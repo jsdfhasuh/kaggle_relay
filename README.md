@@ -1,0 +1,39 @@
+# Kaggle Relay
+
+FastAPI relay for routing Training Platform Kaggle traffic through one Linux server.
+
+## Run
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Set `RELAY_API_TOKEN` to a long random value. Provide Kaggle credentials with
+`KAGGLE_API_TOKEN`, `KAGGLE_USERNAME`/`KAGGLE_KEY`, or by mounting
+`/root/.kaggle`.
+
+## API
+
+All `/v1/*` requests require:
+
+```text
+Authorization: Bearer <RELAY_API_TOKEN>
+```
+
+Main endpoints:
+
+- `GET /v1/health`
+- `GET /v1/kaggle/account`
+- `POST /v1/jobs`
+- `PUT /v1/jobs/{job_id}/archives/{dataset|kernel}/chunks/{index}`
+- `POST /v1/jobs/{job_id}/complete`
+- `GET /v1/jobs/{job_id}`
+- `GET /v1/jobs/{job_id}/artifacts.zip`
+- `DELETE /v1/jobs/{job_id}`
+
+## Reverse Proxy
+
+Use HTTPS, allow large request bodies, and set upload/proxy timeouts to at least
+one hour for multi-GB payloads.
+

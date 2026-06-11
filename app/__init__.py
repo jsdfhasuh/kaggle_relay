@@ -1,0 +1,2 @@
+"""FastAPI Kaggle Relay service."""
+
