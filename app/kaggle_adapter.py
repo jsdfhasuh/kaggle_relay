@@ -162,6 +162,11 @@ class KaggleAdapter:
                 return output
             if result.returncode == 0 and any(word in status_text for word in ["failed", "error", "deleted"]):
                 raise KaggleAdapterError(f"Dataset failed:\n{output}")
+            if result.returncode != 0 and any(
+                word in status_text
+                for word in ["401", "403", "404", "forbidden", "unauthorized", "not found"]
+            ):
+                raise KaggleAdapterError(f"Dataset status failed:\n{output}")
             if time.time() - start > 30 * 60:
                 raise TimeoutError(f"Dataset wait timed out:\n{output}")
             time.sleep(self.settings.dataset_poll_seconds)
@@ -218,4 +223,3 @@ class KaggleAdapter:
             for path in sorted(output_dir.rglob("*")):
                 if path.is_file():
                     archive.write(path, path.relative_to(output_dir).as_posix())
-

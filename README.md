@@ -28,12 +28,47 @@ Main endpoints:
 - `POST /v1/jobs`
 - `PUT /v1/jobs/{job_id}/archives/{dataset|kernel}/chunks/{index}`
 - `POST /v1/jobs/{job_id}/complete`
+- `POST /v1/jobs/{job_id}/progress`
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/artifacts.zip`
 - `DELETE /v1/jobs/{job_id}`
+
+## Kernel Progress Callback
+
+`POST /v1/jobs` may include `callback_token_sha256`. Store only the SHA-256
+hash in Relay, then put the raw callback token in the generated Kaggle script.
+
+The Kaggle script can report progress with:
+
+```text
+POST /v1/jobs/{job_id}/progress
+Authorization: Bearer <raw-callback-token>
+```
+
+If the generated Kaggle script does not know the Relay `job_id`, report by
+`kernel_ref` instead:
+
+```text
+POST /v1/jobs/by-kernel/progress
+Authorization: Bearer <raw-callback-token>
+```
+
+Example body:
+
+```json
+{
+  "kernel_ref": "owner/kernel-slug",
+  "epoch": 4,
+  "epochs": 300,
+  "message": "[Epoch 4/300] Loss: 2.667",
+  "mAP50": 0.992
+}
+```
+
+Relay maps `epoch / epochs` into the existing kernel progress range and stores
+the payload in `kernel_status` plus `recent_logs`.
 
 ## Reverse Proxy
 
 Use HTTPS, allow large request bodies, and set upload/proxy timeouts to at least
 one hour for multi-GB payloads.
-

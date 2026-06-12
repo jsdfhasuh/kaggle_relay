@@ -1,6 +1,6 @@
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 JobStatus = Literal[
@@ -26,6 +26,7 @@ class CreateJobRequest(BaseModel):
     kernel_size: int = Field(ge=0)
     chunk_size: int = Field(gt=0)
     payload_hash: str = ""
+    callback_token_sha256: str = ""
 
 
 class JobResponse(BaseModel):
@@ -39,9 +40,24 @@ class JobResponse(BaseModel):
     kaggle_output: str = ""
     error: str = ""
     payload_hash: str = ""
+    callback_enabled: bool = False
     artifact_path: str = ""
+    dataset_cache_hit: bool = False
+    dataset_upload_required: bool = True
     accepted_chunks: dict[str, list[int]]
     recent_logs: list[str] = []
+
+
+class JobProgressRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    event_type: str = "progress"
+    message: str = ""
+    epoch: Optional[int] = None
+    epochs: Optional[int] = None
+    remote_progress: Optional[float] = Field(default=None, ge=0, le=100)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    log: str = ""
 
 
 class ChunkResponse(BaseModel):
@@ -59,4 +75,3 @@ class HealthResponse(BaseModel):
     version: str
     storage_dir: str
     free_bytes: int
-

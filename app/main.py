@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import hmac
+import json
 import shutil
 import time
 import uuid
@@ -20,9 +22,9 @@ from app.archive import (
 from app.config import Settings
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter
-from app.schemas import ChunkResponse, CreateJobRequest, HealthResponse, JobResponse
+from app.schemas import ChunkResponse, CreateJobRequest, HealthResponse, JobProgressRequest, JobResponse
 from app.security import redact_secrets
-from app.worker import process_job, validate_payloads
+from app.worker import has_ready_dataset_cache, process_job, validate_kernel_payload, validate_payloads
 
 VERSION = "0.1.0"
 
@@ -48,13 +50,71 @@ def job_response(db: RelayDb, job_id: str) -> JobResponse:
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
+    dataset_cache_hit = has_ready_dataset_cache(db, job["dataset_ref"], job["payload_hash"])
     return JobResponse(
         **RelayDb.to_response(
-            job,
+            {
+                **job,
+                "callback_enabled": bool(job.get("callback_token_sha256")),
+                "dataset_cache_hit": dataset_cache_hit,
+                "dataset_upload_required": not dataset_cache_hit,
+            },
             db.accepted_chunks(job_id),
             db.recent_logs(job_id),
         )
     )
+
+
+def bearer_token(authorization: str) -> str:
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return ""
+    return authorization[len(prefix):].strip()
+
+
+def authorize_job_callback(job: dict, authorization: str, settings: Settings) -> bool:
+    token = bearer_token(authorization)
+    if not token:
+        return False
+    if hmac.compare_digest(token, settings.api_token):
+        return True
+    expected_hash = (job.get("callback_token_sha256") or "").strip().lower()
+    if not expected_hash:
+        return False
+    actual_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(actual_hash, expected_hash)
+
+
+def progress_from_callback(job: dict, payload: JobProgressRequest) -> float:
+    remote_progress = payload.remote_progress
+    if remote_progress is None and payload.epoch is not None and payload.epochs:
+        remote_progress = min(100.0, max(0.0, payload.epoch / payload.epochs * 100))
+    if remote_progress is None:
+        return float(job["progress"])
+    callback_progress = min(80.0, 60.0 + remote_progress / 100.0 * 20.0)
+    return max(float(job["progress"]), callback_progress)
+
+
+def callback_log_message(data: dict) -> str:
+    message = str(data.get("message") or data.get("log") or "").strip()
+    if message:
+        return message
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest) -> None:
+    data = payload.model_dump()
+    clean_message = redact_secrets(callback_log_message(data))[-8000:]
+    if clean_message:
+        db.append_log(job["job_id"], clean_message)
+    updates = {
+        "kernel_status": json.dumps(data, ensure_ascii=False, sort_keys=True),
+        "kaggle_output": clean_message[-4000:],
+        "progress": progress_from_callback(job, payload),
+    }
+    if job["status"] not in {"complete", "failed"}:
+        updates["status"] = "waiting_kernel"
+    db.update_job(job["job_id"], **updates)
 
 
 async def worker_loop(app: FastAPI) -> None:
@@ -224,15 +284,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         extracted_dir = job_dir / "extracted"
         db.update_job(job_id, status="assembling", progress=10)
         try:
-            dataset_zip = archives_dir / "dataset.zip"
             kernel_zip = archives_dir / "kernel.zip"
-            assemble_archive(
-                job_dir / "chunks" / "dataset",
-                dataset_zip,
-                job["dataset_size"],
-                job["chunk_size"],
-                job["dataset_archive_sha256"],
-            )
+            dataset_cache_hit = has_ready_dataset_cache(db, job["dataset_ref"], job["payload_hash"])
+            if not dataset_cache_hit:
+                dataset_zip = archives_dir / "dataset.zip"
+                assemble_archive(
+                    job_dir / "chunks" / "dataset",
+                    dataset_zip,
+                    job["dataset_size"],
+                    job["chunk_size"],
+                    job["dataset_archive_sha256"],
+                )
+                safe_extract_zip(dataset_zip, extracted_dir / "dataset", job["dataset_size"])
             assemble_archive(
                 job_dir / "chunks" / "kernel",
                 kernel_zip,
@@ -240,14 +303,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 job["chunk_size"],
                 job["kernel_archive_sha256"],
             )
-            safe_extract_zip(dataset_zip, extracted_dir / "dataset", job["dataset_size"])
             safe_extract_zip(kernel_zip, extracted_dir / "kernel", job["kernel_size"])
-            validate_payloads(extracted_dir / "dataset", extracted_dir / "kernel")
+            if dataset_cache_hit:
+                validate_kernel_payload(extracted_dir / "kernel")
+            else:
+                validate_payloads(extracted_dir / "dataset", extracted_dir / "kernel")
         except Exception as exc:
             db.update_job(job_id, status="failed", progress=0, error=redact_secrets(str(exc)))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         db.update_job(job_id, status="queued", progress=15)
         await request.app.state.queue.put(job_id)
+        return job_response(db, job_id)
+
+    @app.post("/v1/jobs/by-kernel/progress", response_model=JobResponse)
+    def update_job_progress_by_kernel(
+        payload: JobProgressRequest,
+        authorization: str = Header(default=""),
+        settings: Settings = Depends(get_settings),
+        db: RelayDb = Depends(get_db),
+    ) -> JobResponse:
+        kernel_ref = str(payload.model_extra.get("kernel_ref") or "").strip() if payload.model_extra else ""
+        if not kernel_ref:
+            raise HTTPException(status_code=400, detail="kernel_ref is required")
+        job = db.get_latest_job_by_kernel_ref(kernel_ref)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        if not authorize_job_callback(job, authorization, settings):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        apply_progress_callback(db, job, payload)
+        return job_response(db, job["job_id"])
+
+    @app.post("/v1/jobs/{job_id}/progress", response_model=JobResponse)
+    def update_job_progress(
+        job_id: str,
+        payload: JobProgressRequest,
+        authorization: str = Header(default=""),
+        settings: Settings = Depends(get_settings),
+        db: RelayDb = Depends(get_db),
+    ) -> JobResponse:
+        job = db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        if not authorize_job_callback(job, authorization, settings):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        apply_progress_callback(db, job, payload)
         return job_response(db, job_id)
 
     @app.get("/v1/jobs/{job_id}", response_model=JobResponse, dependencies=[Depends(require_auth)])

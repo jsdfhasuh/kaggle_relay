@@ -41,6 +41,7 @@ class RelayDb:
                     kaggle_output TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     payload_hash TEXT NOT NULL DEFAULT '',
+                    callback_token_sha256 TEXT NOT NULL DEFAULT '',
                     artifact_path TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
@@ -61,8 +62,36 @@ class RelayDb:
                     created_at REAL NOT NULL,
                     message TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS kaggle_dataset_cache (
+                    dataset_ref TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    dataset_status TEXT NOT NULL DEFAULT '',
+                    source_job_id TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (dataset_ref, payload_hash)
+                );
+                CREATE TABLE IF NOT EXISTS kaggle_last_job (
+                    dataset_ref TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    dataset_status TEXT NOT NULL DEFAULT '',
+                    job_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (dataset_ref, payload_hash)
+                );
                 """
             )
+            self._ensure_column(conn, "jobs", "callback_token_sha256", "TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def create_job(self, values: dict[str, Any]) -> None:
         stamp = now_ts()
@@ -75,6 +104,7 @@ class RelayDb:
             "kaggle_output": "",
             "error": "",
             "payload_hash": values.get("payload_hash", ""),
+            "callback_token_sha256": values.get("callback_token_sha256", ""),
             "artifact_path": "",
             "created_at": stamp,
             "updated_at": stamp,
@@ -88,14 +118,14 @@ class RelayDb:
                     dataset_archive_sha256, kernel_archive_sha256,
                     dataset_size, kernel_size, chunk_size,
                     status, progress, dataset_status, kernel_status,
-                    kaggle_output, error, payload_hash, artifact_path,
+                    kaggle_output, error, payload_hash, callback_token_sha256, artifact_path,
                     created_at, updated_at, completed_at
                 ) VALUES (
                     :job_id, :dataset_ref, :kernel_ref,
                     :dataset_archive_sha256, :kernel_archive_sha256,
                     :dataset_size, :kernel_size, :chunk_size,
                     :status, :progress, :dataset_status, :kernel_status,
-                    :kaggle_output, :error, :payload_hash, :artifact_path,
+                    :kaggle_output, :error, :payload_hash, :callback_token_sha256, :artifact_path,
                     :created_at, :updated_at, :completed_at
                 )
                 """,
@@ -105,6 +135,19 @@ class RelayDb:
     def get_job(self, job_id: str) -> Optional[dict[str, Any]]:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_latest_job_by_kernel_ref(self, kernel_ref: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE kernel_ref = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (kernel_ref,),
+            ).fetchone()
         return dict(row) if row else None
 
     def update_job(self, job_id: str, **values: Any) -> None:
@@ -189,6 +232,84 @@ class RelayDb:
                 (job_id, limit),
             ).fetchall()
         return [row["message"] for row in reversed(rows)]
+
+    def get_dataset_cache(self, dataset_ref: str, payload_hash: str) -> Optional[dict[str, Any]]:
+        if not payload_hash:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM kaggle_dataset_cache
+                WHERE dataset_ref = ? AND payload_hash = ?
+                """,
+                (dataset_ref, payload_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_dataset_cache(
+        self,
+        dataset_ref: str,
+        payload_hash: str,
+        status: str,
+        dataset_status: str,
+        source_job_id: str,
+    ) -> None:
+        if not payload_hash:
+            return
+        stamp = now_ts()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO kaggle_dataset_cache (
+                    dataset_ref, payload_hash, status, dataset_status,
+                    source_job_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset_ref, payload_hash) DO UPDATE SET
+                    status = excluded.status,
+                    dataset_status = excluded.dataset_status,
+                    source_job_id = excluded.source_job_id,
+                    updated_at = excluded.updated_at
+                """,
+                (dataset_ref, payload_hash, status, dataset_status, source_job_id, stamp, stamp),
+            )
+
+    def get_last_dataset_job(self, dataset_ref: str, payload_hash: str) -> Optional[dict[str, Any]]:
+        if not payload_hash:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM kaggle_last_job
+                WHERE dataset_ref = ? AND payload_hash = ?
+                """,
+                (dataset_ref, payload_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_last_dataset_job(
+        self,
+        dataset_ref: str,
+        payload_hash: str,
+        dataset_status: str,
+        job_id: str,
+    ) -> None:
+        if not payload_hash:
+            return
+        stamp = now_ts()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO kaggle_last_job (
+                    dataset_ref, payload_hash, dataset_status,
+                    job_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset_ref, payload_hash) DO UPDATE SET
+                    dataset_status = excluded.dataset_status,
+                    job_id = excluded.job_id,
+                    updated_at = excluded.updated_at
+                """,
+                (dataset_ref, payload_hash, dataset_status, job_id, stamp, stamp),
+            )
 
     def completed_before(self, cutoff: float) -> list[str]:
         with self.connect() as conn:
