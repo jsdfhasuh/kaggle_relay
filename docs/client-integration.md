@@ -40,7 +40,8 @@ Kernel/notebook chunks are always uploaded because each run uses a fresh kernel.
 
 4. Create `dataset.zip` and `kernel.zip`.
 5. Call `POST /v1/jobs` with archive sizes, archive SHA-256 hashes, `payload_hash`,
-   and `callback_token_sha256`.
+   and `callback_token_sha256`. Include `kaggle_key_id` when the relay token can
+   access more than one Kaggle key.
 6. If the response has `dataset_upload_required=true`, upload dataset chunks.
    If the field is absent, default to `true` for old Relay compatibility.
 7. Always upload kernel chunks.
@@ -61,6 +62,7 @@ job = relay.create_job(
     chunk_size=chunk_size,
     payload_hash=payload_hash,
     callback_token_sha256=callback_token_sha256,
+    kaggle_key_id=kaggle_key_id,
 )
 
 if job.get("dataset_upload_required", True):
@@ -85,6 +87,7 @@ Request body:
 ```json
 {
   "dataset_ref": "owner/dataset-slug",
+  "kaggle_key_id": "ka",
   "kernel_ref": "owner/kernel-slug",
   "dataset_archive_sha256": "<64 hex chars>",
   "kernel_archive_sha256": "<64 hex chars>",
@@ -104,6 +107,9 @@ Important field rules:
   local `dataset.zip`, even if Relay later says dataset upload can be skipped.
 - `callback_token_sha256` is optional but recommended. Relay stores only this
   hash. The raw callback token is embedded in the generated Kaggle script.
+- `kaggle_key_id` is optional only when the relay token maps to exactly one
+  Kaggle key. Jobs remain bound to the resolved key for upload, execution,
+  status, artifact download, deletion, and dataset cache lookup.
 - Do not send a client-side `reuse_dataset` field. Relay makes that decision.
 
 Relevant response fields:
@@ -111,6 +117,7 @@ Relevant response fields:
 ```json
 {
   "job_id": "7f198a0951434e81ad73f71ef8a57fb1",
+  "kaggle_key_id": "ka",
   "dataset_cache_hit": true,
   "dataset_upload_required": false,
   "callback_enabled": true,
@@ -227,6 +234,7 @@ Kaggle CLI log polling as a fallback.
 ## Security Notes
 
 - Do not embed the main `RELAY_API_TOKEN` in Kaggle code.
+- Do not embed a relay token that has broad access to multiple Kaggle keys.
 - Use one callback token per job.
 - Store only `sha256(callback_token)` in Relay via `callback_token_sha256`.
 - Treat the raw callback token as write-only for progress on the matching job.
@@ -246,4 +254,3 @@ Client unit tests should cover:
 - Generated notebook contains `RELAY_CALLBACK_URL`, `RELAY_KERNEL_REF`, and
   `RELAY_CALLBACK_TOKEN`.
 - Callback body includes `kernel_ref`, `epoch`, `epochs`, and `message`.
-

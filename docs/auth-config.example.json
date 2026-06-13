@@ -1,0 +1,21 @@
+{
+  "relay_tokens": [
+    {
+      "id": "admin",
+      "token": "replace-with-admin-relay-token",
+      "allowed_kaggle_key_ids": "*"
+    },
+    {
+      "id": "user-a",
+      "token": "replace-with-user-a-relay-token",
+      "allowed_kaggle_key_ids": ["ka"]
+    }
+  ],
+  "kaggle_keys": [
+    {
+      "id": "ka",
+      "username": "alice",
+      "key": "replace-with-alice-kaggle-key"
+    }
+  ]
+}

@@ -9,9 +9,25 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Set `RELAY_API_TOKEN` to a long random value. Provide Kaggle credentials with
-`KAGGLE_API_TOKEN`, `KAGGLE_USERNAME`/`KAGGLE_KEY`, or by mounting
-`/root/.kaggle`.
+For legacy single-user mode, set `RELAY_API_TOKEN` to a long random value and
+provide Kaggle credentials with `KAGGLE_API_TOKEN`,
+`KAGGLE_USERNAME`/`KAGGLE_KEY`, or by mounting `/root/.kaggle`.
+
+For multi-user/multi-key mode, set `RELAY_AUTH_CONFIG` to a JSON file path. Each
+job is bound to one `kaggle_key_id`; relay tokens can be limited to one key, a
+list of keys, or all keys:
+
+```json
+{
+  "relay_tokens": [
+    {"id": "admin", "token": "admin-token", "allowed_kaggle_key_ids": "*"},
+    {"id": "user-a", "token": "user-a-token", "allowed_kaggle_key_ids": ["ka"]}
+  ],
+  "kaggle_keys": [
+    {"id": "ka", "username": "alice", "key": "alice-kaggle-key"}
+  ]
+}
+```
 
 ## API
 
@@ -32,6 +48,10 @@ Main endpoints:
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/artifacts.zip`
 - `DELETE /v1/jobs/{job_id}`
+
+When a token can access exactly one Kaggle key, `POST /v1/jobs` may omit
+`kaggle_key_id` and Relay will bind the job to that key. When a token can access
+multiple keys or `"*"`, the create request must include `kaggle_key_id`.
 
 ## Kernel Progress Callback
 
