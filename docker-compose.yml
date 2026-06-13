@@ -11,5 +11,4 @@ services:
       - ./relay-data:/data
       # Optional: mount Kaggle credentials instead of KAGGLE_API_TOKEN.
       # - ~/.kaggle:/root/.kaggle:ro
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-
+    command: sh -c "mkdir -p /tmp/kaggle-config && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
