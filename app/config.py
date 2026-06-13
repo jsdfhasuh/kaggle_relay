@@ -16,12 +16,14 @@ class Settings:
     kernel_poll_seconds: int = 60
     kernel_max_wait_seconds: int = 12 * 60 * 60
     kaggle_cmd: str = "kaggle"
+    auth_config_path: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
         token = os.environ.get("RELAY_API_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("RELAY_API_TOKEN is required")
+        auth_config = os.environ.get("RELAY_AUTH_CONFIG", "").strip()
+        if not token and not auth_config:
+            raise RuntimeError("RELAY_API_TOKEN or RELAY_AUTH_CONFIG is required")
         storage_dir = Path(os.environ.get("RELAY_STORAGE_DIR", "/data")).expanduser()
         return cls(
             api_token=token,
@@ -34,6 +36,7 @@ class Settings:
                 os.environ.get("RELAY_KERNEL_MAX_WAIT_SECONDS", str(12 * 60 * 60))
             ),
             kaggle_cmd=os.environ.get("KAGGLE_CMD", "kaggle"),
+            auth_config_path=Path(auth_config).expanduser() if auth_config else None,
         )
 
     @property
@@ -47,4 +50,3 @@ class Settings:
     @property
     def db_path(self) -> Path:
         return self.storage_dir / "relay.db"
-

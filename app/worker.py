@@ -3,6 +3,7 @@ from pathlib import Path
 
 from app.archive import ArchiveError, require_file
 from app.database import RelayDb
+from app.auth_config import AuthStore
 from app.kaggle_adapter import KaggleAdapter
 from app.security import redact_secrets
 
@@ -13,13 +14,18 @@ def is_ready_dataset_status(status: str) -> bool:
     return (status or "").strip().lower() in READY_DATASET_STATUSES
 
 
-def has_ready_dataset_cache(db: RelayDb, dataset_ref: str, payload_hash: str) -> bool:
+def has_ready_dataset_cache(
+    db: RelayDb,
+    dataset_ref: str,
+    payload_hash: str,
+    kaggle_key_id: str = "",
+) -> bool:
     if not payload_hash:
         return False
-    cache = db.get_dataset_cache(dataset_ref, payload_hash)
+    cache = db.get_dataset_cache(dataset_ref, payload_hash, kaggle_key_id=kaggle_key_id)
     if cache and cache["status"] == "ready":
         return True
-    last_job = db.get_last_dataset_job(dataset_ref, payload_hash)
+    last_job = db.get_last_dataset_job(dataset_ref, payload_hash, kaggle_key_id=kaggle_key_id)
     if last_job and is_ready_dataset_status(last_job["dataset_status"]):
         db.upsert_dataset_cache(
             dataset_ref=dataset_ref,
@@ -27,6 +33,7 @@ def has_ready_dataset_cache(db: RelayDb, dataset_ref: str, payload_hash: str) ->
             status="ready",
             dataset_status=last_job["dataset_status"],
             source_job_id=last_job["job_id"],
+            kaggle_key_id=kaggle_key_id,
         )
         return True
     return False
@@ -48,10 +55,11 @@ def validate_payloads(dataset_dir: Path, kernel_dir: Path) -> str:
     return validate_kernel_payload(kernel_dir)
 
 
-def process_job(settings, db: RelayDb, job_id: str) -> None:
+def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None = None) -> None:
     job = db.get_job(job_id)
     if not job:
         return
+    kaggle_key_id = job.get("kaggle_key_id", "")
 
     job_dir = settings.jobs_dir / job_id
     dataset_dir = job_dir / "extracted" / "dataset"
@@ -64,9 +72,15 @@ def process_job(settings, db: RelayDb, job_id: str) -> None:
         db.append_log(job_id, clean)
         db.update_job(job_id, kaggle_output=clean[-4000:])
 
-    adapter = KaggleAdapter(settings, log)
+    credentials = auth_store.credentials_for(kaggle_key_id) if auth_store else None
+    adapter = KaggleAdapter(settings, log, credentials=credentials)
     try:
-        dataset_cache_hit = has_ready_dataset_cache(db, job["dataset_ref"], job["payload_hash"])
+        dataset_cache_hit = has_ready_dataset_cache(
+            db,
+            job["dataset_ref"],
+            job["payload_hash"],
+            kaggle_key_id=kaggle_key_id,
+        )
         if dataset_cache_hit:
             validate_kernel_payload(kernel_dir)
             db.update_job(job_id, dataset_status="ready", progress=40)
@@ -90,12 +104,14 @@ def process_job(settings, db: RelayDb, job_id: str) -> None:
                     status="ready",
                     dataset_status=dataset_status,
                     source_job_id=job_id,
+                    kaggle_key_id=kaggle_key_id,
                 )
                 db.upsert_last_dataset_job(
                     dataset_ref=job["dataset_ref"],
                     payload_hash=job["payload_hash"],
                     dataset_status=dataset_status,
                     job_id=job_id,
+                    kaggle_key_id=kaggle_key_id,
                 )
 
         db.update_job(job_id, status="pushing_kernel", progress=45)

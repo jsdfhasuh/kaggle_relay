@@ -3,12 +3,15 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
 from app.archive import require_file
+from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets
 
@@ -19,6 +22,7 @@ ARTIFACT_FILE_PATTERN = (
     r"PR_curve\.png|F1_curve\.png|P_curve\.png|R_curve\.png)$"
 )
 TRAINING_PROGRESS_PREFIX = "TRAINING_PLATFORM_PROGRESS"
+_ENV_LOCK = threading.RLock()
 
 
 class KaggleAdapterError(RuntimeError):
@@ -53,18 +57,49 @@ def parse_training_progress_logs(output: str) -> list[dict]:
 
 
 class KaggleAdapter:
-    def __init__(self, settings: Settings, log: Callable[[str], None]):
+    def __init__(
+        self,
+        settings: Settings,
+        log: Callable[[str], None],
+        credentials: KaggleCredentials | None = None,
+    ):
         self.settings = settings
         self.log = log
+        self.credentials = credentials
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
-        token = env.get("KAGGLE_API_TOKEN", "").strip()
-        if token:
-            env["KAGGLE_API_TOKEN"] = token
+        if self.credentials:
+            self.credentials.apply_to_env(env)
+        else:
+            token = env.get("KAGGLE_API_TOKEN", "").strip()
+            if token:
+                env["KAGGLE_API_TOKEN"] = token
         return env
+
+    @contextmanager
+    def _temporary_kaggle_env(self):
+        if not self.credentials:
+            yield
+            return
+        with _ENV_LOCK:
+            previous = {name: os.environ.get(name) for name in KAGGLE_ENV_KEYS}
+            try:
+                env = dict(os.environ)
+                self.credentials.apply_to_env(env)
+                for name in KAGGLE_ENV_KEYS:
+                    os.environ.pop(name, None)
+                for name in KAGGLE_ENV_KEYS:
+                    if name in env:
+                        os.environ[name] = env[name]
+                yield
+            finally:
+                for name in KAGGLE_ENV_KEYS:
+                    os.environ.pop(name, None)
+                    if previous[name] is not None:
+                        os.environ[name] = previous[name] or ""
 
     def _run(
         self,
@@ -94,9 +129,10 @@ class KaggleAdapter:
 
     def account(self) -> dict:
         version = self._run(["--version"], check=False).stdout.strip()
-        username = os.environ.get("KAGGLE_USERNAME", "").strip()
+        env = self._env()
+        username = env.get("KAGGLE_USERNAME", "").strip()
         if not username:
-            kaggle_json = Path(os.environ.get("KAGGLE_CONFIG_DIR", str(Path.home() / ".kaggle"))) / "kaggle.json"
+            kaggle_json = Path(env.get("KAGGLE_CONFIG_DIR", str(Path.home() / ".kaggle"))) / "kaggle.json"
             if kaggle_json.exists():
                 try:
                     data = json.loads(kaggle_json.read_text(encoding="utf-8"))
@@ -115,9 +151,10 @@ class KaggleAdapter:
         try:
             from kaggle.api.kaggle_api_extended import KaggleApi
 
-            api = KaggleApi()
-            api.authenticate()
-            result = api.dataset_status(dataset_ref)
+            with self._temporary_kaggle_env():
+                api = KaggleApi()
+                api.authenticate()
+                result = api.dataset_status(dataset_ref)
             text = str(result).lower()
             return "not found" not in text and "404" not in text
         except Exception as exc:
@@ -129,28 +166,29 @@ class KaggleAdapter:
     def upload_dataset(self, dataset_dir: Path, dataset_ref: str, update_message: str) -> None:
         from kaggle.api.kaggle_api_extended import KaggleApi
 
-        api = KaggleApi()
-        api.authenticate()
-        exists = self.dataset_exists(dataset_ref)
-        if exists:
-            self.log(f"Updating dataset {dataset_ref}")
-            api.dataset_create_version(
-                str(dataset_dir),
-                update_message,
-                quiet=False,
-                convert_to_csv=False,
-                delete_old_versions=False,
-                dir_mode="tar",
-            )
-        else:
-            self.log(f"Creating dataset {dataset_ref}")
-            api.dataset_create_new(
-                str(dataset_dir),
-                public=False,
-                quiet=False,
-                convert_to_csv=False,
-                dir_mode="tar",
-            )
+        with self._temporary_kaggle_env():
+            api = KaggleApi()
+            api.authenticate()
+            exists = self.dataset_exists(dataset_ref)
+            if exists:
+                self.log(f"Updating dataset {dataset_ref}")
+                api.dataset_create_version(
+                    str(dataset_dir),
+                    update_message,
+                    quiet=False,
+                    convert_to_csv=False,
+                    delete_old_versions=False,
+                    dir_mode="tar",
+                )
+            else:
+                self.log(f"Creating dataset {dataset_ref}")
+                api.dataset_create_new(
+                    str(dataset_dir),
+                    public=False,
+                    quiet=False,
+                    convert_to_csv=False,
+                    dir_mode="tar",
+                )
 
     def wait_dataset(self, dataset_ref: str) -> str:
         start = time.time()

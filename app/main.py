@@ -19,6 +19,7 @@ from app.archive import (
     safe_extract_zip,
     validate_chunk_index,
 )
+from app.auth_config import AuthSelectionError, AuthStore, RelayPrincipal, bearer_token
 from app.config import Settings
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter
@@ -37,20 +38,52 @@ def get_db(request: Request) -> RelayDb:
     return request.app.state.db
 
 
+def get_auth_store(request: Request) -> AuthStore:
+    return request.app.state.auth_store
+
+
 async def require_auth(
     authorization: str = Header(default=""),
-    settings: Settings = Depends(get_settings),
-) -> None:
-    expected = f"Bearer {settings.api_token}"
-    if authorization != expected:
+    auth_store: AuthStore = Depends(get_auth_store),
+) -> RelayPrincipal:
+    principal = auth_store.authenticate_authorization(authorization)
+    if not principal:
         raise HTTPException(status_code=401, detail="unauthorized")
+    return principal
+
+
+def selection_error(exc: AuthSelectionError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+def require_job_access(job: dict, principal: RelayPrincipal, auth_store: AuthStore) -> None:
+    if not auth_store.can_access_key(principal, job.get("kaggle_key_id", "")):
+        raise HTTPException(status_code=404, detail="job not found")
+
+
+def get_authorized_job(
+    db: RelayDb,
+    job_id: str,
+    principal: RelayPrincipal,
+    auth_store: AuthStore,
+) -> dict:
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    require_job_access(job, principal, auth_store)
+    return job
 
 
 def job_response(db: RelayDb, job_id: str) -> JobResponse:
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    dataset_cache_hit = has_ready_dataset_cache(db, job["dataset_ref"], job["payload_hash"])
+    dataset_cache_hit = has_ready_dataset_cache(
+        db,
+        job["dataset_ref"],
+        job["payload_hash"],
+        kaggle_key_id=job.get("kaggle_key_id", ""),
+    )
     return JobResponse(
         **RelayDb.to_response(
             {
@@ -64,19 +97,12 @@ def job_response(db: RelayDb, job_id: str) -> JobResponse:
         )
     )
 
-
-def bearer_token(authorization: str) -> str:
-    prefix = "Bearer "
-    if not authorization.startswith(prefix):
-        return ""
-    return authorization[len(prefix):].strip()
-
-
-def authorize_job_callback(job: dict, authorization: str, settings: Settings) -> bool:
+def authorize_job_callback(job: dict, authorization: str, auth_store: AuthStore) -> bool:
     token = bearer_token(authorization)
     if not token:
         return False
-    if hmac.compare_digest(token, settings.api_token):
+    principal = auth_store.authenticate_token(token)
+    if principal and auth_store.can_access_key(principal, job.get("kaggle_key_id", "")):
         return True
     expected_hash = (job.get("callback_token_sha256") or "").strip().lower()
     if not expected_hash:
@@ -121,7 +147,13 @@ async def worker_loop(app: FastAPI) -> None:
     while True:
         job_id = await app.state.queue.get()
         try:
-            await asyncio.to_thread(process_job, app.state.settings, app.state.db, job_id)
+            await asyncio.to_thread(
+                process_job,
+                app.state.settings,
+                app.state.db,
+                job_id,
+                app.state.auth_store,
+            )
         finally:
             app.state.queue.task_done()
 
@@ -172,10 +204,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Kaggle Relay", version=VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.db = RelayDb(settings.db_path)
+    app.state.auth_store = AuthStore.from_settings(settings)
     app.state.queue = asyncio.Queue()
 
-    @app.get("/v1/health", response_model=HealthResponse, dependencies=[Depends(require_auth)])
-    def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
+    @app.get("/v1/health", response_model=HealthResponse)
+    def health(
+        settings: Settings = Depends(get_settings),
+        _principal: RelayPrincipal = Depends(require_auth),
+    ) -> HealthResponse:
         usage = shutil.disk_usage(settings.storage_dir)
         return HealthResponse(
             status="ok",
@@ -184,23 +220,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             free_bytes=usage.free,
         )
 
-    @app.get("/v1/kaggle/account", dependencies=[Depends(require_auth)])
-    def kaggle_account(settings: Settings = Depends(get_settings)) -> dict:
-        adapter = KaggleAdapter(settings, lambda _message: None)
-        return adapter.account()
+    @app.get("/v1/kaggle/account")
+    def kaggle_account(
+        kaggle_key_id: str = "",
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        try:
+            resolved_key_id = auth_store.resolve_kaggle_key_id(principal, kaggle_key_id)
+            credentials = auth_store.credentials_for(resolved_key_id)
+        except AuthSelectionError as exc:
+            raise selection_error(exc) from exc
+        adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
+        return {"kaggle_key_id": resolved_key_id, **adapter.account()}
 
-    @app.post("/v1/jobs", response_model=JobResponse, dependencies=[Depends(require_auth)])
-    def create_job(payload: CreateJobRequest, settings: Settings = Depends(get_settings), db: RelayDb = Depends(get_db)) -> JobResponse:
+    @app.post("/v1/jobs", response_model=JobResponse)
+    def create_job(
+        payload: CreateJobRequest,
+        settings: Settings = Depends(get_settings),
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> JobResponse:
+        try:
+            kaggle_key_id = auth_store.resolve_kaggle_key_id(principal, payload.kaggle_key_id)
+        except AuthSelectionError as exc:
+            raise selection_error(exc) from exc
         job_id = uuid.uuid4().hex
         (settings.jobs_dir / job_id / "chunks" / "dataset").mkdir(parents=True, exist_ok=True)
         (settings.jobs_dir / job_id / "chunks" / "kernel").mkdir(parents=True, exist_ok=True)
-        db.create_job({"job_id": job_id, **payload.model_dump()})
+        values = {
+            **payload.model_dump(),
+            "job_id": job_id,
+            "relay_token_id": principal.id,
+            "kaggle_key_id": kaggle_key_id,
+        }
+        db.create_job(values)
         return job_response(db, job_id)
 
     @app.put(
         "/v1/jobs/{job_id}/archives/{archive_type}/chunks/{index}",
         response_model=ChunkResponse,
-        dependencies=[Depends(require_auth)],
     )
     async def upload_chunk(
         job_id: str,
@@ -211,10 +272,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         x_chunk_size: int = Header(alias="X-Chunk-Size"),
         settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
     ) -> ChunkResponse:
-        job = db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="job not found")
+        job = get_authorized_job(db, job_id, principal, auth_store)
         total_size = job[f"{archive_type}_size"]
         try:
             validate_chunk_index(index, total_size, job["chunk_size"])
@@ -266,16 +327,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sha256=actual_sha,
         )
 
-    @app.post("/v1/jobs/{job_id}/complete", response_model=JobResponse, dependencies=[Depends(require_auth)])
+    @app.post("/v1/jobs/{job_id}/complete", response_model=JobResponse)
     async def complete_job(
         job_id: str,
         settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
         request: Request = None,
     ) -> JobResponse:
-        job = db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="job not found")
+        job = get_authorized_job(db, job_id, principal, auth_store)
         if job["status"] in {"queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "downloading_output", "complete"}:
             return job_response(db, job_id)
 
@@ -285,7 +346,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.update_job(job_id, status="assembling", progress=10)
         try:
             kernel_zip = archives_dir / "kernel.zip"
-            dataset_cache_hit = has_ready_dataset_cache(db, job["dataset_ref"], job["payload_hash"])
+            dataset_cache_hit = has_ready_dataset_cache(
+                db,
+                job["dataset_ref"],
+                job["payload_hash"],
+                kaggle_key_id=job.get("kaggle_key_id", ""),
+            )
             if not dataset_cache_hit:
                 dataset_zip = archives_dir / "dataset.zip"
                 assemble_archive(
@@ -319,16 +385,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_job_progress_by_kernel(
         payload: JobProgressRequest,
         authorization: str = Header(default=""),
-        settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
     ) -> JobResponse:
         kernel_ref = str(payload.model_extra.get("kernel_ref") or "").strip() if payload.model_extra else ""
         if not kernel_ref:
             raise HTTPException(status_code=400, detail="kernel_ref is required")
-        job = db.get_latest_job_by_kernel_ref(kernel_ref)
-        if not job:
+
+        principal = auth_store.authenticate_authorization(authorization)
+        key_filter = None
+        if principal and not principal.allow_all_keys:
+            key_filter = set(auth_store.allowed_key_ids(principal))
+
+        candidates = db.get_jobs_by_kernel_ref(kernel_ref, kaggle_key_ids=key_filter, limit=50)
+        if not candidates:
             raise HTTPException(status_code=404, detail="job not found")
-        if not authorize_job_callback(job, authorization, settings):
+
+        job = next(
+            (candidate for candidate in candidates if authorize_job_callback(candidate, authorization, auth_store)),
+            None,
+        )
+        if not job:
             raise HTTPException(status_code=401, detail="unauthorized")
 
         apply_progress_callback(db, job, payload)
@@ -339,27 +416,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job_id: str,
         payload: JobProgressRequest,
         authorization: str = Header(default=""),
-        settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
     ) -> JobResponse:
         job = db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
-        if not authorize_job_callback(job, authorization, settings):
+        if not authorize_job_callback(job, authorization, auth_store):
             raise HTTPException(status_code=401, detail="unauthorized")
 
         apply_progress_callback(db, job, payload)
         return job_response(db, job_id)
 
-    @app.get("/v1/jobs/{job_id}", response_model=JobResponse, dependencies=[Depends(require_auth)])
-    def get_job(job_id: str, db: RelayDb = Depends(get_db)) -> JobResponse:
+    @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
+    def get_job(
+        job_id: str,
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> JobResponse:
+        get_authorized_job(db, job_id, principal, auth_store)
         return job_response(db, job_id)
 
-    @app.get("/v1/jobs/{job_id}/artifacts.zip", dependencies=[Depends(require_auth)])
-    def download_artifacts(job_id: str, db: RelayDb = Depends(get_db)) -> FileResponse:
-        job = db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="job not found")
+    @app.get("/v1/jobs/{job_id}/artifacts.zip")
+    def download_artifacts(
+        job_id: str,
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> FileResponse:
+        job = get_authorized_job(db, job_id, principal, auth_store)
         if job["status"] != "complete" or not job["artifact_path"]:
             raise HTTPException(status_code=409, detail="job is not complete")
         artifact_path = Path(job["artifact_path"])
@@ -367,10 +453,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="artifact not found")
         return FileResponse(artifact_path, media_type="application/zip", filename="artifacts.zip")
 
-    @app.delete("/v1/jobs/{job_id}", dependencies=[Depends(require_auth)])
-    def delete_job(job_id: str, settings: Settings = Depends(get_settings), db: RelayDb = Depends(get_db)) -> Response:
-        if not db.get_job(job_id):
-            raise HTTPException(status_code=404, detail="job not found")
+    @app.delete("/v1/jobs/{job_id}")
+    def delete_job(
+        job_id: str,
+        settings: Settings = Depends(get_settings),
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> Response:
+        get_authorized_job(db, job_id, principal, auth_store)
         shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
         shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
         db.update_job(job_id, status="failed", error="deleted")
