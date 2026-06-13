@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import aiofiles
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 
 from app.archive import (
@@ -96,6 +96,111 @@ def job_response(db: RelayDb, job_id: str) -> JobResponse:
             db.recent_logs(job_id),
         )
     )
+
+
+def list_authorized_job_ids(
+    db: RelayDb,
+    principal: RelayPrincipal,
+    auth_store: AuthStore,
+    limit: int,
+) -> list[str]:
+    safe_limit = min(max(int(limit), 1), 200)
+    if principal.allow_all_keys:
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id FROM jobs ORDER BY created_at DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        return [row["job_id"] for row in rows]
+
+    allowed_key_ids = set(auth_store.allowed_key_ids(principal))
+    if not allowed_key_ids:
+        return []
+
+    placeholders = ", ".join("?" for _ in allowed_key_ids)
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT job_id FROM jobs
+            WHERE kaggle_key_id IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (*sorted(allowed_key_ids), safe_limit),
+        ).fetchall()
+    return [row["job_id"] for row in rows]
+
+
+def credential_source(credentials) -> str:
+    parts = []
+    if getattr(credentials, "config_dir", ""):
+        parts.append("config_dir")
+    if getattr(credentials, "api_token", ""):
+        parts.append("api_token")
+    if getattr(credentials, "username", "") and getattr(credentials, "key", ""):
+        parts.append("username_key")
+    return "+".join(parts) or "unknown"
+
+
+def auth_config_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
+    if getattr(auth_store, "legacy", False):
+        return {
+            "mode": "legacy",
+            "current_token_id": principal.id,
+            "allowed_kaggle_key_ids": auth_store.allowed_key_ids(principal),
+            "relay_tokens": [
+                {
+                    "id": principal.id,
+                    "current": True,
+                    "allowed_kaggle_key_ids": auth_store.allowed_key_ids(principal),
+                }
+            ],
+            "kaggle_keys": [
+                {
+                    "id": "",
+                    "username": "",
+                    "credential_source": "environment_or_mounted_kaggle_config",
+                }
+            ],
+        }
+
+    kaggle_keys = getattr(auth_store, "_kaggle_keys", {})
+    allowed_key_ids = auth_store.allowed_key_ids(principal)
+    visible_keys = []
+    for key_id in allowed_key_ids:
+        credentials = kaggle_keys.get(key_id)
+        visible_keys.append(
+            {
+                "id": key_id,
+                "username": getattr(credentials, "username", "") if credentials else "",
+                "credential_source": credential_source(credentials) if credentials else "unknown",
+            }
+        )
+
+    visible_tokens = []
+    for _token_value, token_principal in getattr(auth_store, "_tokens", []):
+        if principal.allow_all_keys or token_principal.id == principal.id:
+            allowed = (
+                "*"
+                if token_principal.allow_all_keys
+                else sorted(token_principal.allowed_kaggle_key_ids or [])
+            )
+            visible_tokens.append(
+                {
+                    "id": token_principal.id,
+                    "current": token_principal.id == principal.id,
+                    "allowed_kaggle_key_ids": allowed,
+                }
+            )
+
+    return {
+        "mode": "multi_key",
+        "current_token_id": principal.id,
+        "allowed_kaggle_key_ids": allowed_key_ids,
+        "relay_tokens": visible_tokens,
+        "kaggle_keys": visible_keys,
+    }
+
 
 def authorize_job_callback(job: dict, authorization: str, auth_store: AuthStore) -> bool:
     token = bearer_token(authorization)
@@ -207,6 +312,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.auth_store = AuthStore.from_settings(settings)
     app.state.queue = asyncio.Queue()
 
+    @app.get("/", include_in_schema=False)
+    def ui_index() -> FileResponse:
+        return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+    @app.get("/ui", include_in_schema=False)
+    def ui_alias() -> FileResponse:
+        return FileResponse(Path(__file__).parent / "static" / "index.html")
+
     @app.get("/v1/health", response_model=HealthResponse)
     def health(
         settings: Settings = Depends(get_settings),
@@ -219,6 +332,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             storage_dir=str(settings.storage_dir),
             free_bytes=usage.free,
         )
+
+    @app.get("/v1/auth/config")
+    def get_auth_config(
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        return auth_config_summary(auth_store, principal)
 
     @app.get("/v1/kaggle/account")
     def kaggle_account(
@@ -258,6 +378,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
         db.create_job(values)
         return job_response(db, job_id)
+
+    @app.get("/v1/jobs", response_model=list[JobResponse])
+    def list_jobs(
+        limit: int = Query(default=50, ge=1, le=200),
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> list[JobResponse]:
+        return [
+            job_response(db, job_id)
+            for job_id in list_authorized_job_ids(db, principal, auth_store, limit)
+        ]
 
     @app.put(
         "/v1/jobs/{job_id}/archives/{archive_type}/chunks/{index}",
