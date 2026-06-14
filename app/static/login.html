@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kaggle Relay 登录</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f6fb;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #667085;
+      --border: #d8dee8;
+      --primary: #1f6feb;
+      --danger: #c2410c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(180deg, #edf4ff 0%, var(--bg) 48%, #eef2f7 100%);
+      color: var(--text);
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+    }
+    main {
+      width: min(420px, calc(100vw - 32px));
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.12);
+      padding: 28px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.25;
+    }
+    p {
+      margin: 0 0 22px;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: #344054;
+      font-size: 14px;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 15px;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(31, 111, 235, .16);
+    }
+    button {
+      width: 100%;
+      margin-top: 16px;
+      border: 0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: var(--primary);
+      color: #fff;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: .65;
+      cursor: not-allowed;
+    }
+    .error {
+      min-height: 22px;
+      margin-top: 12px;
+      color: var(--danger);
+      font-size: 14px;
+      word-break: break-word;
+    }
+    .hint {
+      margin-top: 16px;
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Kaggle Relay 登录</h1>
+    <p>输入 Relay API Token。登录成功后由后端设置 HttpOnly Cookie，页面请求会自动使用同源登录态。</p>
+
+    <form id="loginForm">
+      <label for="token">Relay API Token</label>
+      <input id="token" type="password" autocomplete="current-password" autofocus />
+      <button id="loginButton" type="submit">登录</button>
+      <div id="error" class="error" aria-live="polite"></div>
+    </form>
+
+    <div class="hint">多用户模式下，可以使用配置文件中任一 relay token 登录；登录后只显示该 principal 有权访问的任务和 Kaggle Key。</div>
+  </main>
+
+  <script>
+    const form = document.getElementById("loginForm");
+    const tokenInput = document.getElementById("token");
+    const button = document.getElementById("loginButton");
+    const errorBox = document.getElementById("error");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      errorBox.textContent = "";
+      const token = tokenInput.value.trim();
+      if (!token) {
+        errorBox.textContent = "请输入 Relay API Token";
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = "登录中...";
+      try {
+        const response = await fetch("/v1/ui/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({token})
+        });
+        if (!response.ok) {
+          let message = "登录失败，请检查 token";
+          try {
+            const data = await response.json();
+            message = data.detail || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
+        window.location.href = "/ui";
+      } catch (error) {
+        errorBox.textContent = error.message || String(error);
+      } finally {
+        button.disabled = false;
+        button.textContent = "登录";
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kaggle Relay 管理后台</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --panel-soft: #f8fafc;
+      --text: #111827;
+      --muted: #667085;
+      --border: #d8dee8;
+      --primary: #1f6feb;
+      --secondary: #475467;
+      --success: #15803d;
+      --danger: #b42318;
+      --warning: #b54708;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+    }
+    header {
+      min-height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 0 20px;
+      background: #101828;
+      color: #fff;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.3;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(320px, .82fr);
+      gap: 16px;
+      padding: 16px;
+    }
+    section, aside > div {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    aside {
+      display: grid;
+      gap: 16px;
+      align-content: start;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      line-height: 1.35;
+    }
+    button, select, input, textarea {
+      min-height: 34px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      padding: 7px 10px;
+      font-size: 14px;
+      background: #fff;
+    }
+    input, textarea, select {
+      width: 100%;
+      color: var(--text);
+    }
+    textarea {
+      min-height: 68px;
+      resize: vertical;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+    }
+    button {
+      border-color: transparent;
+      background: var(--primary);
+      color: #fff;
+      cursor: pointer;
+    }
+    button.secondary { background: var(--secondary); }
+    button.light {
+      border-color: #b9cdf7;
+      background: #edf4ff;
+      color: #175cd3;
+    }
+    button.danger { background: var(--danger); }
+    button:disabled {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+    .session {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      flex-wrap: wrap;
+      color: #d0d5dd;
+      font-size: 13px;
+    }
+    .toolbar, .status-line {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .status-line {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #eef4ff;
+      color: #1849a9;
+      font-size: 12px;
+      line-height: 1.3;
+      white-space: nowrap;
+    }
+    .pill.ok { background: #dcfae6; color: #067647; }
+    .pill.bad { background: #fee4e2; color: #b42318; }
+    .pill.warn { background: #fef0c7; color: #b54708; }
+    .table-wrap {
+      max-height: calc(100vh - 232px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 9px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--panel-soft);
+      color: #344054;
+    }
+    td.actions {
+      white-space: nowrap;
+    }
+    .mono {
+      font-family: Consolas, Monaco, monospace;
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .progress {
+      width: 118px;
+      height: 8px;
+      margin-top: 5px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e4e7ec;
+    }
+    .progress > div {
+      height: 100%;
+      background: var(--success);
+    }
+    .summary-list {
+      display: grid;
+      gap: 10px;
+    }
+    .summary-item {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+    }
+    .summary-title {
+      margin-bottom: 4px;
+      font-weight: 700;
+    }
+    .form-grid {
+      display: grid;
+      gap: 10px;
+    }
+    .field {
+      display: grid;
+      gap: 5px;
+    }
+    .field label {
+      color: #344054;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #344054;
+      font-size: 13px;
+    }
+    .check-row input {
+      width: auto;
+      min-height: 0;
+    }
+    .inline-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .message {
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-word;
+    }
+    pre {
+      margin: 0;
+      max-height: 360px;
+      overflow: auto;
+      border-radius: 8px;
+      background: #101828;
+      color: #f2f4f7;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .detail-block {
+      margin-top: 16px;
+    }
+    .error {
+      color: var(--danger);
+      font-size: 13px;
+      word-break: break-word;
+    }
+    @media (max-width: 980px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px 16px;
+      }
+      .session {
+        justify-content: flex-start;
+      }
+      main {
+        grid-template-columns: 1fr;
+        padding: 12px;
+      }
+      .table-wrap {
+        max-height: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Kaggle Relay 管理后台</h1>
+    <div class="session">
+      <span id="sessionInfo">检查登录状态...</span>
+      <button class="secondary" id="logoutButton" type="button">退出登录</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>任务列表</h2>
+      <div class="status-line">
+        <span id="healthText">服务状态：加载中...</span>
+        <span id="jobCountText">任务数：-</span>
+        <span id="lastRefreshText">刷新：-</span>
+      </div>
+      <div class="toolbar">
+        <label>
+          数量
+          <select id="limitSelect">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </label>
+        <button id="refreshButton" type="button">刷新</button>
+        <button class="light" id="autoRefreshButton" type="button">自动刷新：开</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>状态</th>
+              <th>进度</th>
+              <th>Kaggle Key</th>
+              <th>Dataset / Kernel</th>
+              <th>Cache</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="jobsBody">
+            <tr><td colspan="7" class="muted">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="detail-block">
+        <h2>任务详情</h2>
+        <pre id="jobDetail">选择任务后显示完整 JSON 和 recent_logs。</pre>
+      </div>
+    </section>
+
+    <aside>
+      <div>
+        <h2>多用户 / 多 Kaggle Key</h2>
+        <div id="authConfig" class="summary-list">加载中...</div>
+      </div>
+      <div id="adminTools" hidden>
+        <h2>配置管理</h2>
+        <div class="summary-list">
+          <div class="summary-item">
+            <div class="summary-title">添加 Kaggle 账号</div>
+            <form id="kaggleKeyForm" class="form-grid">
+              <div class="field">
+                <label for="newKaggleKeyId">Key ID</label>
+                <input id="newKaggleKeyId" autocomplete="off" placeholder="例如 team-a" required />
+              </div>
+              <div class="field">
+                <label for="newKaggleApiToken">Kaggle API Token</label>
+                <textarea id="newKaggleApiToken" autocomplete="off" placeholder='{"username":"...","key":"..."} 或 KGAT_...'></textarea>
+              </div>
+              <div class="field">
+                <label for="newKaggleUsername">Username</label>
+                <input id="newKaggleUsername" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="newKaggleKey">Key</label>
+                <input id="newKaggleKey" type="password" autocomplete="new-password" />
+              </div>
+              <div class="field">
+                <label for="newKaggleConfigDir">Config Dir</label>
+                <input id="newKaggleConfigDir" autocomplete="off" placeholder="/root/.kaggle" />
+              </div>
+              <button type="submit">保存 Kaggle 账号</button>
+              <div id="kaggleKeyMessage" class="message" aria-live="polite"></div>
+            </form>
+          </div>
+
+          <div class="summary-item">
+            <div class="summary-title">添加用户</div>
+            <form id="relayTokenForm" class="form-grid">
+              <div class="field">
+                <label for="newRelayTokenId">用户 ID</label>
+                <input id="newRelayTokenId" autocomplete="off" placeholder="例如 user-b" required />
+              </div>
+              <div class="inline-actions">
+                <div class="field">
+                  <label for="newRelayToken">Relay Token</label>
+                  <input id="newRelayToken" type="password" autocomplete="new-password" required />
+                </div>
+                <button class="light" id="generateRelayTokenButton" type="button">生成</button>
+              </div>
+              <label class="check-row">
+                <input id="newRelayAllowAll" type="checkbox" />
+                允许访问所有 Kaggle Key
+              </label>
+              <div class="field">
+                <label for="newRelayAllowedKeys">允许访问的 Key</label>
+                <select id="newRelayAllowedKeys" multiple size="4"></select>
+              </div>
+              <button type="submit">保存用户</button>
+              <div id="relayTokenMessage" class="message" aria-live="polite"></div>
+            </form>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h2>Kaggle 账号检查</h2>
+        <div class="toolbar">
+          <select id="accountKeySelect"></select>
+          <button id="accountButton" type="button">检查</button>
+        </div>
+        <pre id="accountResult">选择 key 后点击检查。</pre>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    let autoRefresh = true;
+    let timer = null;
+    let authConfigCache = null;
+
+    function qs(id) {
+      return document.getElementById(id);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function shortId(value, size = 12) {
+      const text = String(value || "");
+      if (text.length <= size) return text;
+      return `${text.slice(0, size)}...`;
+    }
+
+    function fmtBytes(bytes) {
+      const value = Number(bytes);
+      if (!Number.isFinite(value)) return "-";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let current = value;
+      let index = 0;
+      while (current >= 1024 && index < units.length - 1) {
+        current /= 1024;
+        index += 1;
+      }
+      return `${current.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        credentials: "same-origin",
+        headers: {
+          ...(options.headers || {})
+        }
+      });
+
+      if (response.status === 401) {
+        window.location.href = "/login";
+        throw new Error("unauthorized");
+      }
+      if (!response.ok) {
+        let detail = await response.text();
+        try {
+          const data = JSON.parse(detail);
+          detail = data.detail || detail;
+        } catch (_) {}
+        throw new Error(`${response.status} ${detail}`);
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) return response.json();
+      return response;
+    }
+
+    async function loadSession() {
+      const session = await api("/v1/ui/session");
+      if (!session.authenticated) {
+        window.location.href = "/login";
+        throw new Error("unauthenticated");
+      }
+      qs("sessionInfo").textContent = `已登录：${session.principal_id}`;
+      return session;
+    }
+
+    async function loadHealth() {
+      const data = await api("/v1/health");
+      qs("healthText").innerHTML =
+        `服务状态：<span class="pill ok">${escapeHtml(data.status)}</span> 版本：${escapeHtml(data.version)} 剩余空间：${fmtBytes(data.free_bytes)}`;
+    }
+
+    function statusPill(status) {
+      const value = String(status || "");
+      if (value === "complete") return `<span class="pill ok">${escapeHtml(value)}</span>`;
+      if (value === "failed") return `<span class="pill bad">${escapeHtml(value)}</span>`;
+      if (["queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "downloading_output"].includes(value)) {
+        return `<span class="pill warn">${escapeHtml(value)}</span>`;
+      }
+      return `<span class="pill">${escapeHtml(value)}</span>`;
+    }
+
+    async function loadJobs() {
+      const limit = Number(qs("limitSelect").value || 50);
+      const jobs = await api(`/v1/jobs?limit=${limit}`);
+      qs("jobCountText").textContent = `任务数：${jobs.length}`;
+      qs("lastRefreshText").textContent = `刷新：${new Date().toLocaleTimeString()}`;
+
+      const tbody = qs("jobsBody");
+      if (!jobs.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="muted">暂无任务。</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = jobs.map((job) => {
+        const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+        const jobId = escapeHtml(job.job_id);
+        const canDownload = job.status === "complete" && job.artifact_path;
+        return `
+          <tr>
+            <td class="mono" title="${jobId}">${escapeHtml(shortId(job.job_id))}</td>
+            <td>${statusPill(job.status)}</td>
+            <td>
+              <div>${Math.round(progress)}%</div>
+              <div class="progress"><div style="width:${progress}%"></div></div>
+            </td>
+            <td class="mono">${escapeHtml(job.kaggle_key_id || "legacy")}</td>
+            <td>
+              <div><strong>Dataset:</strong> ${escapeHtml(job.dataset_ref)}</div>
+              <div><strong>Kernel:</strong> ${escapeHtml(job.kernel_ref)}</div>
+            </td>
+            <td>${job.dataset_cache_hit ? '<span class="pill ok">命中</span>' : '<span class="pill">未命中</span>'}</td>
+            <td class="actions">
+              <button type="button" data-job-detail="${jobId}">详情</button>
+              ${canDownload ? `<button class="light" type="button" data-job-download="${jobId}">下载</button>` : ""}
+            </td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    async function loadJobDetail(jobId) {
+      const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}`);
+      qs("jobDetail").textContent = JSON.stringify(data, null, 2);
+    }
+
+    function formatAllowed(value) {
+      if (Array.isArray(value)) return value.length ? value.join(", ") : "无";
+      return value || "-";
+    }
+
+    function renderAuthConfig(data) {
+      authConfigCache = data;
+      const relayTokens = data.relay_tokens || [];
+      const kaggleKeys = data.kaggle_keys || [];
+
+      qs("authConfig").innerHTML = `
+        <div class="summary-item">
+          <div class="summary-title">当前登录</div>
+          <div class="muted">模式：${escapeHtml(data.mode)}</div>
+          <div class="muted">Principal：${escapeHtml(data.principal_id || "-")}</div>
+          <div class="muted">允许 Key：${escapeHtml(formatAllowed(data.allowed_kaggle_key_ids))}</div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-title">Relay Principals</div>
+          ${relayTokens.map((token) => `
+            <div class="muted">
+              <strong>${escapeHtml(token.id)}</strong>
+              ${token.current ? '<span class="pill ok">当前</span>' : ""}
+              <br />允许：${escapeHtml(formatAllowed(token.allowed_kaggle_key_ids))}
+            </div>
+          `).join("<hr />") || '<div class="muted">无</div>'}
+        </div>
+        <div class="summary-item">
+          <div class="summary-title">Kaggle Keys</div>
+          ${kaggleKeys.map((key) => `
+            <div class="muted">
+              <strong>${escapeHtml(key.id || "legacy")}</strong><br />
+              username：${escapeHtml(key.username || "-")}<br />
+              source：${escapeHtml(key.credential_source || "-")}
+            </div>
+          `).join("<hr />") || '<div class="muted">无</div>'}
+        </div>
+      `;
+
+      const select = qs("accountKeySelect");
+      select.innerHTML = kaggleKeys.map((key) => {
+        const label = `${key.id || "legacy"}${key.username ? " (" + key.username + ")" : ""}`;
+        return `<option value="${escapeHtml(key.id || "")}">${escapeHtml(label)}</option>`;
+      }).join("");
+
+      const allowedSelect = qs("newRelayAllowedKeys");
+      allowedSelect.innerHTML = kaggleKeys
+        .filter((key) => key.id)
+        .map((key) => `<option value="${escapeHtml(key.id)}">${escapeHtml(key.id)}</option>`)
+        .join("");
+      qs("adminTools").hidden = !data.can_manage_auth;
+    }
+
+    async function loadAuthConfig() {
+      const data = await api("/v1/auth/config");
+      renderAuthConfig(data);
+      return data;
+    }
+
+    async function checkKaggleAccount() {
+      const keyId = qs("accountKeySelect").value || "";
+      qs("accountResult").textContent = "检查中...";
+      try {
+        const path = keyId ? `/v1/kaggle/account?kaggle_key_id=${encodeURIComponent(keyId)}` : "/v1/kaggle/account";
+        const data = await api(path);
+        qs("accountResult").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        qs("accountResult").textContent = error.message || String(error);
+      }
+    }
+
+    async function downloadArtifacts(jobId) {
+      try {
+        const response = await fetch(`/v1/jobs/${encodeURIComponent(jobId)}/artifacts.zip`, {
+          credentials: "same-origin"
+        });
+        if (response.status === 401) {
+          window.location.href = "/login";
+          return;
+        }
+        if (!response.ok) {
+          alert(`下载失败：${await response.text()}`);
+          return;
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${jobId}-artifacts.zip`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        alert(`下载失败：${error.message || String(error)}`);
+      }
+    }
+
+    function formMessage(id, text, isError = false) {
+      const box = qs(id);
+      box.textContent = text;
+      box.className = isError ? "message error" : "message";
+    }
+
+    function selectedAllowedKeys() {
+      return Array.from(qs("newRelayAllowedKeys").selectedOptions).map((option) => option.value);
+    }
+
+    function generateRelayToken() {
+      const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+      const bytes = new Uint8Array(48);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (value) => chars[value % chars.length]).join("");
+    }
+
+    async function addKaggleKey(event) {
+      event.preventDefault();
+      formMessage("kaggleKeyMessage", "");
+      const payload = {
+        id: qs("newKaggleKeyId").value.trim(),
+        username: qs("newKaggleUsername").value.trim(),
+        key: qs("newKaggleKey").value.trim(),
+        api_token: qs("newKaggleApiToken").value.trim(),
+        config_dir: qs("newKaggleConfigDir").value.trim()
+      };
+      if (!payload.id) {
+        formMessage("kaggleKeyMessage", "请填写 Key ID", true);
+        return;
+      }
+      if (!((payload.username && payload.key) || payload.api_token || payload.config_dir)) {
+        formMessage("kaggleKeyMessage", "请填写 API Token、Username/Key 或 Config Dir", true);
+        return;
+      }
+
+      try {
+        const data = await api("/v1/auth/kaggle-keys", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        renderAuthConfig(data);
+        qs("kaggleKeyForm").reset();
+        formMessage("kaggleKeyMessage", "Kaggle 账号已保存");
+      } catch (error) {
+        formMessage("kaggleKeyMessage", error.message || String(error), true);
+      }
+    }
+
+    async function addRelayToken(event) {
+      event.preventDefault();
+      formMessage("relayTokenMessage", "");
+      const allowAll = qs("newRelayAllowAll").checked;
+      const allowedKeys = selectedAllowedKeys();
+      const payload = {
+        id: qs("newRelayTokenId").value.trim(),
+        token: qs("newRelayToken").value.trim(),
+        allow_all_kaggle_keys: allowAll,
+        allowed_kaggle_key_ids: allowAll ? [] : allowedKeys
+      };
+      if (!payload.id || !payload.token) {
+        formMessage("relayTokenMessage", "请填写用户 ID 和 Relay Token", true);
+        return;
+      }
+      if (!allowAll && !allowedKeys.length) {
+        formMessage("relayTokenMessage", "请选择至少一个允许访问的 Key", true);
+        return;
+      }
+
+      try {
+        const data = await api("/v1/auth/relay-tokens", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        renderAuthConfig(data);
+        qs("relayTokenForm").reset();
+        qs("newRelayAllowedKeys").disabled = false;
+        qs("newRelayToken").type = "password";
+        formMessage("relayTokenMessage", "用户已保存；请记录刚才填写的 token，后端不会再次显示");
+      } catch (error) {
+        formMessage("relayTokenMessage", error.message || String(error), true);
+      }
+    }
+
+    async function logout() {
+      await fetch("/v1/ui/logout", {
+        method: "POST",
+        credentials: "same-origin"
+      });
+      window.location.href = "/login";
+    }
+
+    function toggleAutoRefresh() {
+      autoRefresh = !autoRefresh;
+      qs("autoRefreshButton").textContent = `自动刷新：${autoRefresh ? "开" : "关"}`;
+    }
+
+    async function loadAll() {
+      try {
+        await loadSession();
+        await Promise.all([loadHealth(), loadJobs(), loadAuthConfig()]);
+      } catch (error) {
+        if (!["unauthorized", "unauthenticated"].includes(error.message)) {
+          qs("healthText").innerHTML = `<span class="error">${escapeHtml(error.message || String(error))}</span>`;
+        }
+      }
+    }
+
+    document.addEventListener("click", (event) => {
+      const detailButton = event.target.closest("[data-job-detail]");
+      if (detailButton) {
+        loadJobDetail(detailButton.dataset.jobDetail).catch(console.error);
+        return;
+      }
+      const downloadButton = event.target.closest("[data-job-download]");
+      if (downloadButton) {
+        downloadArtifacts(downloadButton.dataset.jobDownload);
+      }
+    });
+
+    qs("logoutButton").addEventListener("click", () => logout().catch(console.error));
+    qs("refreshButton").addEventListener("click", () => loadAll().catch(console.error));
+    qs("autoRefreshButton").addEventListener("click", toggleAutoRefresh);
+    qs("accountButton").addEventListener("click", () => checkKaggleAccount().catch(console.error));
+    qs("limitSelect").addEventListener("change", () => loadJobs().catch(console.error));
+    qs("kaggleKeyForm").addEventListener("submit", (event) => addKaggleKey(event).catch(console.error));
+    qs("relayTokenForm").addEventListener("submit", (event) => addRelayToken(event).catch(console.error));
+    qs("generateRelayTokenButton").addEventListener("click", () => {
+      qs("newRelayToken").type = "text";
+      qs("newRelayToken").value = generateRelayToken();
+      formMessage("relayTokenMessage", "已生成 token；保存前可以复制给用户");
+    });
+    qs("newRelayAllowAll").addEventListener("change", () => {
+      qs("newRelayAllowedKeys").disabled = qs("newRelayAllowAll").checked;
+    });
+
+    loadAll();
+    timer = setInterval(() => {
+      if (autoRefresh) {
+        loadJobs().catch(console.error);
+      }
+    }, 5000);
+  </script>
+</body>
+</html>
