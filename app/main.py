@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import shutil
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -11,7 +13,7 @@ from typing import Literal
 
 import aiofiles
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from app.archive import (
     ArchiveError,
@@ -19,15 +21,32 @@ from app.archive import (
     safe_extract_zip,
     validate_chunk_index,
 )
-from app.auth_config import AuthSelectionError, AuthStore, RelayPrincipal, bearer_token
+from app.auth_config import AuthConfigError, AuthSelectionError, AuthStore, RelayPrincipal, bearer_token
 from app.config import Settings
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter
-from app.schemas import ChunkResponse, CreateJobRequest, HealthResponse, JobProgressRequest, JobResponse
+from app.schemas import (
+    ChunkResponse,
+    CreateKaggleKeyRequest,
+    CreateJobRequest,
+    CreateRelayTokenRequest,
+    HealthResponse,
+    JobProgressRequest,
+    JobResponse,
+    UiLoginRequest,
+)
 from app.security import redact_secrets
+from app.ui_auth import (
+    authenticate_ui_session,
+    create_ui_session_cookie,
+    delete_ui_session_cookie,
+    set_ui_session_cookie,
+    ui_session_max_age_seconds,
+)
 from app.worker import has_ready_dataset_cache, process_job, validate_kernel_payload, validate_payloads
 
 VERSION = "0.1.0"
+AUTH_CONFIG_LOCK = threading.RLock()
 
 
 def get_settings(request: Request) -> Settings:
@@ -43,13 +62,22 @@ def get_auth_store(request: Request) -> AuthStore:
 
 
 async def require_auth(
+    request: Request,
     authorization: str = Header(default=""),
+    settings: Settings = Depends(get_settings),
     auth_store: AuthStore = Depends(get_auth_store),
 ) -> RelayPrincipal:
-    principal = auth_store.authenticate_authorization(authorization)
-    if not principal:
+    token = bearer_token(authorization)
+    if token:
+        principal = auth_store.authenticate_token(token)
+        if principal:
+            return principal
         raise HTTPException(status_code=401, detail="unauthorized")
-    return principal
+
+    principal = authenticate_ui_session(request, settings, auth_store)
+    if principal:
+        return principal
+    raise HTTPException(status_code=401, detail="unauthorized")
 
 
 def selection_error(exc: AuthSelectionError) -> HTTPException:
@@ -78,6 +106,11 @@ def job_response(db: RelayDb, job_id: str) -> JobResponse:
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
+    return job_to_response(db, job)
+
+
+def job_to_response(db: RelayDb, job: dict) -> JobResponse:
+    job_id = job["job_id"]
     dataset_cache_hit = has_ready_dataset_cache(
         db,
         job["dataset_ref"],
@@ -98,108 +131,169 @@ def job_response(db: RelayDb, job_id: str) -> JobResponse:
     )
 
 
-def list_authorized_job_ids(
-    db: RelayDb,
-    principal: RelayPrincipal,
-    auth_store: AuthStore,
-    limit: int,
-) -> list[str]:
-    safe_limit = min(max(int(limit), 1), 200)
-    if principal.allow_all_keys:
-        with db.connect() as conn:
-            rows = conn.execute(
-                "SELECT job_id FROM jobs ORDER BY created_at DESC LIMIT ?",
-                (safe_limit,),
-            ).fetchall()
-        return [row["job_id"] for row in rows]
-
-    allowed_key_ids = set(auth_store.allowed_key_ids(principal))
-    if not allowed_key_ids:
-        return []
-
-    placeholders = ", ".join("?" for _ in allowed_key_ids)
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT job_id FROM jobs
-            WHERE kaggle_key_id IN ({placeholders})
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (*sorted(allowed_key_ids), safe_limit),
-        ).fetchall()
-    return [row["job_id"] for row in rows]
+def public_allowed_key_ids(auth_store: AuthStore, principal: RelayPrincipal) -> list[str]:
+    return auth_store.allowed_key_ids(principal)
 
 
-def credential_source(credentials) -> str:
-    parts = []
-    if getattr(credentials, "config_dir", ""):
-        parts.append("config_dir")
-    if getattr(credentials, "api_token", ""):
-        parts.append("api_token")
-    if getattr(credentials, "username", "") and getattr(credentials, "key", ""):
-        parts.append("username_key")
-    return "+".join(parts) or "unknown"
+def public_kaggle_keys(auth_store: AuthStore, principal: RelayPrincipal) -> list[dict]:
+    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
+    if auth_store.legacy:
+        return [{"id": "", "username": "", "credential_source": "environment"}]
+
+    summaries = []
+    kaggle_keys = getattr(auth_store, "_kaggle_keys", {})
+    for key_id in allowed_key_ids:
+        credentials = kaggle_keys.get(key_id)
+        if not credentials:
+            continue
+        if credentials.config_dir:
+            credential_source = "config_dir"
+        elif credentials.api_token:
+            credential_source = "api_token"
+        elif credentials.username and credentials.key:
+            credential_source = "username_key"
+        else:
+            credential_source = "unknown"
+        summaries.append(
+            {
+                "id": credentials.id,
+                "username": credentials.username,
+                "credential_source": credential_source,
+            }
+        )
+    return summaries
+
+
+def public_relay_tokens(auth_store: AuthStore, principal: RelayPrincipal) -> list[dict]:
+    tokens = []
+    for _token_value, token_principal in getattr(auth_store, "_tokens", []):
+        if not principal.allow_all_keys and token_principal.id != principal.id:
+            continue
+        allowed = (
+            "*"
+            if token_principal.allow_all_keys
+            else sorted(token_principal.allowed_kaggle_key_ids or [])
+        )
+        tokens.append(
+            {
+                "id": token_principal.id,
+                "allowed_kaggle_key_ids": allowed,
+                "current": token_principal.id == principal.id,
+            }
+        )
+    return tokens
 
 
 def auth_config_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
-    if getattr(auth_store, "legacy", False):
-        return {
-            "mode": "legacy",
-            "current_token_id": principal.id,
-            "allowed_kaggle_key_ids": auth_store.allowed_key_ids(principal),
-            "relay_tokens": [
-                {
-                    "id": principal.id,
-                    "current": True,
-                    "allowed_kaggle_key_ids": auth_store.allowed_key_ids(principal),
-                }
-            ],
-            "kaggle_keys": [
-                {
-                    "id": "",
-                    "username": "",
-                    "credential_source": "environment_or_mounted_kaggle_config",
-                }
-            ],
-        }
-
-    kaggle_keys = getattr(auth_store, "_kaggle_keys", {})
-    allowed_key_ids = auth_store.allowed_key_ids(principal)
-    visible_keys = []
-    for key_id in allowed_key_ids:
-        credentials = kaggle_keys.get(key_id)
-        visible_keys.append(
-            {
-                "id": key_id,
-                "username": getattr(credentials, "username", "") if credentials else "",
-                "credential_source": credential_source(credentials) if credentials else "unknown",
-            }
-        )
-
-    visible_tokens = []
-    for _token_value, token_principal in getattr(auth_store, "_tokens", []):
-        if principal.allow_all_keys or token_principal.id == principal.id:
-            allowed = (
-                "*"
-                if token_principal.allow_all_keys
-                else sorted(token_principal.allowed_kaggle_key_ids or [])
-            )
-            visible_tokens.append(
-                {
-                    "id": token_principal.id,
-                    "current": token_principal.id == principal.id,
-                    "allowed_kaggle_key_ids": allowed,
-                }
-            )
-
+    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
     return {
-        "mode": "multi_key",
+        "mode": "legacy" if auth_store.legacy else "multi_key",
+        "principal_id": principal.id,
         "current_token_id": principal.id,
         "allowed_kaggle_key_ids": allowed_key_ids,
-        "relay_tokens": visible_tokens,
-        "kaggle_keys": visible_keys,
+        "can_manage_auth": principal.allow_all_keys and not auth_store.legacy,
+        "relay_tokens": public_relay_tokens(auth_store, principal),
+        "kaggle_keys": public_kaggle_keys(auth_store, principal),
     }
+
+
+def session_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
+    return {
+        "authenticated": True,
+        "principal_id": principal.id,
+        "allowed_kaggle_key_ids": public_allowed_key_ids(auth_store, principal),
+    }
+
+
+def require_config_admin(settings: Settings, principal: RelayPrincipal) -> Path:
+    if not settings.auth_config_path:
+        raise HTTPException(status_code=400, detail="RELAY_AUTH_CONFIG is required")
+    if not principal.allow_all_keys:
+        raise HTTPException(status_code=403, detail="admin permission is required")
+    return Path(settings.auth_config_path)
+
+
+def read_auth_config(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="failed to read auth config") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="auth config is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="auth config must be a JSON object")
+    data.setdefault("relay_tokens", [])
+    data.setdefault("kaggle_keys", [])
+    if not isinstance(data["relay_tokens"], list) or not isinstance(data["kaggle_keys"], list):
+        raise HTTPException(status_code=500, detail="auth config lists are invalid")
+    return data
+
+
+def validate_and_write_auth_config(path: Path, data: dict) -> AuthStore:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        new_store = AuthStore.from_file(tmp_path)
+        os.replace(tmp_path, path)
+        os.chmod(path, 0o600)
+        return new_store
+    except AuthConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def add_kaggle_key_config(settings: Settings, principal: RelayPrincipal, payload: CreateKaggleKeyRequest) -> AuthStore:
+    path = require_config_admin(settings, principal)
+    key_id = payload.id.strip()
+    entry = {"id": key_id}
+    username = payload.username.strip()
+    key = payload.key.strip()
+    api_token = payload.api_token.strip()
+    config_dir = payload.config_dir.strip()
+    if username or key:
+        entry["username"] = username
+        entry["key"] = key
+    if api_token:
+        entry["api_token"] = api_token
+    if config_dir:
+        entry["config_dir"] = config_dir
+    if not ((username and key) or api_token or config_dir):
+        raise HTTPException(status_code=400, detail="kaggle credentials are required")
+
+    with AUTH_CONFIG_LOCK:
+        data = read_auth_config(path)
+        if any(str(item.get("id", "")).strip() == key_id for item in data["kaggle_keys"] if isinstance(item, dict)):
+            raise HTTPException(status_code=409, detail="kaggle key id already exists")
+        data["kaggle_keys"].append(entry)
+        return validate_and_write_auth_config(path, data)
+
+
+def add_relay_token_config(settings: Settings, principal: RelayPrincipal, payload: CreateRelayTokenRequest) -> AuthStore:
+    path = require_config_admin(settings, principal)
+    token_id = payload.id.strip()
+    token = payload.token.strip()
+    allowed_ids = [value.strip() for value in payload.allowed_kaggle_key_ids if value.strip()]
+    allowed: str | list[str] = "*" if payload.allow_all_kaggle_keys else allowed_ids
+    if not payload.allow_all_kaggle_keys and not allowed_ids:
+        raise HTTPException(status_code=400, detail="allowed_kaggle_key_ids is required")
+
+    with AUTH_CONFIG_LOCK:
+        data = read_auth_config(path)
+        if any(str(item.get("id", "")).strip() == token_id for item in data["relay_tokens"] if isinstance(item, dict)):
+            raise HTTPException(status_code=409, detail="relay token id already exists")
+        if any(str(item.get("token", "")).strip() == token for item in data["relay_tokens"] if isinstance(item, dict)):
+            raise HTTPException(status_code=409, detail="relay token already exists")
+        data["relay_tokens"].append(
+            {
+                "id": token_id,
+                "token": token,
+                "allowed_kaggle_key_ids": allowed,
+            }
+        )
+        return validate_and_write_auth_config(path, data)
 
 
 def authorize_job_callback(job: dict, authorization: str, auth_store: AuthStore) -> bool:
@@ -312,13 +406,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.auth_store = AuthStore.from_settings(settings)
     app.state.queue = asyncio.Queue()
 
+    def static_file(name: str) -> Path:
+        return Path(__file__).parent / "static" / name
+
+    def ui_response(
+        request: Request,
+        settings: Settings,
+        auth_store: AuthStore,
+    ):
+        principal = authenticate_ui_session(request, settings, auth_store)
+        if not principal:
+            return RedirectResponse("/login", status_code=303)
+        return FileResponse(static_file("index.html"))
+
     @app.get("/", include_in_schema=False)
-    def ui_index() -> FileResponse:
-        return FileResponse(Path(__file__).parent / "static" / "index.html")
+    def ui_index(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+    ):
+        return ui_response(request, settings, auth_store)
 
     @app.get("/ui", include_in_schema=False)
-    def ui_alias() -> FileResponse:
-        return FileResponse(Path(__file__).parent / "static" / "index.html")
+    def ui_alias(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+    ):
+        return ui_response(request, settings, auth_store)
+
+    @app.get("/admin", include_in_schema=False)
+    def admin_alias(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+    ):
+        return ui_response(request, settings, auth_store)
+
+    @app.get("/login", include_in_schema=False)
+    def login_page() -> FileResponse:
+        return FileResponse(static_file("login.html"))
+
+    @app.post("/v1/ui/login")
+    def ui_login(
+        payload: UiLoginRequest,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+    ) -> JSONResponse:
+        principal = auth_store.authenticate_token(payload.token.strip())
+        if not principal:
+            raise HTTPException(status_code=401, detail="invalid token")
+        max_age = ui_session_max_age_seconds()
+        response = JSONResponse(
+            {
+                "ok": True,
+                "principal_id": principal.id,
+                "allowed_kaggle_key_ids": public_allowed_key_ids(auth_store, principal),
+            }
+        )
+        set_ui_session_cookie(
+            response,
+            create_ui_session_cookie(settings, auth_store, principal, max_age),
+            max_age,
+        )
+        return response
+
+    @app.post("/v1/ui/logout")
+    def ui_logout() -> JSONResponse:
+        response = JSONResponse({"ok": True})
+        delete_ui_session_cookie(response)
+        return response
+
+    @app.get("/v1/ui/session")
+    def ui_session(
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+    ) -> dict:
+        principal = authenticate_ui_session(request, settings, auth_store)
+        if not principal:
+            return {"authenticated": False}
+        return session_summary(auth_store, principal)
 
     @app.get("/v1/health", response_model=HealthResponse)
     def health(
@@ -334,11 +502,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.get("/v1/auth/config")
-    def get_auth_config(
+    def auth_config(
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
         return auth_config_summary(auth_store, principal)
+
+    @app.post("/v1/auth/kaggle-keys")
+    def create_auth_kaggle_key(
+        payload: CreateKaggleKeyRequest,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        new_store = add_kaggle_key_config(settings, principal, payload)
+        request.app.state.auth_store = new_store
+        return auth_config_summary(new_store, principal)
+
+    @app.post("/v1/auth/relay-tokens")
+    def create_auth_relay_token(
+        payload: CreateRelayTokenRequest,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        new_store = add_relay_token_config(settings, principal, payload)
+        request.app.state.auth_store = new_store
+        return auth_config_summary(new_store, principal)
 
     @app.get("/v1/kaggle/account")
     def kaggle_account(
@@ -386,10 +578,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> list[JobResponse]:
-        return [
-            job_response(db, job_id)
-            for job_id in list_authorized_job_ids(db, principal, auth_store, limit)
-        ]
+        key_filter = None if principal.allow_all_keys else set(auth_store.allowed_key_ids(principal))
+        jobs = db.list_jobs(kaggle_key_ids=key_filter, limit=limit)
+        return [job_to_response(db, job) for job in jobs]
 
     @app.put(
         "/v1/jobs/{job_id}/archives/{archive_type}/chunks/{index}",

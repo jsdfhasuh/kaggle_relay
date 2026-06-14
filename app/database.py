@@ -217,6 +217,37 @@ class RelayDb:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         return dict(row) if row else None
 
+    def list_jobs(
+        self,
+        kaggle_key_ids: Optional[set[str]] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        with self.connect() as conn:
+            if kaggle_key_ids is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+            elif not kaggle_key_ids:
+                rows = []
+            else:
+                placeholders = ", ".join("?" for _ in kaggle_key_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM jobs
+                    WHERE kaggle_key_id IN ({placeholders})
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (*sorted(kaggle_key_ids), safe_limit),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_latest_job_by_kernel_ref(
         self,
         kernel_ref: str,

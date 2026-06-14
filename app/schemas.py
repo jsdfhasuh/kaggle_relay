@@ -77,3 +77,22 @@ class HealthResponse(BaseModel):
     version: str
     storage_dir: str
     free_bytes: int
+
+
+class UiLoginRequest(BaseModel):
+    token: str = Field(min_length=1)
+
+
+class CreateKaggleKeyRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    username: str = ""
+    key: str = ""
+    api_token: str = ""
+    config_dir: str = ""
+
+
+class CreateRelayTokenRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    token: str = Field(min_length=16)
+    allowed_kaggle_key_ids: list[str] = Field(default_factory=list)
+    allow_all_kaggle_keys: bool = False
