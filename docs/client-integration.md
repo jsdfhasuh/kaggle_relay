@@ -40,8 +40,9 @@ Kernel/notebook chunks are always uploaded because each run uses a fresh kernel.
 
 4. Create `dataset.zip` and `kernel.zip`.
 5. Call `POST /v1/jobs` with archive sizes, archive SHA-256 hashes, `payload_hash`,
-   and `callback_token_sha256`. Include `kaggle_key_id` when the relay token can
-   access more than one Kaggle key.
+   and `callback_token_sha256`. If the relay token can access more than one
+   Kaggle key, omit `kaggle_key_id` to let Relay choose an available key by GPU
+   quota, or include `kaggle_key_id` to force a specific key.
 6. If the response has `dataset_upload_required=true`, upload dataset chunks.
    If the field is absent, default to `true` for old Relay compatibility.
 7. Always upload kernel chunks.
@@ -107,9 +108,21 @@ Important field rules:
   local `dataset.zip`, even if Relay later says dataset upload can be skipped.
 - `callback_token_sha256` is optional but recommended. Relay stores only this
   hash. The raw callback token is embedded in the generated Kaggle script.
-- `kaggle_key_id` is optional only when the relay token maps to exactly one
-  Kaggle key. Jobs remain bound to the resolved key for upload, execution,
-  status, artifact download, deletion, and dataset cache lookup.
+- `kaggle_key_id` is optional. When the relay token maps to exactly one Kaggle
+  key, Relay uses that key. When the token can access multiple keys and this
+  field is omitted, Relay checks Kaggle quota and picks an allowed key with
+  remaining GPU quota. When this field is present, Relay uses the requested key
+  or rejects the request if the token is not allowed to use it.
+- `dataset-metadata.json` and `kernel-metadata.json` must include `id` in
+  `owner/slug` format. Relay validates those IDs against `dataset_ref` and
+  `kernel_ref` after upload assembly and before pushing to Kaggle. If the
+  selected Kaggle key has a configured `username`, the metadata owner must match
+  that username.
+- Jobs remain bound to the resolved key for upload, execution, status, artifact
+  download, deletion, and dataset cache lookup.
+- Jobs also remain bound to the relay token principal that created them. A client
+  resuming an interrupted upload must use the same relay token; another token
+  with access to the same Kaggle key receives `404 job not found`.
 - Do not send a client-side `reuse_dataset` field. Relay makes that decision.
 
 Relevant response fields:

@@ -29,6 +29,17 @@ list of keys, or all keys:
 }
 ```
 
+New Kaggle key entries added through the admin API/UI must include `username`
+along with `key`, `api_token`, or `config_dir`. Existing entries can be edited
+with `PATCH /v1/auth/kaggle-keys/{id}` or the admin UI. Relay uses that username
+to validate uploaded Kaggle metadata before submitting jobs, so it must be the
+Kaggle profile URL slug, not the display name. Tokens beginning with `KGAT_`
+should be stored as `api_token`; the `key` field is only for the legacy
+username/key credential shape.
+Use `POST /v1/kaggle/account/probe?kaggle_key_id=<id>` or the admin UI
+"强校验" button to verify the token can create a private dataset under the
+configured username. This creates a tiny probe dataset and then deletes it.
+
 ## API
 
 All `/v1/*` requests require:
@@ -41,6 +52,9 @@ Main endpoints:
 
 - `GET /v1/health`
 - `GET /v1/kaggle/account`
+- `POST /v1/kaggle/account/probe`
+- `GET /v1/kaggle/accounts`
+- `PATCH /v1/auth/kaggle-keys/{id}`
 - `POST /v1/jobs`
 - `PUT /v1/jobs/{job_id}/archives/{dataset|kernel}/chunks/{index}`
 - `POST /v1/jobs/{job_id}/complete`
@@ -49,9 +63,10 @@ Main endpoints:
 - `GET /v1/jobs/{job_id}/artifacts.zip`
 - `DELETE /v1/jobs/{job_id}`
 
-When a token can access exactly one Kaggle key, `POST /v1/jobs` may omit
-`kaggle_key_id` and Relay will bind the job to that key. When a token can access
-multiple keys or `"*"`, the create request must include `kaggle_key_id`.
+When `POST /v1/jobs` omits `kaggle_key_id`, Relay binds the job to the only
+allowed key, or for multi-key tokens chooses an allowed key with remaining GPU
+quota. Supplying `kaggle_key_id` still forces that specific key when the token is
+allowed to use it.
 
 ## Kernel Progress Callback
 
