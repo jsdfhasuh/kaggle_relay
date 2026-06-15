@@ -220,72 +220,88 @@ class RelayDb:
     def list_jobs(
         self,
         kaggle_key_ids: Optional[set[str]] = None,
+        relay_token_id: Optional[str] = None,
+        include_unowned: bool = False,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 200))
         with self.connect() as conn:
-            if kaggle_key_ids is None:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (safe_limit,),
-                ).fetchall()
-            elif not kaggle_key_ids:
-                rows = []
-            else:
+            conditions = []
+            params: list[Any] = []
+            if kaggle_key_ids is not None:
+                if not kaggle_key_ids:
+                    return []
                 placeholders = ", ".join("?" for _ in kaggle_key_ids)
-                rows = conn.execute(
-                    f"""
-                    SELECT * FROM jobs
-                    WHERE kaggle_key_id IN ({placeholders})
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (*sorted(kaggle_key_ids), safe_limit),
-                ).fetchall()
+                conditions.append(f"kaggle_key_id IN ({placeholders})")
+                params.extend(sorted(kaggle_key_ids))
+            if relay_token_id is not None:
+                if include_unowned:
+                    conditions.append("(relay_token_id = ? OR relay_token_id = '')")
+                else:
+                    conditions.append("relay_token_id = ?")
+                params.append(relay_token_id)
+
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (*params, safe_limit),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def get_latest_job_by_kernel_ref(
         self,
         kernel_ref: str,
         kaggle_key_ids: Optional[set[str]] = None,
+        relay_token_id: Optional[str] = None,
+        include_unowned: bool = False,
     ) -> Optional[dict[str, Any]]:
-        jobs = self.get_jobs_by_kernel_ref(kernel_ref, kaggle_key_ids=kaggle_key_ids, limit=1)
+        jobs = self.get_jobs_by_kernel_ref(
+            kernel_ref,
+            kaggle_key_ids=kaggle_key_ids,
+            relay_token_id=relay_token_id,
+            include_unowned=include_unowned,
+            limit=1,
+        )
         return jobs[0] if jobs else None
 
     def get_jobs_by_kernel_ref(
         self,
         kernel_ref: str,
         kaggle_key_ids: Optional[set[str]] = None,
+        relay_token_id: Optional[str] = None,
+        include_unowned: bool = False,
         limit: int = 30,
     ) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            if kaggle_key_ids is None:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE kernel_ref = ?
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (kernel_ref, limit),
-                ).fetchall()
-            elif not kaggle_key_ids:
-                rows = []
-            else:
+            conditions = ["kernel_ref = ?"]
+            params: list[Any] = [kernel_ref]
+            if kaggle_key_ids is not None:
+                if not kaggle_key_ids:
+                    return []
                 placeholders = ", ".join("?" for _ in kaggle_key_ids)
-                rows = conn.execute(
-                    f"""
-                    SELECT * FROM jobs
-                    WHERE kernel_ref = ? AND kaggle_key_id IN ({placeholders})
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (kernel_ref, *sorted(kaggle_key_ids), limit),
-                ).fetchall()
+                conditions.append(f"kaggle_key_id IN ({placeholders})")
+                params.extend(sorted(kaggle_key_ids))
+            if relay_token_id is not None:
+                if include_unowned:
+                    conditions.append("(relay_token_id = ? OR relay_token_id = '')")
+                else:
+                    conditions.append("relay_token_id = ?")
+                params.append(relay_token_id)
+
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE {' AND '.join(conditions)}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def update_job(self, job_id: str, **values: Any) -> None:

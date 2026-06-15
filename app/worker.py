@@ -39,20 +39,71 @@ def has_ready_dataset_cache(
     return False
 
 
-def validate_kernel_payload(kernel_dir: Path) -> str:
-    metadata_path = require_file(kernel_dir, "kernel-metadata.json")
+def read_metadata_json(path: Path, name: str) -> dict:
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ArchiveError("kernel-metadata.json is not valid JSON") from exc
+        raise ArchiveError(f"{name} is not valid JSON") from exc
+    if not isinstance(metadata, dict):
+        raise ArchiveError(f"{name} must be a JSON object")
+    return metadata
+
+
+def split_kaggle_ref(value: str, name: str) -> tuple[str, str]:
+    ref = str(value or "").strip()
+    parts = ref.split("/", 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise ArchiveError(f"{name} must be in owner/slug format")
+    return parts[0].strip(), parts[1].strip()
+
+
+def validate_metadata_ref(
+    metadata: dict,
+    metadata_name: str,
+    expected_ref: str,
+    credentials=None,
+) -> None:
+    metadata_ref = str(metadata.get("id") or "").strip()
+    if not metadata_ref:
+        raise ArchiveError(f"{metadata_name} requires id")
+    metadata_owner, _metadata_slug = split_kaggle_ref(metadata_ref, f"{metadata_name} id")
+
+    if expected_ref and metadata_ref.lower() != expected_ref.lower():
+        raise ArchiveError(
+            f"{metadata_name} id {metadata_ref} does not match requested ref {expected_ref}"
+        )
+
+    username = str(getattr(credentials, "username", "") or "").strip()
+    if username and metadata_owner.lower() != username.lower():
+        raise ArchiveError(
+            f"{metadata_name} owner {metadata_owner} does not match Kaggle key username {username}"
+        )
+
+
+def validate_kernel_payload(
+    kernel_dir: Path,
+    kernel_ref: str = "",
+    credentials=None,
+) -> str:
+    metadata_path = require_file(kernel_dir, "kernel-metadata.json")
+    metadata = read_metadata_json(metadata_path, "kernel-metadata.json")
+    validate_metadata_ref(metadata, "kernel-metadata.json", kernel_ref, credentials)
     code_file = str(metadata.get("code_file", "train.py") or "train.py")
     require_file(kernel_dir, code_file)
     return code_file
 
 
-def validate_payloads(dataset_dir: Path, kernel_dir: Path) -> str:
-    require_file(dataset_dir, "dataset-metadata.json")
-    return validate_kernel_payload(kernel_dir)
+def validate_payloads(
+    dataset_dir: Path,
+    kernel_dir: Path,
+    dataset_ref: str = "",
+    kernel_ref: str = "",
+    credentials=None,
+) -> str:
+    metadata_path = require_file(dataset_dir, "dataset-metadata.json")
+    metadata = read_metadata_json(metadata_path, "dataset-metadata.json")
+    validate_metadata_ref(metadata, "dataset-metadata.json", dataset_ref, credentials)
+    return validate_kernel_payload(kernel_dir, kernel_ref, credentials)
 
 
 def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None = None) -> None:
@@ -82,11 +133,17 @@ def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None
             kaggle_key_id=kaggle_key_id,
         )
         if dataset_cache_hit:
-            validate_kernel_payload(kernel_dir)
+            validate_kernel_payload(kernel_dir, job["kernel_ref"], credentials)
             db.update_job(job_id, dataset_status="ready", progress=40)
             log(f"Reusing ready dataset cache for {job['dataset_ref']}")
         else:
-            validate_payloads(dataset_dir, kernel_dir)
+            validate_payloads(
+                dataset_dir,
+                kernel_dir,
+                job["dataset_ref"],
+                job["kernel_ref"],
+                credentials,
+            )
             db.update_job(job_id, status="uploading_dataset", progress=20)
             adapter.upload_dataset(
                 dataset_dir,
@@ -95,7 +152,10 @@ def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None
             )
 
             db.update_job(job_id, status="waiting_dataset", progress=35)
-            dataset_status = adapter.wait_dataset(job["dataset_ref"])
+            dataset_status = adapter.wait_dataset(
+                job["dataset_ref"],
+                permission_grace_seconds=settings.dataset_status_permission_grace_seconds,
+            )
             db.update_job(job_id, dataset_status=dataset_status, progress=40)
             if is_ready_dataset_status(dataset_status):
                 db.upsert_dataset_cache(

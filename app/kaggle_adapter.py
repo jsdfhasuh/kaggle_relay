@@ -5,8 +5,11 @@ import shutil
 import subprocess
 import threading
 import time
+import tempfile
+import uuid
 import zipfile
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,6 +30,23 @@ _ENV_LOCK = threading.RLock()
 
 class KaggleAdapterError(RuntimeError):
     pass
+
+
+def parse_kaggle_duration(value: str) -> timedelta:
+    text = str(value or "").strip()
+    if text.endswith("s"):
+        text = text[:-1]
+    seconds_raw, _, nanos_raw = text.partition(".")
+    seconds = int(seconds_raw or "0")
+    nanos_text = re.sub(r"\D", "", nanos_raw)
+    nanos = int((nanos_text + "0" * 9)[:9]) if nanos_text else 0
+    return timedelta(seconds=seconds, microseconds=nanos // 1000)
+
+
+def patch_kaggle_duration_parser() -> None:
+    from kagglesdk.kaggle_object import TimeDeltaSerializer
+
+    TimeDeltaSerializer._from_dict_value = staticmethod(parse_kaggle_duration)
 
 
 def parse_training_progress_logs(output: str) -> list[dict]:
@@ -147,6 +167,147 @@ class KaggleAdapter:
             "auth_output": auth_result.stdout[-2000:],
         }
 
+    def quota(self) -> dict:
+        patch_kaggle_duration_parser()
+        try:
+            with self._temporary_kaggle_env():
+                from kaggle.api.kaggle_api_extended import KaggleApi
+
+                api = KaggleApi()
+                api.authenticate()
+                response = api.quota_view()
+        except SystemExit as exc:
+            raise KaggleAdapterError(f"Kaggle quota authentication failed: {exc}") from exc
+
+        accelerators = []
+        for resource, quota in (("GPU", response.gpu_quota), ("TPU", response.tpu_quota)):
+            if quota is None:
+                continue
+            used_hours = quota.time_used.total_seconds() / 3600
+            total_hours = quota.total_time_allowed.total_seconds() / 3600
+            accelerators.append(
+                {
+                    "resource": resource,
+                    "used_hours": round(used_hours, 4),
+                    "remaining_hours": round(max(0.0, total_hours - used_hours), 4),
+                    "total_hours": round(total_hours, 4),
+                }
+            )
+
+        return {
+            "available": True,
+            "refresh_at": response.quota_refresh_time.isoformat() if response.quota_refresh_time else "",
+            "accelerators": accelerators,
+            "error": "",
+        }
+
+    def probe_username_write_access(self) -> dict:
+        env = self._env()
+        username = env.get("KAGGLE_USERNAME", "").strip()
+        if not username:
+            return {
+                "ok": False,
+                "username": "",
+                "dataset_ref": "",
+                "created": False,
+                "cleanup_ok": False,
+                "cleanup_error": "",
+                "error": "kaggle username is required for write probe",
+            }
+
+        slug = f"relay-probe-{uuid.uuid4().hex[:12]}"
+        dataset_ref = f"{username}/{slug}"
+        created = False
+        cleanup_ok = False
+        cleanup_error = ""
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="kaggle-relay-probe-") as temp_dir:
+                probe_dir = Path(temp_dir)
+                (probe_dir / "probe.txt").write_text("kaggle relay credential probe\n", encoding="utf-8")
+                (probe_dir / "dataset-metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "id": dataset_ref,
+                            "title": f"Relay Probe {slug[-8:]}",
+                            "licenses": [{"name": "CC0-1.0"}],
+                            "resources": [
+                                {
+                                    "path": "probe.txt",
+                                    "description": "Kaggle Relay credential probe",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self._temporary_kaggle_env():
+                    from kaggle.api.kaggle_api_extended import KaggleApi
+
+                    api = KaggleApi()
+                    api.authenticate()
+                    response = api.dataset_create_new(
+                        str(probe_dir),
+                        public=False,
+                        quiet=True,
+                        convert_to_csv=False,
+                        dir_mode="skip",
+                    )
+                    error = str(getattr(response, "error", "") or "").strip()
+                    if error:
+                        return {
+                            "ok": False,
+                            "username": username,
+                            "dataset_ref": dataset_ref,
+                            "created": False,
+                            "cleanup_ok": False,
+                            "cleanup_error": "",
+                            "error": redact_secrets(error),
+                        }
+                    created = True
+                    try:
+                        result = self._run(
+                            ["datasets", "delete", dataset_ref, "-y"],
+                            check=False,
+                        )
+                        if result.returncode != 0:
+                            raise KaggleAdapterError(result.stdout.strip() or f"returncode={result.returncode}")
+                        cleanup_ok = True
+                    except Exception as exc:
+                        cleanup_error = redact_secrets(str(exc))[-2000:]
+        except SystemExit as exc:
+            return {
+                "ok": False,
+                "username": username,
+                "dataset_ref": dataset_ref,
+                "created": created,
+                "cleanup_ok": cleanup_ok,
+                "cleanup_error": cleanup_error,
+                "error": f"Kaggle probe authentication failed: {exc}",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "username": username,
+                "dataset_ref": dataset_ref,
+                "created": created,
+                "cleanup_ok": cleanup_ok,
+                "cleanup_error": cleanup_error,
+                "error": redact_secrets(str(exc))[-2000:],
+            }
+
+        return {
+            "ok": created,
+            "username": username,
+            "dataset_ref": dataset_ref,
+            "created": created,
+            "cleanup_ok": cleanup_ok,
+            "cleanup_error": cleanup_error,
+            "error": "" if cleanup_ok else "probe dataset was created but cleanup failed",
+        }
+
     def dataset_exists(self, dataset_ref: str) -> bool:
         try:
             from kaggle.api.kaggle_api_extended import KaggleApi
@@ -190,8 +351,10 @@ class KaggleAdapter:
                     dir_mode="tar",
                 )
 
-    def wait_dataset(self, dataset_ref: str) -> str:
+    def wait_dataset(self, dataset_ref: str, permission_grace_seconds: int = 0) -> str:
         start = time.time()
+        visibility_retry_logged = False
+        visibility_grace = max(0, int(permission_grace_seconds or 0))
         while True:
             result = self._run(["datasets", "status", dataset_ref], check=False)
             output = result.stdout.strip() or f"returncode={result.returncode}"
@@ -200,12 +363,23 @@ class KaggleAdapter:
                 return output
             if result.returncode == 0 and any(word in status_text for word in ["failed", "error", "deleted"]):
                 raise KaggleAdapterError(f"Dataset failed:\n{output}")
-            if result.returncode != 0 and any(
-                word in status_text
-                for word in ["401", "403", "404", "forbidden", "unauthorized", "not found"]
-            ):
+            elapsed = time.time() - start
+            if result.returncode != 0 and any(word in status_text for word in ["401", "unauthorized"]):
                 raise KaggleAdapterError(f"Dataset status failed:\n{output}")
-            if time.time() - start > 30 * 60:
+            if result.returncode != 0 and any(
+                word in status_text for word in ["403", "404", "forbidden", "not found"]
+            ):
+                if visibility_grace > 0 and elapsed <= visibility_grace:
+                    if not visibility_retry_logged:
+                        self.log(
+                            "Dataset status is temporarily unavailable after upload; "
+                            f"retrying for up to {visibility_grace} seconds"
+                        )
+                        visibility_retry_logged = True
+                    time.sleep(self.settings.dataset_poll_seconds)
+                    continue
+                raise KaggleAdapterError(f"Dataset status failed:\n{output}")
+            if elapsed > 30 * 60:
                 raise TimeoutError(f"Dataset wait timed out:\n{output}")
             time.sleep(self.settings.dataset_poll_seconds)
 

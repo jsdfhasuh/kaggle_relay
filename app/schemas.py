@@ -44,6 +44,10 @@ class JobResponse(BaseModel):
     payload_hash: str = ""
     callback_enabled: bool = False
     artifact_path: str = ""
+    can_download: bool = False
+    artifact_size: Optional[int] = None
+    artifact_filename: str = ""
+    download_unavailable_reason: str = ""
     dataset_cache_hit: bool = False
     dataset_upload_required: bool = True
     accepted_chunks: dict[str, list[int]]
@@ -85,6 +89,13 @@ class UiLoginRequest(BaseModel):
 
 class CreateKaggleKeyRequest(BaseModel):
     id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    username: str = ""
+    key: str = ""
+    api_token: str = ""
+    config_dir: str = ""
+
+
+class UpdateKaggleKeyRequest(BaseModel):
     username: str = ""
     key: str = ""
     api_token: str = ""

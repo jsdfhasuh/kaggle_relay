@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -34,6 +35,7 @@ from app.schemas import (
     JobProgressRequest,
     JobResponse,
     UiLoginRequest,
+    UpdateKaggleKeyRequest,
 )
 from app.security import redact_secrets
 from app.ui_auth import (
@@ -47,6 +49,7 @@ from app.worker import has_ready_dataset_cache, process_job, validate_kernel_pay
 
 VERSION = "0.1.0"
 AUTH_CONFIG_LOCK = threading.RLock()
+KAGGLE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def get_settings(request: Request) -> Settings:
@@ -84,8 +87,20 @@ def selection_error(exc: AuthSelectionError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
-def require_job_access(job: dict, principal: RelayPrincipal, auth_store: AuthStore) -> None:
+def can_access_job(job: dict, principal: RelayPrincipal, auth_store: AuthStore) -> bool:
     if not auth_store.can_access_key(principal, job.get("kaggle_key_id", "")):
+        return False
+
+    job_owner = str(job.get("relay_token_id") or "").strip()
+    if auth_store.legacy:
+        return not job_owner or job_owner == principal.id
+    if job_owner:
+        return job_owner == principal.id
+    return principal.allow_all_keys
+
+
+def require_job_access(job: dict, principal: RelayPrincipal, auth_store: AuthStore) -> None:
+    if not can_access_job(job, principal, auth_store):
         raise HTTPException(status_code=404, detail="job not found")
 
 
@@ -109,6 +124,39 @@ def job_response(db: RelayDb, job_id: str) -> JobResponse:
     return job_to_response(db, job)
 
 
+def artifact_download_metadata(job: dict) -> dict:
+    filename = f"{job['job_id']}-artifacts.zip"
+    metadata = {
+        "can_download": False,
+        "artifact_size": None,
+        "artifact_filename": filename,
+        "download_unavailable_reason": "",
+    }
+    if job["status"] != "complete":
+        metadata["download_unavailable_reason"] = "job is not complete"
+        return metadata
+    if not job.get("artifact_path"):
+        metadata["download_unavailable_reason"] = "artifact path is missing"
+        return metadata
+
+    artifact_path = Path(job["artifact_path"])
+    try:
+        stat = artifact_path.stat()
+    except FileNotFoundError:
+        metadata["download_unavailable_reason"] = "artifact file is missing"
+        return metadata
+    except OSError:
+        metadata["download_unavailable_reason"] = "artifact file is inaccessible"
+        return metadata
+    if not artifact_path.is_file():
+        metadata["download_unavailable_reason"] = "artifact path is not a file"
+        return metadata
+
+    metadata["can_download"] = True
+    metadata["artifact_size"] = stat.st_size
+    return metadata
+
+
 def job_to_response(db: RelayDb, job: dict) -> JobResponse:
     job_id = job["job_id"]
     dataset_cache_hit = has_ready_dataset_cache(
@@ -122,6 +170,7 @@ def job_to_response(db: RelayDb, job: dict) -> JobResponse:
             {
                 **job,
                 "callback_enabled": bool(job.get("callback_token_sha256")),
+                **artifact_download_metadata(job),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
             },
@@ -197,6 +246,169 @@ def auth_config_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dic
     }
 
 
+def quota_unavailable(error: str) -> dict:
+    return {
+        "available": False,
+        "refresh_at": "",
+        "accelerators": [],
+        "error": redact_secrets(error)[-2000:],
+    }
+
+
+def kaggle_account_status(
+    settings: Settings,
+    auth_store: AuthStore,
+    principal: RelayPrincipal,
+    kaggle_key_id: str = "",
+) -> dict:
+    try:
+        resolved_key_id = resolve_job_kaggle_key_id(settings, auth_store, principal, kaggle_key_id)
+        credentials = auth_store.credentials_for(resolved_key_id)
+    except AuthSelectionError as exc:
+        raise selection_error(exc) from exc
+
+    adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
+    account = adapter.account()
+    if account.get("authenticated"):
+        try:
+            quota = adapter.quota()
+        except Exception as exc:
+            quota = quota_unavailable(str(exc))
+    else:
+        quota = quota_unavailable("kaggle authentication failed")
+    return {"kaggle_key_id": resolved_key_id, **account, "quota": quota}
+
+
+def kaggle_account_probe(
+    settings: Settings,
+    auth_store: AuthStore,
+    principal: RelayPrincipal,
+    kaggle_key_id: str = "",
+) -> dict:
+    try:
+        resolved_key_id = auth_store.resolve_kaggle_key_id(principal, kaggle_key_id)
+        credentials = auth_store.credentials_for(resolved_key_id)
+    except AuthSelectionError as exc:
+        raise selection_error(exc) from exc
+
+    adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
+    return {"kaggle_key_id": resolved_key_id, **adapter.probe_username_write_access()}
+
+
+def quota_remaining_hours(quota: dict, preferred_resource: str = "GPU") -> float | None:
+    if not quota.get("available"):
+        return None
+    accelerators = quota.get("accelerators") or []
+    preferred = next(
+        (
+            item
+            for item in accelerators
+            if str(item.get("resource", "")).upper() == preferred_resource.upper()
+        ),
+        None,
+    )
+    if preferred is not None:
+        return float(preferred.get("remaining_hours") or 0)
+    if not accelerators:
+        return 0
+    return max(float(item.get("remaining_hours") or 0) for item in accelerators)
+
+
+def select_kaggle_key_by_quota(
+    settings: Settings,
+    auth_store: AuthStore,
+    principal: RelayPrincipal,
+    owner: str = "",
+) -> str:
+    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
+    owner = owner.strip()
+    if owner:
+        matching_key_ids = []
+        for key_id in allowed_key_ids:
+            credentials = auth_store.credentials_for(key_id)
+            username = str(getattr(credentials, "username", "") or "").strip()
+            if username.lower() == owner.lower():
+                matching_key_ids.append(key_id)
+        if not matching_key_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"no allowed kaggle key matches requested owner {owner}",
+            )
+        allowed_key_ids = matching_key_ids
+
+    candidates: list[tuple[float, str]] = []
+    exhausted: list[str] = []
+    unavailable: list[str] = []
+
+    for key_id in allowed_key_ids:
+        try:
+            credentials = auth_store.credentials_for(key_id)
+            quota = KaggleAdapter(settings, lambda _message: None, credentials=credentials).quota()
+            remaining = quota_remaining_hours(quota)
+        except Exception as exc:
+            unavailable.append(f"{key_id}: {redact_secrets(str(exc))[-300:]}")
+            continue
+
+        if remaining is None:
+            unavailable.append(f"{key_id}: quota unavailable")
+        elif remaining > 0:
+            candidates.append((remaining, key_id))
+        else:
+            exhausted.append(key_id)
+
+    if candidates:
+        return max(candidates)[1]
+    if exhausted:
+        raise HTTPException(
+            status_code=409,
+            detail="no allowed kaggle key has remaining GPU quota",
+        )
+    detail = "unable to read quota for allowed kaggle keys"
+    if unavailable:
+        detail = f"{detail}: {'; '.join(unavailable)}"
+    raise HTTPException(status_code=503, detail=detail)
+
+
+def resolve_job_kaggle_key_id(
+    settings: Settings,
+    auth_store: AuthStore,
+    principal: RelayPrincipal,
+    requested_key_id: str = "",
+    dataset_ref: str = "",
+    kernel_ref: str = "",
+) -> str:
+    requested = str(requested_key_id or "").strip()
+    if requested:
+        return auth_store.resolve_kaggle_key_id(principal, requested)
+    if auth_store.legacy or len(public_allowed_key_ids(auth_store, principal)) <= 1:
+        return auth_store.resolve_kaggle_key_id(principal, requested)
+    return select_kaggle_key_by_quota(
+        settings,
+        auth_store,
+        principal,
+        owner=requested_owner_from_refs(dataset_ref, kernel_ref),
+    )
+
+
+def ref_owner(value: str) -> str:
+    ref = str(value or "").strip()
+    parts = ref.split("/", 1)
+    if len(parts) != 2:
+        return ""
+    return parts[0].strip()
+
+
+def requested_owner_from_refs(dataset_ref: str, kernel_ref: str) -> str:
+    dataset_owner = ref_owner(dataset_ref)
+    kernel_owner = ref_owner(kernel_ref)
+    if dataset_owner and kernel_owner and dataset_owner.lower() != kernel_owner.lower():
+        raise HTTPException(
+            status_code=400,
+            detail=f"dataset_ref owner {dataset_owner} does not match kernel_ref owner {kernel_owner}",
+        )
+    return dataset_owner or kernel_owner
+
+
 def session_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
     return {
         "authenticated": True,
@@ -245,22 +457,36 @@ def validate_and_write_auth_config(path: Path, data: dict) -> AuthStore:
         tmp_path.unlink(missing_ok=True)
 
 
+def validate_kaggle_username(username: str) -> str:
+    username = username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="kaggle username is required")
+    if not KAGGLE_USERNAME_RE.fullmatch(username):
+        raise HTTPException(
+            status_code=400,
+            detail="kaggle username must be the profile slug from kaggle.com, not the display name",
+        )
+    return username
+
+
 def add_kaggle_key_config(settings: Settings, principal: RelayPrincipal, payload: CreateKaggleKeyRequest) -> AuthStore:
     path = require_config_admin(settings, principal)
     key_id = payload.id.strip()
     entry = {"id": key_id}
-    username = payload.username.strip()
+    username = validate_kaggle_username(payload.username)
     key = payload.key.strip()
     api_token = payload.api_token.strip()
     config_dir = payload.config_dir.strip()
-    if username or key:
-        entry["username"] = username
+    if key.upper().startswith("KGAT_"):
+        raise HTTPException(status_code=400, detail="KGAT token must be provided as api_token, not key")
+    entry["username"] = username
+    if key:
         entry["key"] = key
     if api_token:
         entry["api_token"] = api_token
     if config_dir:
         entry["config_dir"] = config_dir
-    if not ((username and key) or api_token or config_dir):
+    if not (key or api_token or config_dir):
         raise HTTPException(status_code=400, detail="kaggle credentials are required")
 
     with AUTH_CONFIG_LOCK:
@@ -268,6 +494,57 @@ def add_kaggle_key_config(settings: Settings, principal: RelayPrincipal, payload
         if any(str(item.get("id", "")).strip() == key_id for item in data["kaggle_keys"] if isinstance(item, dict)):
             raise HTTPException(status_code=409, detail="kaggle key id already exists")
         data["kaggle_keys"].append(entry)
+        return validate_and_write_auth_config(path, data)
+
+
+def update_kaggle_key_config(
+    settings: Settings,
+    principal: RelayPrincipal,
+    key_id: str,
+    payload: UpdateKaggleKeyRequest,
+) -> AuthStore:
+    path = require_config_admin(settings, principal)
+    key_id = key_id.strip()
+    if not key_id:
+        raise HTTPException(status_code=400, detail="kaggle key id is required")
+    username = validate_kaggle_username(payload.username)
+    key = payload.key.strip()
+    api_token = payload.api_token.strip()
+    config_dir = payload.config_dir.strip()
+    if key.upper().startswith("KGAT_"):
+        raise HTTPException(status_code=400, detail="KGAT token must be provided as api_token, not key")
+
+    with AUTH_CONFIG_LOCK:
+        data = read_auth_config(path)
+        index = -1
+        existing: dict | None = None
+        for candidate_index, item in enumerate(data["kaggle_keys"]):
+            if isinstance(item, dict) and str(item.get("id", "")).strip() == key_id:
+                index = candidate_index
+                existing = dict(item)
+                break
+        if existing is None:
+            raise HTTPException(status_code=404, detail="kaggle key id not found")
+
+        existing["id"] = key_id
+        existing["username"] = username
+        if key or api_token or config_dir:
+            for field in ("key", "api_token", "config_dir"):
+                existing.pop(field, None)
+            if key:
+                existing["key"] = key
+            if api_token:
+                existing["api_token"] = api_token
+            if config_dir:
+                existing["config_dir"] = config_dir
+        if not (
+            str(existing.get("key", "") or "").strip()
+            or str(existing.get("api_token", "") or "").strip()
+            or str(existing.get("config_dir", "") or "").strip()
+        ):
+            raise HTTPException(status_code=400, detail="kaggle credentials are required")
+
+        data["kaggle_keys"][index] = existing
         return validate_and_write_auth_config(path, data)
 
 
@@ -301,7 +578,7 @@ def authorize_job_callback(job: dict, authorization: str, auth_store: AuthStore)
     if not token:
         return False
     principal = auth_store.authenticate_token(token)
-    if principal and auth_store.can_access_key(principal, job.get("kaggle_key_id", "")):
+    if principal and can_access_job(job, principal, auth_store):
         return True
     expected_hash = (job.get("callback_token_sha256") or "").strip().lower()
     if not expected_hash:
@@ -520,6 +797,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
 
+    @app.patch("/v1/auth/kaggle-keys/{kaggle_key_id}")
+    def update_auth_kaggle_key(
+        kaggle_key_id: str,
+        payload: UpdateKaggleKeyRequest,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        new_store = update_kaggle_key_config(settings, principal, kaggle_key_id, payload)
+        request.app.state.auth_store = new_store
+        return auth_config_summary(new_store, principal)
+
     @app.post("/v1/auth/relay-tokens")
     def create_auth_relay_token(
         payload: CreateRelayTokenRequest,
@@ -539,13 +829,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        try:
-            resolved_key_id = auth_store.resolve_kaggle_key_id(principal, kaggle_key_id)
-            credentials = auth_store.credentials_for(resolved_key_id)
-        except AuthSelectionError as exc:
-            raise selection_error(exc) from exc
-        adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
-        return {"kaggle_key_id": resolved_key_id, **adapter.account()}
+        return kaggle_account_status(settings, auth_store, principal, kaggle_key_id)
+
+    @app.post("/v1/kaggle/account/probe")
+    def kaggle_account_write_probe(
+        kaggle_key_id: str = "",
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        return kaggle_account_probe(settings, auth_store, principal, kaggle_key_id)
+
+    @app.get("/v1/kaggle/accounts")
+    def kaggle_accounts(
+        settings: Settings = Depends(get_settings),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        return {
+            "accounts": [
+                kaggle_account_status(settings, auth_store, principal, key_id)
+                for key_id in public_allowed_key_ids(auth_store, principal)
+            ],
+        }
 
     @app.post("/v1/jobs", response_model=JobResponse)
     def create_job(
@@ -556,7 +862,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         principal: RelayPrincipal = Depends(require_auth),
     ) -> JobResponse:
         try:
-            kaggle_key_id = auth_store.resolve_kaggle_key_id(principal, payload.kaggle_key_id)
+            kaggle_key_id = resolve_job_kaggle_key_id(
+                settings,
+                auth_store,
+                principal,
+                payload.kaggle_key_id,
+                payload.dataset_ref,
+                payload.kernel_ref,
+            )
         except AuthSelectionError as exc:
             raise selection_error(exc) from exc
         job_id = uuid.uuid4().hex
@@ -579,7 +892,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         principal: RelayPrincipal = Depends(require_auth),
     ) -> list[JobResponse]:
         key_filter = None if principal.allow_all_keys else set(auth_store.allowed_key_ids(principal))
-        jobs = db.list_jobs(kaggle_key_ids=key_filter, limit=limit)
+        owner_filter = None if auth_store.legacy else principal.id
+        include_unowned = bool(owner_filter and principal.allow_all_keys)
+        jobs = db.list_jobs(
+            kaggle_key_ids=key_filter,
+            relay_token_id=owner_filter,
+            include_unowned=include_unowned,
+            limit=limit,
+        )
         return [job_to_response(db, job) for job in jobs]
 
     @app.put(
@@ -666,6 +986,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job_dir = settings.jobs_dir / job_id
         archives_dir = job_dir / "archives"
         extracted_dir = job_dir / "extracted"
+        credentials = auth_store.credentials_for(job.get("kaggle_key_id", ""))
         db.update_job(job_id, status="assembling", progress=10)
         try:
             kernel_zip = archives_dir / "kernel.zip"
@@ -694,9 +1015,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             safe_extract_zip(kernel_zip, extracted_dir / "kernel", job["kernel_size"])
             if dataset_cache_hit:
-                validate_kernel_payload(extracted_dir / "kernel")
+                validate_kernel_payload(
+                    extracted_dir / "kernel",
+                    job["kernel_ref"],
+                    credentials,
+                )
             else:
-                validate_payloads(extracted_dir / "dataset", extracted_dir / "kernel")
+                validate_payloads(
+                    extracted_dir / "dataset",
+                    extracted_dir / "kernel",
+                    job["dataset_ref"],
+                    job["kernel_ref"],
+                    credentials,
+                )
         except Exception as exc:
             db.update_job(job_id, status="failed", progress=0, error=redact_secrets(str(exc)))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -719,8 +1050,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         key_filter = None
         if principal and not principal.allow_all_keys:
             key_filter = set(auth_store.allowed_key_ids(principal))
+        owner_filter = None if not principal or auth_store.legacy else principal.id
+        include_unowned = bool(owner_filter and principal.allow_all_keys)
 
-        candidates = db.get_jobs_by_kernel_ref(kernel_ref, kaggle_key_ids=key_filter, limit=50)
+        candidates = db.get_jobs_by_kernel_ref(
+            kernel_ref,
+            kaggle_key_ids=key_filter,
+            relay_token_id=owner_filter,
+            include_unowned=include_unowned,
+            limit=50,
+        )
         if not candidates:
             raise HTTPException(status_code=404, detail="job not found")
 
@@ -769,12 +1108,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         principal: RelayPrincipal = Depends(require_auth),
     ) -> FileResponse:
         job = get_authorized_job(db, job_id, principal, auth_store)
-        if job["status"] != "complete" or not job["artifact_path"]:
-            raise HTTPException(status_code=409, detail="job is not complete")
+        download = artifact_download_metadata(job)
+        if not download["can_download"]:
+            status_code = 404 if job["status"] == "complete" and job.get("artifact_path") else 409
+            raise HTTPException(status_code=status_code, detail=download["download_unavailable_reason"])
         artifact_path = Path(job["artifact_path"])
-        if not artifact_path.is_file():
-            raise HTTPException(status_code=404, detail="artifact not found")
-        return FileResponse(artifact_path, media_type="application/zip", filename="artifacts.zip")
+        return FileResponse(
+            artifact_path,
+            media_type="application/zip",
+            filename=str(download["artifact_filename"]),
+        )
 
     @app.delete("/v1/jobs/{job_id}")
     def delete_job(

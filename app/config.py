@@ -13,6 +13,7 @@ class Settings:
     chunk_size: int = DEFAULT_CHUNK_SIZE
     retention_hours: int = 72
     dataset_poll_seconds: int = 20
+    dataset_status_permission_grace_seconds: int = 300
     kernel_poll_seconds: int = 60
     kernel_max_wait_seconds: int = 12 * 60 * 60
     kaggle_cmd: str = "kaggle"
@@ -31,6 +32,9 @@ class Settings:
             chunk_size=int(os.environ.get("RELAY_CHUNK_SIZE", DEFAULT_CHUNK_SIZE)),
             retention_hours=int(os.environ.get("RELAY_RETENTION_HOURS", "72")),
             dataset_poll_seconds=int(os.environ.get("RELAY_DATASET_POLL_SECONDS", "20")),
+            dataset_status_permission_grace_seconds=int(
+                os.environ.get("RELAY_DATASET_STATUS_PERMISSION_GRACE_SECONDS", "300")
+            ),
             kernel_poll_seconds=int(os.environ.get("RELAY_KERNEL_POLL_SECONDS", "60")),
             kernel_max_wait_seconds=int(
                 os.environ.get("RELAY_KERNEL_MAX_WAIT_SECONDS", str(12 * 60 * 60))

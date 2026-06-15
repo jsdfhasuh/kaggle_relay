@@ -53,6 +53,14 @@ def build_zip(files: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         for name, content in files.items():
+            if name in {"dataset-metadata.json", "kernel-metadata.json"}:
+                try:
+                    metadata = json.loads(content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    metadata = None
+                if isinstance(metadata, dict) and not metadata.get("id"):
+                    metadata["id"] = "demo/data" if name == "dataset-metadata.json" else "demo/kernel"
+                    content = json.dumps(metadata).encode("utf-8")
             archive.writestr(name, content)
     return buffer.getvalue()
 
@@ -285,6 +293,79 @@ def test_admin_can_add_kaggle_key_and_relay_token(tmp_path):
     assert "carol-key" not in new_user_config.text
 
 
+def test_admin_can_update_existing_kaggle_key_without_reentering_secret(tmp_path):
+    app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
+
+    with TestClient(app) as client:
+        update_key = client.patch(
+            "/v1/auth/kaggle-keys/kb",
+            headers=auth_headers("admin-token"),
+            json={"username": "bob_slug"},
+        )
+        new_user_config = client.get("/v1/auth/config", headers=auth_headers("user-b-token"))
+
+    saved_config = json.loads((tmp_path / "auth.json").read_text(encoding="utf-8"))
+    saved_key = next(item for item in saved_config["kaggle_keys"] if item["id"] == "kb")
+
+    assert update_key.status_code == 200
+    assert "bob-key" not in update_key.text
+    assert saved_key["username"] == "bob_slug"
+    assert saved_key["key"] == "bob-key"
+    assert new_user_config.status_code == 200
+    assert new_user_config.json()["kaggle_keys"] == [
+        {"id": "kb", "username": "bob_slug", "credential_source": "username_key"}
+    ]
+
+
+def test_admin_must_include_username_when_adding_kaggle_key(tmp_path):
+    app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
+
+    with TestClient(app) as client:
+        add_key = client.post(
+            "/v1/auth/kaggle-keys",
+            headers=auth_headers("admin-token"),
+            json={"id": "kc", "api_token": "carol-token"},
+        )
+
+    assert add_key.status_code == 400
+    assert add_key.json()["detail"] == "kaggle username is required"
+
+
+def test_admin_must_use_kaggle_username_slug_for_kaggle_key(tmp_path):
+    app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
+
+    with TestClient(app) as client:
+        add_key = client.post(
+            "/v1/auth/kaggle-keys",
+            headers=auth_headers("admin-token"),
+            json={"id": "kc", "username": "yunru zhou", "api_token": "carol-token"},
+        )
+        update_key = client.patch(
+            "/v1/auth/kaggle-keys/kb",
+            headers=auth_headers("admin-token"),
+            json={"username": "yunru zhou"},
+        )
+
+    assert add_key.status_code == 400
+    assert add_key.json()["detail"] == "kaggle username must be the profile slug from kaggle.com, not the display name"
+    assert update_key.status_code == 400
+    assert update_key.json()["detail"] == "kaggle username must be the profile slug from kaggle.com, not the display name"
+
+
+def test_admin_must_put_kgat_token_in_api_token_field(tmp_path):
+    app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
+
+    with TestClient(app) as client:
+        add_key = client.post(
+            "/v1/auth/kaggle-keys",
+            headers=auth_headers("admin-token"),
+            json={"id": "kc", "username": "carol", "key": "KGAT_wrong-field"},
+        )
+
+    assert add_key.status_code == 400
+    assert add_key.json()["detail"] == "KGAT token must be provided as api_token, not key"
+
+
 def test_non_admin_cannot_add_auth_config_entries(tmp_path):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
@@ -293,6 +374,11 @@ def test_non_admin_cannot_add_auth_config_entries(tmp_path):
             "/v1/auth/kaggle-keys",
             headers=auth_headers("user-a-token"),
             json={"id": "kc", "username": "carol", "key": "carol-key"},
+        )
+        update_key = client.patch(
+            "/v1/auth/kaggle-keys/kb",
+            headers=auth_headers("user-a-token"),
+            json={"username": "bob_slug"},
         )
         add_token = client.post(
             "/v1/auth/relay-tokens",
@@ -305,4 +391,5 @@ def test_non_admin_cannot_add_auth_config_entries(tmp_path):
         )
 
     assert add_key.status_code == 403
+    assert update_key.status_code == 403
     assert add_token.status_code == 403
