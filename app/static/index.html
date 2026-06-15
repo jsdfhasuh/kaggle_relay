@@ -6,96 +6,164 @@
   <title>Kaggle Relay 管理后台</title>
   <style>
     :root {
-      --bg: #f5f7fb;
-      --panel: #ffffff;
-      --panel-soft: #f8fafc;
-      --text: #111827;
+      --bg: #eef2f7;
+      --surface: #ffffff;
+      --surface-soft: #f7f9fc;
+      --ink: #111827;
       --muted: #667085;
-      --border: #d8dee8;
-      --primary: #1f6feb;
+      --border: #d0d7e2;
+      --primary: #1769aa;
+      --primary-strong: #0b4f82;
       --secondary: #475467;
-      --success: #15803d;
+      --success: #14743b;
       --danger: #b42318;
       --warning: #b54708;
+      --focus: #84c5f4;
     }
+
     * { box-sizing: border-box; }
+
     body {
       margin: 0;
       background: var(--bg);
-      color: var(--text);
+      color: var(--ink);
       font-family: Arial, "Microsoft YaHei", sans-serif;
     }
+
     header {
-      min-height: 58px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
+      gap: 16px;
+      min-height: 60px;
       padding: 0 20px;
-      background: #101828;
+      background: #172033;
       color: #fff;
+      border-bottom: 3px solid #2aa198;
     }
+
+    .page-tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .nav-tab {
+      min-height: 32px;
+      border: 1px solid rgba(255,255,255,.24);
+      background: rgba(255,255,255,.08);
+      color: #e5edf7;
+    }
+
+    .nav-tab:hover:not(:disabled) {
+      background: rgba(255,255,255,.16);
+    }
+
+    .nav-tab.active {
+      border-color: #7dd3c7;
+      background: #e6fffb;
+      color: #0f514a;
+    }
+
     h1 {
       margin: 0;
       font-size: 18px;
-      line-height: 1.3;
+      line-height: 1.35;
+      letter-spacing: 0;
     }
-    main {
-      display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(320px, .82fr);
-      gap: 16px;
-      padding: 16px;
-    }
-    section, aside > div {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-    }
-    aside {
-      display: grid;
-      gap: 16px;
-      align-content: start;
-    }
+
     h2 {
-      margin: 0 0 12px;
+      margin: 0;
       font-size: 16px;
       line-height: 1.35;
     }
+
+    h3 {
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.35;
+    }
+
     button, select, input, textarea {
       min-height: 34px;
-      border-radius: 8px;
       border: 1px solid var(--border);
+      border-radius: 6px;
       padding: 7px 10px;
       font-size: 14px;
+      font-family: inherit;
       background: #fff;
+      color: var(--ink);
     }
+
     input, textarea, select {
       width: 100%;
-      color: var(--text);
     }
+
     textarea {
-      min-height: 68px;
+      min-height: 70px;
       resize: vertical;
-      font-family: Arial, "Microsoft YaHei", sans-serif;
+      line-height: 1.45;
     }
+
     button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
       border-color: transparent;
       background: var(--primary);
       color: #fff;
       cursor: pointer;
+      white-space: nowrap;
     }
-    button.secondary { background: var(--secondary); }
+
+    button:hover:not(:disabled) {
+      background: var(--primary-strong);
+    }
+
+    button.secondary {
+      background: var(--secondary);
+    }
+
     button.light {
-      border-color: #b9cdf7;
-      background: #edf4ff;
+      border-color: #b7c9df;
+      background: #eff6ff;
       color: #175cd3;
     }
-    button.danger { background: var(--danger); }
+
+    button.light:hover:not(:disabled) {
+      background: #dbeafe;
+    }
+
+    button.ghost {
+      border-color: var(--border);
+      background: #fff;
+      color: var(--secondary);
+    }
+
+    button.ghost:hover:not(:disabled) {
+      background: var(--surface-soft);
+    }
+
     button:disabled {
-      opacity: .6;
+      opacity: .58;
       cursor: not-allowed;
     }
+
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 1px;
+    }
+
+    main {
+      padding: 14px;
+    }
+
+    .page {
+      min-width: 0;
+    }
+
     .session {
       display: flex;
       align-items: center;
@@ -105,135 +173,272 @@
       color: #d0d5dd;
       font-size: 13px;
     }
-    .toolbar, .status-line {
+
+    .workspace {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .management-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 420px;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .management-column {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+      min-width: 0;
+    }
+
+    .panel {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .panel-header {
       display: flex;
       align-items: center;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 12px;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--surface-soft);
+      border-bottom: 1px solid var(--border);
     }
-    .status-line {
+
+    .panel-body {
+      padding: 14px;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: #fff;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 9px 10px;
+      border: 1px solid #d9e2ec;
+      border-radius: 6px;
+      background: #fbfcfe;
+    }
+
+    .metric-label {
       color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .metric-value {
+      margin-top: 2px;
+      font-size: 14px;
+      line-height: 1.35;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: end;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      background: #fff;
+    }
+
+    .toolbar label {
+      display: grid;
+      gap: 4px;
+      min-width: 112px;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .table-wrap {
+      max-height: calc(100vh - 292px);
+      overflow: auto;
+      background: #fff;
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
       font-size: 13px;
     }
+
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 10px 9px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f3f6fa;
+      color: #344054;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    tr:hover td {
+      background: #f8fbff;
+    }
+
+    .job-id-cell {
+      width: 132px;
+    }
+
+    .progress-cell {
+      width: 134px;
+    }
+
+    .artifact-cell {
+      width: 166px;
+    }
+
+    .actions-cell {
+      width: 116px;
+      white-space: nowrap;
+    }
+
+    .mono {
+      font-family: Consolas, Monaco, monospace;
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .small {
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .strong {
+      font-weight: 700;
+    }
+
+    .wrap {
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
     .pill {
       display: inline-flex;
       align-items: center;
+      max-width: 100%;
       border-radius: 999px;
       padding: 3px 8px;
-      background: #eef4ff;
+      background: #e8f1ff;
       color: #1849a9;
       font-size: 12px;
       line-height: 1.3;
       white-space: nowrap;
     }
-    .pill.ok { background: #dcfae6; color: #067647; }
-    .pill.bad { background: #fee4e2; color: #b42318; }
-    .pill.warn { background: #fef0c7; color: #b54708; }
-    .table-wrap {
-      max-height: calc(100vh - 232px);
-      overflow: auto;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #fff;
+
+    .pill.ok {
+      background: #dcfae6;
+      color: #067647;
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
+
+    .pill.bad {
+      background: #fee4e2;
+      color: var(--danger);
     }
-    th, td {
-      border-bottom: 1px solid var(--border);
-      padding: 9px 8px;
-      text-align: left;
-      vertical-align: top;
+
+    .pill.warn {
+      background: #fef0c7;
+      color: var(--warning);
     }
-    th {
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: var(--panel-soft);
+
+    .pill.neutral {
+      background: #eef2f6;
       color: #344054;
     }
-    td.actions {
-      white-space: nowrap;
-    }
-    .mono {
-      font-family: Consolas, Monaco, monospace;
-    }
-    .muted {
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.5;
-    }
+
     .progress {
-      width: 118px;
+      width: 116px;
       height: 8px;
       margin-top: 5px;
       overflow: hidden;
       border-radius: 999px;
       background: #e4e7ec;
     }
+
     .progress > div {
       height: 100%;
-      background: var(--success);
+      background: #2aa198;
     }
-    .summary-list {
-      display: grid;
-      gap: 10px;
-    }
-    .summary-item {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px;
-      background: #fff;
-    }
-    .summary-title {
-      margin-bottom: 4px;
-      font-weight: 700;
-    }
-    .form-grid {
-      display: grid;
-      gap: 10px;
-    }
-    .field {
+
+    .artifact-state {
       display: grid;
       gap: 5px;
+      justify-items: start;
     }
-    .field label {
-      color: #344054;
-      font-size: 13px;
-      font-weight: 700;
+
+    .download-button {
+      min-width: 92px;
     }
-    .check-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: #344054;
-      font-size: 13px;
-    }
-    .check-row input {
-      width: auto;
-      min-height: 0;
-    }
-    .inline-actions {
+
+    .detail-grid {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 8px;
-      align-items: end;
+      margin-bottom: 12px;
     }
-    .message {
-      min-height: 18px;
-      color: var(--muted);
-      font-size: 13px;
-      word-break: break-word;
+
+    .detail-block {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
     }
+
+    .log-list {
+      display: grid;
+      gap: 6px;
+      max-height: 260px;
+      overflow: auto;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+
+    .log-list li {
+      border-left: 3px solid #b7c9df;
+      padding: 7px 9px;
+      background: #fbfcfe;
+      color: #344054;
+      font-family: Consolas, Monaco, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
     pre {
       margin: 0;
       max-height: 360px;
       overflow: auto;
-      border-radius: 8px;
-      background: #101828;
+      border-radius: 6px;
+      background: #111827;
       color: #f2f4f7;
       padding: 12px;
       font-size: 12px;
@@ -241,29 +446,164 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .detail-block {
-      margin-top: 16px;
+
+    .summary-list {
+      display: grid;
+      gap: 8px;
     }
-    .error {
-      color: var(--danger);
+
+    .summary-row {
+      display: grid;
+      gap: 4px;
+      padding: 8px 0;
+      border-bottom: 1px solid #e4e7ec;
+    }
+
+    .summary-row:last-child {
+      border-bottom: 0;
+    }
+
+    .summary-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
       font-size: 13px;
+      font-weight: 700;
+    }
+
+    .account-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .account-card {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid #d9e2ec;
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .account-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .quota-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .form-grid {
+      display: grid;
+      gap: 10px;
+    }
+
+    .form-section {
+      display: grid;
+      gap: 10px;
+      padding: 12px 0;
+      border-top: 1px solid #e4e7ec;
+    }
+
+    .form-section:first-child {
+      padding-top: 0;
+      border-top: 0;
+    }
+
+    .field {
+      display: grid;
+      gap: 5px;
+    }
+
+    .field label {
+      color: #344054;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #344054;
+      font-size: 13px;
+    }
+
+    .check-row input {
+      width: auto;
+      min-height: 0;
+    }
+
+    .inline-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+
+    .message {
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
       word-break: break-word;
     }
-    @media (max-width: 980px) {
+
+    .message.error, .error {
+      color: var(--danger);
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @media (max-width: 1120px) {
+      .management-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .table-wrap {
+        max-height: none;
+      }
+    }
+
+    @media (max-width: 720px) {
       header {
         align-items: flex-start;
         flex-direction: column;
-        padding: 14px 16px;
+        padding: 14px;
       }
+
+      .page-tabs {
+        width: 100%;
+      }
+
+      .nav-tab {
+        flex: 1;
+      }
+
       .session {
         justify-content: flex-start;
       }
+
       main {
-        grid-template-columns: 1fr;
-        padding: 12px;
+        padding: 10px;
       }
-      .table-wrap {
-        max-height: none;
+
+      .panel-header, .toolbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .status-strip, .detail-grid, .quota-grid {
+        grid-template-columns: 1fr;
       }
     }
   </style>
@@ -271,6 +611,11 @@
 <body>
   <header>
     <h1>Kaggle Relay 管理后台</h1>
+    <nav class="page-tabs" aria-label="页面导航">
+      <button class="nav-tab active" type="button" data-page-nav="runtime">运行情况</button>
+      <button class="nav-tab" type="button" data-page-nav="accounts">账号情况</button>
+      <button class="nav-tab" type="button" data-page-nav="users">用户与 Token</button>
+    </nav>
     <div class="session">
       <span id="sessionInfo">检查登录状态...</span>
       <button class="secondary" id="logoutButton" type="button">退出登录</button>
@@ -278,131 +623,216 @@
   </header>
 
   <main>
-    <section>
-      <h2>任务列表</h2>
-      <div class="status-line">
-        <span id="healthText">服务状态：加载中...</span>
-        <span id="jobCountText">任务数：-</span>
-        <span id="lastRefreshText">刷新：-</span>
-      </div>
-      <div class="toolbar">
-        <label>
-          数量
-          <select id="limitSelect">
-            <option value="20">20</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-            <option value="200">200</option>
-          </select>
-        </label>
-        <button id="refreshButton" type="button">刷新</button>
-        <button class="light" id="autoRefreshButton" type="button">自动刷新：开</button>
-      </div>
+    <section id="runtimePage" class="page" data-page="runtime">
+      <div class="workspace">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>运行情况</h2>
+            <span id="lastRefreshText" class="muted">刷新：-</span>
+          </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Job</th>
-              <th>状态</th>
-              <th>进度</th>
-              <th>Kaggle Key</th>
-              <th>Dataset / Kernel</th>
-              <th>Cache</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody id="jobsBody">
-            <tr><td colspan="7" class="muted">加载中...</td></tr>
-          </tbody>
-        </table>
-      </div>
+          <div class="status-strip">
+            <div class="metric">
+              <div class="metric-label">服务状态</div>
+              <div id="healthText" class="metric-value">加载中...</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">任务数量</div>
+              <div id="jobCountText" class="metric-value">-</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">当前账号</div>
+              <div id="principalMetric" class="metric-value">-</div>
+            </div>
+          </div>
 
-      <div class="detail-block">
-        <h2>任务详情</h2>
-        <pre id="jobDetail">选择任务后显示完整 JSON 和 recent_logs。</pre>
+          <div class="toolbar">
+            <label>
+              数量
+              <select id="limitSelect">
+                <option value="20">20</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+              </select>
+            </label>
+            <button id="refreshButton" type="button">刷新</button>
+            <button class="light" id="autoRefreshButton" type="button">自动刷新：开</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="job-id-cell">Job</th>
+                  <th>状态</th>
+                  <th class="progress-cell">进度</th>
+                  <th>Kaggle Key</th>
+                  <th>Dataset / Kernel</th>
+                  <th>Cache</th>
+                  <th class="artifact-cell">产物</th>
+                  <th class="actions-cell">操作</th>
+                </tr>
+              </thead>
+              <tbody id="jobsBody">
+                <tr><td colspan="8" class="muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>任务详情</h2>
+            <span id="selectedJobText" class="muted">未选择任务</span>
+          </div>
+          <div class="panel-body">
+            <div id="detailEmpty" class="muted">选择任务后显示状态、产物、日志和完整 JSON。</div>
+            <div id="detailContent" hidden>
+              <div id="detailSummary" class="detail-grid"></div>
+              <div id="detailError" class="detail-block" hidden></div>
+              <div class="detail-block">
+                <h3>Recent Logs</h3>
+                <ul id="detailLogs" class="log-list"></ul>
+              </div>
+              <div class="detail-block">
+                <h3>Raw JSON</h3>
+                <pre id="jobDetail"></pre>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
     </section>
 
-    <aside>
-      <div>
-        <h2>多用户 / 多 Kaggle Key</h2>
-        <div id="authConfig" class="summary-list">加载中...</div>
-      </div>
-      <div id="adminTools" hidden>
-        <h2>配置管理</h2>
-        <div class="summary-list">
-          <div class="summary-item">
-            <div class="summary-title">添加 Kaggle 账号</div>
-            <form id="kaggleKeyForm" class="form-grid">
-              <div class="field">
-                <label for="newKaggleKeyId">Key ID</label>
-                <input id="newKaggleKeyId" autocomplete="off" placeholder="例如 team-a" required />
-              </div>
-              <div class="field">
-                <label for="newKaggleApiToken">Kaggle API Token</label>
-                <textarea id="newKaggleApiToken" autocomplete="off" placeholder='{"username":"...","key":"..."} 或 KGAT_...'></textarea>
-              </div>
-              <div class="field">
-                <label for="newKaggleUsername">Username</label>
-                <input id="newKaggleUsername" autocomplete="off" />
-              </div>
-              <div class="field">
-                <label for="newKaggleKey">Key</label>
-                <input id="newKaggleKey" type="password" autocomplete="new-password" />
-              </div>
-              <div class="field">
-                <label for="newKaggleConfigDir">Config Dir</label>
-                <input id="newKaggleConfigDir" autocomplete="off" placeholder="/root/.kaggle" />
-              </div>
-              <button type="submit">保存 Kaggle 账号</button>
-              <div id="kaggleKeyMessage" class="message" aria-live="polite"></div>
-            </form>
-          </div>
+    <section id="usersPage" class="page" data-page="users" hidden>
+      <div class="management-grid">
+        <div class="management-column">
+          <section class="panel">
+            <div class="panel-header">
+              <h2>用户与 Token</h2>
+            </div>
+            <div class="panel-body">
+              <div id="authConfig" class="summary-list">加载中...</div>
+            </div>
+          </section>
 
-          <div class="summary-item">
-            <div class="summary-title">添加用户</div>
-            <form id="relayTokenForm" class="form-grid">
-              <div class="field">
-                <label for="newRelayTokenId">用户 ID</label>
-                <input id="newRelayTokenId" autocomplete="off" placeholder="例如 user-b" required />
+          <section id="adminTools" class="panel" hidden>
+            <div class="panel-header">
+              <h2>配置管理</h2>
+            </div>
+            <div class="panel-body">
+              <div class="form-section">
+                <h3 id="kaggleKeyFormTitle">添加 Kaggle 账号</h3>
+                <form id="kaggleKeyForm" class="form-grid">
+                  <div class="field">
+                    <label for="newKaggleKeyId">Key ID</label>
+                    <input id="newKaggleKeyId" autocomplete="off" placeholder="例如 team-a" required />
+                  </div>
+                  <div class="field">
+                    <label for="newKaggleApiToken">API Token（KGAT_... 填这里）</label>
+                    <textarea id="newKaggleApiToken" autocomplete="off" placeholder="粘贴 Kaggle 生成的 KGAT_... token"></textarea>
+                  </div>
+                  <div class="field">
+                    <label for="newKaggleUsername">Kaggle Username / Owner Slug</label>
+                    <input id="newKaggleUsername" autocomplete="off" placeholder="个人主页 URL 里的那段，例如 yunruzhou" required />
+                  </div>
+                  <div class="field">
+                    <label for="newKaggleKey">旧式 Key（非 KGAT_ token）</label>
+                    <input id="newKaggleKey" type="password" autocomplete="new-password" placeholder="仅用于旧版 username/key 凭据" />
+                  </div>
+                  <div class="field">
+                    <label for="newKaggleConfigDir">Config Dir</label>
+                    <input id="newKaggleConfigDir" autocomplete="off" placeholder="/root/.kaggle" />
+                  </div>
+                  <div class="muted small" id="kaggleCredentialHint">新增账号至少填写 API Token、旧式 Key 或 Config Dir 其中一项。</div>
+                  <div class="inline-actions">
+                    <button id="saveKaggleKeyButton" type="submit">保存 Kaggle 账号</button>
+                    <button class="light" id="cancelKaggleEditButton" type="button" hidden>取消编辑</button>
+                  </div>
+                  <div id="kaggleKeyMessage" class="message" aria-live="polite"></div>
+                </form>
               </div>
-              <div class="inline-actions">
-                <div class="field">
-                  <label for="newRelayToken">Relay Token</label>
-                  <input id="newRelayToken" type="password" autocomplete="new-password" required />
-                </div>
-                <button class="light" id="generateRelayTokenButton" type="button">生成</button>
+
+              <div class="form-section">
+                <h3>添加用户</h3>
+                <form id="relayTokenForm" class="form-grid">
+                  <div class="field">
+                    <label for="newRelayTokenId">用户 ID</label>
+                    <input id="newRelayTokenId" autocomplete="off" placeholder="例如 user-b" required />
+                  </div>
+                  <div class="inline-actions">
+                    <div class="field">
+                      <label for="newRelayToken">Relay Token</label>
+                      <input id="newRelayToken" type="password" autocomplete="new-password" required />
+                    </div>
+                    <button class="light" id="generateRelayTokenButton" type="button">生成</button>
+                  </div>
+                  <label class="check-row">
+                    <input id="newRelayAllowAll" type="checkbox" />
+                    允许访问所有 Kaggle Key
+                  </label>
+                  <div class="field">
+                    <label for="newRelayAllowedKeys">允许访问的 Key</label>
+                    <select id="newRelayAllowedKeys" multiple size="4"></select>
+                  </div>
+                  <button type="submit">保存用户</button>
+                  <div id="relayTokenMessage" class="message" aria-live="polite"></div>
+                </form>
               </div>
-              <label class="check-row">
-                <input id="newRelayAllowAll" type="checkbox" />
-                允许访问所有 Kaggle Key
-              </label>
-              <div class="field">
-                <label for="newRelayAllowedKeys">允许访问的 Key</label>
-                <select id="newRelayAllowedKeys" multiple size="4"></select>
-              </div>
-              <button type="submit">保存用户</button>
-              <div id="relayTokenMessage" class="message" aria-live="polite"></div>
-            </form>
+            </div>
+          </section>
+        </div>
+
+      </div>
+    </section>
+
+    <section id="accountsPage" class="page" data-page="accounts" hidden>
+      <div class="workspace">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>账号情况</h2>
+            <span id="accountRefreshText" class="muted">刷新：-</span>
           </div>
-        </div>
+          <div class="toolbar">
+            <button id="refreshAccountsButton" type="button">刷新</button>
+          </div>
+          <div class="panel-body">
+            <div id="accountsStatus" class="account-list">加载中...</div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Kaggle 账号检查</h2>
+          </div>
+          <div class="panel-body">
+            <div class="inline-actions">
+              <div class="field">
+                <label for="accountKeySelect">Kaggle Key</label>
+                <select id="accountKeySelect"></select>
+              </div>
+              <button id="accountButton" type="button">检查</button>
+            </div>
+            <div class="detail-block">
+              <pre id="accountResult">选择 key 后点击检查。</pre>
+            </div>
+          </div>
+        </section>
       </div>
-      <div>
-        <h2>Kaggle 账号检查</h2>
-        <div class="toolbar">
-          <select id="accountKeySelect"></select>
-          <button id="accountButton" type="button">检查</button>
-        </div>
-        <pre id="accountResult">选择 key 后点击检查。</pre>
-      </div>
-    </aside>
+    </section>
   </main>
 
   <script>
     let autoRefresh = true;
     let timer = null;
     let authConfigCache = null;
+    let jobsCache = [];
+    let selectedJobId = "";
+    let activePage = "runtime";
+    let editingKaggleKeyId = "";
+    const downloadingJobs = new Set();
+    const kaggleUsernamePattern = /^[A-Za-z0-9_-]+$/;
 
     function qs(id) {
       return document.getElementById(id);
@@ -425,26 +855,173 @@
 
     function fmtBytes(bytes) {
       const value = Number(bytes);
-      if (!Number.isFinite(value)) return "-";
+      if (!Number.isFinite(value) || value < 0) return "-";
       const units = ["B", "KB", "MB", "GB", "TB"];
       let current = value;
-      let index = 0;
-      while (current >= 1024 && index < units.length - 1) {
+      let unitIndex = 0;
+      while (current >= 1024 && unitIndex < units.length - 1) {
         current /= 1024;
-        index += 1;
+        unitIndex += 1;
       }
-      return `${current.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+      return `${current.toFixed(current >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+
+    function fmtHours(hours) {
+      const value = Number(hours);
+      if (!Number.isFinite(value)) return "-";
+      return `${value.toFixed(value === 0 || value >= 10 ? 0 : 2)}h`;
+    }
+
+    function clampProgress(value) {
+      return Math.max(0, Math.min(100, Number(value || 0)));
+    }
+
+    function normalizePage(page) {
+      return ["runtime", "accounts", "users"].includes(page) ? page : "runtime";
+    }
+
+    function pageFromHash() {
+      const value = window.location.hash.replace(/^#/, "");
+      return normalizePage(value);
+    }
+
+    function setActivePage(page, options = {}) {
+      activePage = normalizePage(page);
+      document.querySelectorAll(".page").forEach((pageElement) => {
+        pageElement.hidden = pageElement.dataset.page !== activePage;
+      });
+      document.querySelectorAll("[data-page-nav]").forEach((button) => {
+        const selected = button.dataset.pageNav === activePage;
+        button.classList.toggle("active", selected);
+        button.setAttribute("aria-current", selected ? "page" : "false");
+      });
+      if (options.updateHash !== false) {
+        const nextHash = `#${activePage}`;
+        if (window.location.hash !== nextHash) {
+          history.replaceState(null, "", nextHash);
+        }
+      }
+    }
+
+    function statusLabel(status) {
+      const labels = {
+        receiving: "接收中",
+        assembling: "组装中",
+        queued: "排队中",
+        uploading_dataset: "上传数据集",
+        waiting_dataset: "等待数据集",
+        pushing_kernel: "提交 Kernel",
+        waiting_kernel: "等待 Kernel",
+        downloading_output: "下载输出",
+        complete: "完成",
+        failed: "失败"
+      };
+      return labels[status] || status || "-";
+    }
+
+    function statusPill(status) {
+      const value = String(status || "");
+      if (value === "complete") return `<span class="pill ok">${statusLabel(value)}</span>`;
+      if (value === "failed") return `<span class="pill bad">${statusLabel(value)}</span>`;
+      if (["queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "downloading_output", "assembling", "receiving"].includes(value)) {
+        return `<span class="pill warn">${statusLabel(value)}</span>`;
+      }
+      return `<span class="pill neutral">${escapeHtml(statusLabel(value))}</span>`;
+    }
+
+    function cachePill(job) {
+      if (job.dataset_cache_hit) return '<span class="pill ok">命中</span>';
+      if (job.dataset_upload_required === false) return '<span class="pill ok">可跳过</span>';
+      return '<span class="pill neutral">需上传</span>';
+    }
+
+    function downloadReason(job) {
+      const reason = String(job.download_unavailable_reason || "");
+      const map = {
+        "job is not complete": job.status === "failed" ? "任务失败" : "等待任务完成",
+        "artifact path is missing": "未记录产物路径",
+        "artifact file is missing": "产物文件不存在",
+        "artifact file is inaccessible": "产物文件不可访问",
+        "artifact path is not a file": "产物路径不是文件"
+      };
+      return map[reason] || reason || "暂无产物";
+    }
+
+    function artifactFilename(job) {
+      return job.artifact_filename || `${job.job_id}-artifacts.zip`;
+    }
+
+    function renderArtifact(job) {
+      const jobId = escapeHtml(job.job_id);
+      if (job.can_download) {
+        const downloading = downloadingJobs.has(job.job_id);
+        return `
+          <div class="artifact-state">
+            <button class="download-button" type="button" data-job-download="${jobId}" ${downloading ? "disabled" : ""}>
+              ${downloading ? "下载中..." : "下载 ZIP"}
+            </button>
+            <span class="muted small">${escapeHtml(fmtBytes(job.artifact_size))}</span>
+          </div>
+        `;
+      }
+      return `
+        <div class="artifact-state">
+          <button class="ghost download-button" type="button" disabled>下载 ZIP</button>
+          <span class="muted small">${escapeHtml(downloadReason(job))}</span>
+        </div>
+      `;
+    }
+
+    function renderProgress(job) {
+      const progress = clampProgress(job.progress);
+      return `
+        <div>${Math.round(progress)}%</div>
+        <div class="progress"><div style="width:${progress}%"></div></div>
+      `;
+    }
+
+    function renderJobs(jobs) {
+      const tbody = qs("jobsBody");
+      if (!jobs.length) {
+        tbody.innerHTML = `<tr><td colspan="8" class="muted">暂无任务。</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = jobs.map((job) => {
+        const jobId = escapeHtml(job.job_id);
+        return `
+          <tr>
+            <td class="job-id-cell">
+              <div class="mono strong" title="${jobId}">${escapeHtml(shortId(job.job_id))}</div>
+            </td>
+            <td>
+              ${statusPill(job.status)}
+              <div class="muted small mono">${escapeHtml(job.status || "-")}</div>
+            </td>
+            <td class="progress-cell">${renderProgress(job)}</td>
+            <td class="mono">${escapeHtml(job.kaggle_key_id || "legacy")}</td>
+            <td class="wrap">
+              <div><span class="strong">Dataset:</span> ${escapeHtml(job.dataset_ref)}</div>
+              <div><span class="strong">Kernel:</span> ${escapeHtml(job.kernel_ref)}</div>
+            </td>
+            <td>${cachePill(job)}</td>
+            <td class="artifact-cell">${renderArtifact(job)}</td>
+            <td class="actions-cell">
+              <button class="light" type="button" data-job-detail="${jobId}">详情</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
     }
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
-        ...options,
         credentials: "same-origin",
+        ...options,
         headers: {
           ...(options.headers || {})
         }
       });
-
       if (response.status === 401) {
         window.location.href = "/login";
         throw new Error("unauthorized");
@@ -470,67 +1047,78 @@
         throw new Error("unauthenticated");
       }
       qs("sessionInfo").textContent = `已登录：${session.principal_id}`;
+      qs("principalMetric").textContent = session.principal_id || "-";
       return session;
     }
 
     async function loadHealth() {
       const data = await api("/v1/health");
       qs("healthText").innerHTML =
-        `服务状态：<span class="pill ok">${escapeHtml(data.status)}</span> 版本：${escapeHtml(data.version)} 剩余空间：${fmtBytes(data.free_bytes)}`;
-    }
-
-    function statusPill(status) {
-      const value = String(status || "");
-      if (value === "complete") return `<span class="pill ok">${escapeHtml(value)}</span>`;
-      if (value === "failed") return `<span class="pill bad">${escapeHtml(value)}</span>`;
-      if (["queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "downloading_output"].includes(value)) {
-        return `<span class="pill warn">${escapeHtml(value)}</span>`;
-      }
-      return `<span class="pill">${escapeHtml(value)}</span>`;
+        `<span class="pill ok">${escapeHtml(data.status)}</span> <span class="muted small">版本 ${escapeHtml(data.version)} / ${escapeHtml(fmtBytes(data.free_bytes))} 可用</span>`;
     }
 
     async function loadJobs() {
       const limit = Number(qs("limitSelect").value || 50);
       const jobs = await api(`/v1/jobs?limit=${limit}`);
-      qs("jobCountText").textContent = `任务数：${jobs.length}`;
+      jobsCache = jobs;
+      qs("jobCountText").textContent = String(jobs.length);
       qs("lastRefreshText").textContent = `刷新：${new Date().toLocaleTimeString()}`;
-
-      const tbody = qs("jobsBody");
-      if (!jobs.length) {
-        tbody.innerHTML = `<tr><td colspan="7" class="muted">暂无任务。</td></tr>`;
-        return;
+      renderJobs(jobs);
+      if (selectedJobId && jobs.some((job) => job.job_id === selectedJobId)) {
+        loadJobDetail(selectedJobId, {silent: true}).catch(console.error);
       }
-
-      tbody.innerHTML = jobs.map((job) => {
-        const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
-        const jobId = escapeHtml(job.job_id);
-        const canDownload = job.status === "complete" && job.artifact_path;
-        return `
-          <tr>
-            <td class="mono" title="${jobId}">${escapeHtml(shortId(job.job_id))}</td>
-            <td>${statusPill(job.status)}</td>
-            <td>
-              <div>${Math.round(progress)}%</div>
-              <div class="progress"><div style="width:${progress}%"></div></div>
-            </td>
-            <td class="mono">${escapeHtml(job.kaggle_key_id || "legacy")}</td>
-            <td>
-              <div><strong>Dataset:</strong> ${escapeHtml(job.dataset_ref)}</div>
-              <div><strong>Kernel:</strong> ${escapeHtml(job.kernel_ref)}</div>
-            </td>
-            <td>${job.dataset_cache_hit ? '<span class="pill ok">命中</span>' : '<span class="pill">未命中</span>'}</td>
-            <td class="actions">
-              <button type="button" data-job-detail="${jobId}">详情</button>
-              ${canDownload ? `<button class="light" type="button" data-job-download="${jobId}">下载</button>` : ""}
-            </td>
-          </tr>
-        `;
-      }).join("");
     }
 
-    async function loadJobDetail(jobId) {
-      const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}`);
+    function renderDetail(data) {
+      selectedJobId = data.job_id;
+      qs("selectedJobText").textContent = shortId(data.job_id, 18);
+      qs("detailEmpty").hidden = true;
+      qs("detailContent").hidden = false;
+
+      const artifactText = data.can_download
+        ? `${artifactFilename(data)} / ${fmtBytes(data.artifact_size)}`
+        : downloadReason(data);
+      qs("detailSummary").innerHTML = `
+        <div class="metric">
+          <div class="metric-label">状态</div>
+          <div class="metric-value">${statusPill(data.status)}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">进度</div>
+          <div class="metric-value">${Math.round(clampProgress(data.progress))}%</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">产物</div>
+          <div class="metric-value wrap">${escapeHtml(artifactText)}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Kaggle Key</div>
+          <div class="metric-value mono">${escapeHtml(data.kaggle_key_id || "legacy")}</div>
+        </div>
+      `;
+
+      const errorBox = qs("detailError");
+      if (data.error) {
+        errorBox.hidden = false;
+        errorBox.innerHTML = `<h3>错误</h3><pre>${escapeHtml(data.error)}</pre>`;
+      } else {
+        errorBox.hidden = true;
+        errorBox.innerHTML = "";
+      }
+
+      const logs = data.recent_logs || [];
+      qs("detailLogs").innerHTML = logs.length
+        ? logs.map((line) => `<li>${escapeHtml(line)}</li>`).join("")
+        : `<li>暂无日志。</li>`;
       qs("jobDetail").textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function loadJobDetail(jobId, options = {}) {
+      const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}`);
+      renderDetail(data);
+      if (!options.silent) {
+        qs("detailContent").scrollIntoView({block: "nearest"});
+      }
     }
 
     function formatAllowed(value) {
@@ -544,31 +1132,37 @@
       const kaggleKeys = data.kaggle_keys || [];
 
       qs("authConfig").innerHTML = `
-        <div class="summary-item">
-          <div class="summary-title">当前登录</div>
+        <div class="summary-row">
+          <div class="summary-title">
+            <span>当前登录</span>
+            ${data.can_manage_auth ? '<span class="pill ok">管理员</span>' : '<span class="pill neutral">普通用户</span>'}
+          </div>
           <div class="muted">模式：${escapeHtml(data.mode)}</div>
           <div class="muted">Principal：${escapeHtml(data.principal_id || "-")}</div>
           <div class="muted">允许 Key：${escapeHtml(formatAllowed(data.allowed_kaggle_key_ids))}</div>
         </div>
-        <div class="summary-item">
-          <div class="summary-title">Relay Principals</div>
+        <div class="summary-row">
+          <div class="summary-title"><span>Relay Principals</span><span class="pill neutral">${relayTokens.length}</span></div>
           ${relayTokens.map((token) => `
             <div class="muted">
               <strong>${escapeHtml(token.id)}</strong>
               ${token.current ? '<span class="pill ok">当前</span>' : ""}
               <br />允许：${escapeHtml(formatAllowed(token.allowed_kaggle_key_ids))}
             </div>
-          `).join("<hr />") || '<div class="muted">无</div>'}
+          `).join("") || '<div class="muted">无</div>'}
         </div>
-        <div class="summary-item">
-          <div class="summary-title">Kaggle Keys</div>
+        <div class="summary-row">
+          <div class="summary-title"><span>Kaggle Keys</span><span class="pill neutral">${kaggleKeys.length}</span></div>
           ${kaggleKeys.map((key) => `
             <div class="muted">
-              <strong>${escapeHtml(key.id || "legacy")}</strong><br />
+              <div class="summary-title">
+                <strong>${escapeHtml(key.id || "legacy")}</strong>
+                ${data.can_manage_auth && key.id ? `<button class="light" type="button" data-edit-kaggle-key="${escapeHtml(key.id)}">编辑</button>` : ""}
+              </div>
               username：${escapeHtml(key.username || "-")}<br />
               source：${escapeHtml(key.credential_source || "-")}
             </div>
-          `).join("<hr />") || '<div class="muted">无</div>'}
+          `).join("") || '<div class="muted">无</div>'}
         </div>
       `;
 
@@ -592,6 +1186,102 @@
       return data;
     }
 
+    async function loadRuntimeData() {
+      await Promise.all([loadHealth(), loadJobs()]);
+    }
+
+    async function loadUserData() {
+      await loadAuthConfig();
+    }
+
+    function quotaFor(account, resource) {
+      const quota = account.quota || {};
+      const items = quota.accelerators || [];
+      return items.find((item) => item.resource === resource) || null;
+    }
+
+    function renderQuotaMetric(account, resource) {
+      const quota = account.quota || {};
+      const item = quotaFor(account, resource);
+      if (!quota.available) {
+        return `
+          <div class="metric">
+            <div class="metric-label">${resource}</div>
+            <div class="metric-value">不可用</div>
+            <div class="muted small wrap">${escapeHtml(quota.error || "quota unavailable")}</div>
+          </div>
+        `;
+      }
+      if (!item) {
+        return `
+          <div class="metric">
+            <div class="metric-label">${resource}</div>
+            <div class="metric-value">无数据</div>
+            <div class="muted small">Kaggle 未返回该资源配额。</div>
+          </div>
+        `;
+      }
+
+      const used = Number(item.used_hours || 0);
+      const total = Number(item.total_hours || 0);
+      const percent = total > 0 ? Math.max(0, Math.min(100, used / total * 100)) : 0;
+      return `
+        <div class="metric">
+          <div class="metric-label">${resource}</div>
+          <div class="metric-value">${escapeHtml(fmtHours(item.remaining_hours))} 剩余</div>
+          <div class="muted small">已用 ${escapeHtml(fmtHours(item.used_hours))} / 总额 ${escapeHtml(fmtHours(item.total_hours))}</div>
+          <div class="progress"><div style="width:${percent}%"></div></div>
+        </div>
+      `;
+    }
+
+    function renderAccountStatus(account) {
+      const keyId = account.kaggle_key_id || "legacy";
+      const quota = account.quota || {};
+      const refreshAt = quota.refresh_at ? new Date(quota.refresh_at).toLocaleString() : "-";
+      return `
+        <div class="account-card">
+          <div class="account-card-header">
+            <div>
+              <div class="summary-title">${escapeHtml(keyId)}</div>
+              <div class="muted">username：${escapeHtml(account.username || "-")}</div>
+            </div>
+            <div class="inline-actions">
+              ${account.authenticated ? '<span class="pill ok">认证通过</span>' : '<span class="pill bad">认证失败</span>'}
+              ${authConfigCache?.can_manage_auth && account.kaggle_key_id ? `<button class="light" type="button" data-edit-kaggle-key="${escapeHtml(account.kaggle_key_id)}">编辑</button>` : ""}
+              <button class="light" type="button" data-account-probe="${escapeHtml(account.kaggle_key_id || "")}">强校验</button>
+            </div>
+          </div>
+          <div class="quota-grid">
+            ${renderQuotaMetric(account, "GPU")}
+            ${renderQuotaMetric(account, "TPU")}
+          </div>
+          <div class="muted small">刷新时间：${escapeHtml(refreshAt)} / CLI：${escapeHtml(account.version || "-")}</div>
+          ${account.authenticated ? "" : `<pre>${escapeHtml(account.auth_output || "authentication failed")}</pre>`}
+        </div>
+      `;
+    }
+
+    function renderAccounts(accounts) {
+      const rows = accounts || [];
+      qs("accountsStatus").innerHTML = rows.length
+        ? rows.map((account) => renderAccountStatus(account)).join("")
+        : '<div class="muted">当前用户没有可访问的 Kaggle Key。</div>';
+      qs("accountRefreshText").textContent = `刷新：${new Date().toLocaleTimeString()}`;
+    }
+
+    async function loadKaggleAccounts() {
+      qs("accountsStatus").innerHTML = '<div class="muted">加载中...</div>';
+      const data = await api("/v1/kaggle/accounts");
+      renderAccounts(data.accounts || []);
+      return data;
+    }
+
+    async function loadAccountsData() {
+      await loadAuthConfig();
+      await loadKaggleAccounts();
+    }
+
     async function checkKaggleAccount() {
       const keyId = qs("accountKeySelect").value || "";
       qs("accountResult").textContent = "检查中...";
@@ -604,7 +1294,35 @@
       }
     }
 
+    async function probeKaggleAccount(keyId, button) {
+      const previousText = button.textContent;
+      button.disabled = true;
+      button.textContent = "校验中...";
+      qs("accountResult").textContent = "强校验中，会在 Kaggle 创建并删除一个很小的私有 probe dataset...";
+      try {
+        const path = keyId ? `/v1/kaggle/account/probe?kaggle_key_id=${encodeURIComponent(keyId)}` : "/v1/kaggle/account/probe";
+        const data = await api(path, {method: "POST"});
+        qs("accountResult").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        qs("accountResult").textContent = error.message || String(error);
+      } finally {
+        button.disabled = false;
+        button.textContent = previousText;
+      }
+    }
+
+    function setDownloadButtons(jobId, isDownloading) {
+      if (isDownloading) downloadingJobs.add(jobId);
+      else downloadingJobs.delete(jobId);
+      document.querySelectorAll(`[data-job-download="${jobId}"]`).forEach((button) => {
+        button.disabled = isDownloading;
+        button.textContent = isDownloading ? "下载中..." : "下载 ZIP";
+      });
+    }
+
     async function downloadArtifacts(jobId) {
+      const job = jobsCache.find((item) => item.job_id === jobId) || {};
+      setDownloadButtons(jobId, true);
       try {
         const response = await fetch(`/v1/jobs/${encodeURIComponent(jobId)}/artifacts.zip`, {
           credentials: "same-origin"
@@ -614,20 +1332,28 @@
           return;
         }
         if (!response.ok) {
-          alert(`下载失败：${await response.text()}`);
+          let detail = await response.text();
+          try {
+            const data = JSON.parse(detail);
+            detail = data.detail || detail;
+          } catch (_) {}
+          alert(`下载失败：${detail}`);
+          await loadJobs();
           return;
         }
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = `${jobId}-artifacts.zip`;
+        link.download = artifactFilename({...job, job_id: jobId});
         document.body.appendChild(link);
         link.click();
         link.remove();
         URL.revokeObjectURL(url);
       } catch (error) {
         alert(`下载失败：${error.message || String(error)}`);
+      } finally {
+        setDownloadButtons(jobId, false);
       }
     }
 
@@ -635,6 +1361,43 @@
       const box = qs(id);
       box.textContent = text;
       box.className = isError ? "message error" : "message";
+    }
+
+    function findKaggleKey(keyId) {
+      const keys = authConfigCache?.kaggle_keys || [];
+      return keys.find((key) => key.id === keyId) || null;
+    }
+
+    function resetKaggleKeyForm() {
+      editingKaggleKeyId = "";
+      qs("kaggleKeyForm").reset();
+      qs("newKaggleKeyId").disabled = false;
+      qs("kaggleKeyFormTitle").textContent = "添加 Kaggle 账号";
+      qs("saveKaggleKeyButton").textContent = "保存 Kaggle 账号";
+      qs("cancelKaggleEditButton").hidden = true;
+      qs("kaggleCredentialHint").textContent = "新增账号至少填写 API Token、旧式 Key 或 Config Dir 其中一项。";
+    }
+
+    function startEditKaggleKey(keyId) {
+      const key = findKaggleKey(keyId);
+      if (!key) {
+        formMessage("kaggleKeyMessage", "没有找到这个 Kaggle Key，请刷新后再试", true);
+        return;
+      }
+      editingKaggleKeyId = key.id;
+      setActivePage("users");
+      qs("newKaggleKeyId").value = key.id;
+      qs("newKaggleKeyId").disabled = true;
+      qs("newKaggleUsername").value = key.username || "";
+      qs("newKaggleKey").value = "";
+      qs("newKaggleApiToken").value = "";
+      qs("newKaggleConfigDir").value = "";
+      qs("kaggleKeyFormTitle").textContent = `编辑 Kaggle 账号：${key.id}`;
+      qs("saveKaggleKeyButton").textContent = "更新 Kaggle 账号";
+      qs("cancelKaggleEditButton").hidden = false;
+      qs("kaggleCredentialHint").textContent = "编辑时凭据字段留空会保留原值；只有填入新凭据时才会替换。";
+      formMessage("kaggleKeyMessage", "");
+      qs("kaggleKeyForm").scrollIntoView({block: "nearest"});
     }
 
     function selectedAllowedKeys() {
@@ -648,11 +1411,12 @@
       return Array.from(bytes, (value) => chars[value % chars.length]).join("");
     }
 
-    async function addKaggleKey(event) {
+    async function saveKaggleKey(event) {
       event.preventDefault();
       formMessage("kaggleKeyMessage", "");
+      const isEditing = Boolean(editingKaggleKeyId);
       const payload = {
-        id: qs("newKaggleKeyId").value.trim(),
+        id: (isEditing ? editingKaggleKeyId : qs("newKaggleKeyId").value).trim(),
         username: qs("newKaggleUsername").value.trim(),
         key: qs("newKaggleKey").value.trim(),
         api_token: qs("newKaggleApiToken").value.trim(),
@@ -662,20 +1426,35 @@
         formMessage("kaggleKeyMessage", "请填写 Key ID", true);
         return;
       }
-      if (!((payload.username && payload.key) || payload.api_token || payload.config_dir)) {
-        formMessage("kaggleKeyMessage", "请填写 API Token、Username/Key 或 Config Dir", true);
+      if (!payload.username) {
+        formMessage("kaggleKeyMessage", "请填写 Kaggle Username / Owner Slug", true);
+        return;
+      }
+      if (!kaggleUsernamePattern.test(payload.username)) {
+        formMessage("kaggleKeyMessage", "Username 必须是 Kaggle 主页 URL 里的 slug，不能包含空格或显示名", true);
+        return;
+      }
+      if (payload.key.toUpperCase().startsWith("KGAT_")) {
+        formMessage("kaggleKeyMessage", "KGAT_ token 请填写到 API Token，不要填写到旧式 Key", true);
+        return;
+      }
+      if (!isEditing && !(payload.key || payload.api_token || payload.config_dir)) {
+        formMessage("kaggleKeyMessage", "请填写 API Token、Key 或 Config Dir", true);
         return;
       }
 
       try {
-        const data = await api("/v1/auth/kaggle-keys", {
-          method: "POST",
+        const path = isEditing
+          ? `/v1/auth/kaggle-keys/${encodeURIComponent(payload.id)}`
+          : "/v1/auth/kaggle-keys";
+        const data = await api(path, {
+          method: isEditing ? "PATCH" : "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(payload)
         });
         renderAuthConfig(data);
-        qs("kaggleKeyForm").reset();
-        formMessage("kaggleKeyMessage", "Kaggle 账号已保存");
+        resetKaggleKeyForm();
+        formMessage("kaggleKeyMessage", isEditing ? "Kaggle 账号已更新" : "Kaggle 账号已保存");
       } catch (error) {
         formMessage("kaggleKeyMessage", error.message || String(error), true);
       }
@@ -733,10 +1512,19 @@
     async function loadAll() {
       try {
         await loadSession();
-        await Promise.all([loadHealth(), loadJobs(), loadAuthConfig()]);
+        if (activePage === "accounts") {
+          await loadAccountsData();
+        } else if (activePage === "users") {
+          await loadUserData();
+        } else {
+          await loadRuntimeData();
+        }
       } catch (error) {
         if (!["unauthorized", "unauthenticated"].includes(error.message)) {
-          qs("healthText").innerHTML = `<span class="error">${escapeHtml(error.message || String(error))}</span>`;
+          const message = `<span class="error">${escapeHtml(error.message || String(error))}</span>`;
+          if (activePage === "accounts") qs("accountsStatus").innerHTML = message;
+          else if (activePage === "users") qs("authConfig").innerHTML = message;
+          else qs("healthText").innerHTML = message;
         }
       }
     }
@@ -750,15 +1538,40 @@
       const downloadButton = event.target.closest("[data-job-download]");
       if (downloadButton) {
         downloadArtifacts(downloadButton.dataset.jobDownload);
+        return;
+      }
+      const probeButton = event.target.closest("[data-account-probe]");
+      if (probeButton) {
+        probeKaggleAccount(probeButton.dataset.accountProbe || "", probeButton).catch(console.error);
+        return;
+      }
+      const editKaggleButton = event.target.closest("[data-edit-kaggle-key]");
+      if (editKaggleButton) {
+        startEditKaggleKey(editKaggleButton.dataset.editKaggleKey || "");
       }
     });
 
+    document.querySelectorAll("[data-page-nav]").forEach((button) => {
+      button.addEventListener("click", () => {
+        setActivePage(button.dataset.pageNav);
+        loadAll().catch(console.error);
+      });
+    });
+    window.addEventListener("hashchange", () => {
+      setActivePage(pageFromHash(), {updateHash: false});
+      loadAll().catch(console.error);
+    });
     qs("logoutButton").addEventListener("click", () => logout().catch(console.error));
-    qs("refreshButton").addEventListener("click", () => loadAll().catch(console.error));
+    qs("refreshButton").addEventListener("click", () => loadRuntimeData().catch(console.error));
+    qs("refreshAccountsButton").addEventListener("click", () => loadAccountsData().catch(console.error));
     qs("autoRefreshButton").addEventListener("click", toggleAutoRefresh);
     qs("accountButton").addEventListener("click", () => checkKaggleAccount().catch(console.error));
     qs("limitSelect").addEventListener("change", () => loadJobs().catch(console.error));
-    qs("kaggleKeyForm").addEventListener("submit", (event) => addKaggleKey(event).catch(console.error));
+    qs("kaggleKeyForm").addEventListener("submit", (event) => saveKaggleKey(event).catch(console.error));
+    qs("cancelKaggleEditButton").addEventListener("click", () => {
+      resetKaggleKeyForm();
+      formMessage("kaggleKeyMessage", "");
+    });
     qs("relayTokenForm").addEventListener("submit", (event) => addRelayToken(event).catch(console.error));
     qs("generateRelayTokenButton").addEventListener("click", () => {
       qs("newRelayToken").type = "text";
@@ -769,11 +1582,10 @@
       qs("newRelayAllowedKeys").disabled = qs("newRelayAllowAll").checked;
     });
 
-    loadAll();
+    setActivePage(pageFromHash(), {updateHash: false});
+    loadAll().catch(console.error);
     timer = setInterval(() => {
-      if (autoRefresh) {
-        loadJobs().catch(console.error);
-      }
+      if (autoRefresh && activePage === "runtime") loadRuntimeData().catch(console.error);
     }, 5000);
   </script>
 </body>
