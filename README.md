@@ -58,15 +58,19 @@ Main endpoints:
 - `POST /v1/jobs`
 - `PUT /v1/jobs/{job_id}/archives/{dataset|kernel}/chunks/{index}`
 - `POST /v1/jobs/{job_id}/complete`
+- `POST /v1/jobs/{job_id}/cancel`
 - `POST /v1/jobs/{job_id}/progress`
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/artifacts.zip`
 - `DELETE /v1/jobs/{job_id}`
 
 When `POST /v1/jobs` omits `kaggle_key_id`, Relay binds the job to the only
-allowed key, or for multi-key tokens chooses an allowed key with remaining GPU
-quota. Supplying `kaggle_key_id` still forces that specific key when the token is
-allowed to use it.
+allowed key, or for multi-key tokens first prefers an allowed key whose username
+matches the requested owner and has remaining GPU quota. If that owner has no
+remaining quota, Relay may choose another allowed key with remaining quota and
+rewrite `dataset_ref`, `kernel_ref`, and uploaded Kaggle metadata to that key's
+username. Supplying `kaggle_key_id` still forces that specific key when the token
+is allowed to use it, with the same owner rewrite if needed.
 
 ## Kernel Progress Callback
 
@@ -102,6 +106,13 @@ Example body:
 
 Relay maps `epoch / epochs` into the existing kernel progress range and stores
 the payload in `kernel_status` plus `recent_logs`.
+
+To stop a running Kaggle job, call `POST /v1/jobs/{job_id}/cancel`. Kaggle does
+not expose a public hard-stop API for a running kernel, so cancellation is
+cooperative: generated `train.py` should read `cancel_requested` from the next
+progress callback response, save useful outputs under `/kaggle/working`, and
+exit cleanly. Relay then downloads available artifacts and marks the job
+`canceled`.
 
 ## Reverse Proxy
 

@@ -41,14 +41,23 @@ Kernel/notebook chunks are always uploaded because each run uses a fresh kernel.
 4. Create `dataset.zip` and `kernel.zip`.
 5. Call `POST /v1/jobs` with archive sizes, archive SHA-256 hashes, `payload_hash`,
    and `callback_token_sha256`. If the relay token can access more than one
-   Kaggle key, omit `kaggle_key_id` to let Relay choose an available key by GPU
-   quota, or include `kaggle_key_id` to force a specific key.
+   Kaggle key, omit `kaggle_key_id` to let Relay choose an available key by owner
+   and GPU quota, or include `kaggle_key_id` to force a specific key.
+   Use the returned `dataset_ref`, `kernel_ref`, and `kaggle_key_id` as the
+   source of truth after this call; Relay may rewrite the owner when it falls
+   back to another Kaggle account with remaining quota.
 6. If the response has `dataset_upload_required=true`, upload dataset chunks.
    If the field is absent, default to `true` for old Relay compatibility.
 7. Always upload kernel chunks.
 8. Call `POST /v1/jobs/{job_id}/complete`.
-9. Poll `GET /v1/jobs/{job_id}` until `status` is `complete` or `failed`.
+9. Poll `GET /v1/jobs/{job_id}` until `status` is `complete`, `canceled`, or `failed`.
 10. Download `GET /v1/jobs/{job_id}/artifacts.zip` after completion.
+11. To stop a running job cooperatively, call `POST /v1/jobs/{job_id}/cancel`.
+    The Kaggle script must read the next callback response and exit cleanly.
+12. After a client restart or reconnect, keep using the same Relay Token and
+    call `GET /v1/jobs?active=true` to find unfinished jobs bound to that token,
+    then use `accepted_chunks`, `status`, and `can_download` to decide whether
+    to resume chunk upload, keep polling, cancel, or download.
 
 Reference client pseudocode:
 
@@ -65,6 +74,9 @@ job = relay.create_job(
     callback_token_sha256=callback_token_sha256,
     kaggle_key_id=kaggle_key_id,
 )
+dataset_ref = job["dataset_ref"]
+kernel_ref = job["kernel_ref"]
+kaggle_key_id = job["kaggle_key_id"]
 
 if job.get("dataset_upload_required", True):
     relay.upload_archive_chunks(job["job_id"], "dataset", dataset_zip)
@@ -72,6 +84,39 @@ if job.get("dataset_upload_required", True):
 relay.upload_archive_chunks(job["job_id"], "kernel", kernel_zip)
 relay.complete_job(job["job_id"])
 ```
+
+## Query Existing Jobs For Resume
+
+Clients can filter jobs by the current Relay Token and status:
+
+```text
+GET /v1/jobs?active=true
+Authorization: Bearer <RELAY_API_TOKEN>
+```
+
+Rules:
+
+- A regular relay token can only query and operate on jobs it created. Do not
+  put the raw token in a URL query parameter; only send it in
+  `Authorization: Bearer ...`.
+- An admin / `allowed_kaggle_key_ids="*"` token returns all visible jobs for the
+  current permissions.
+- To resume as a specific regular token, send that regular token as the
+  `Authorization` value.
+- `active=true` returns unfinished jobs, meaning jobs whose status is not
+  `complete`, `canceled`, or `failed`.
+- Exact status filters are also supported, for example
+  `GET /v1/jobs?status=receiving&status=waiting_kernel`. Comma-separated values
+  such as `status=receiving,waiting_kernel` also work.
+
+Resume guidance:
+
+- `receiving`: read `accepted_chunks` and upload only missing chunks.
+- `assembling`, `queued`, `uploading_dataset`, `waiting_dataset`,
+  `pushing_kernel`, `waiting_kernel`, `downloading_output`: do not create a
+  duplicate job; keep polling `GET /v1/jobs/{job_id}`.
+- `complete` or `canceled` with `can_download=true`: download artifacts.
+- `failed`: inspect `error` and create a replacement job if needed.
 
 ## Create Job Request
 
@@ -110,14 +155,17 @@ Important field rules:
   hash. The raw callback token is embedded in the generated Kaggle script.
 - `kaggle_key_id` is optional. When the relay token maps to exactly one Kaggle
   key, Relay uses that key. When the token can access multiple keys and this
-  field is omitted, Relay checks Kaggle quota and picks an allowed key with
-  remaining GPU quota. When this field is present, Relay uses the requested key
-  or rejects the request if the token is not allowed to use it.
+  field is omitted, Relay first prefers a key whose configured `username` matches
+  the requested owner and has remaining GPU quota. If that owner has no quota,
+  Relay may fall back to another allowed key with quota. When this field is
+  present, Relay uses the requested key or rejects the request if the token is
+  not allowed to use it.
 - `dataset-metadata.json` and `kernel-metadata.json` must include `id` in
-  `owner/slug` format. Relay validates those IDs against `dataset_ref` and
-  `kernel_ref` after upload assembly and before pushing to Kaggle. If the
-  selected Kaggle key has a configured `username`, the metadata owner must match
-  that username.
+  `owner/slug` format. Relay validates slug consistency after upload assembly.
+  If the selected Kaggle key has a configured `username`, Relay rewrites the
+  metadata owner to match that username when necessary. Relay also rewrites
+  `kernel-metadata.json.dataset_sources` entries that point at the submitted
+  dataset slug so the kernel uses the final dataset ref.
 - Jobs remain bound to the resolved key for upload, execution, status, artifact
   download, deletion, and dataset cache lookup.
 - Jobs also remain bound to the relay token principal that created them. A client
@@ -187,6 +235,40 @@ Relay finds the latest job for `kernel_ref`, verifies the callback token against
 
 Relay maps `epoch / epochs` into the existing kernel progress range from `60` to
 `80`. If `remote_progress` is provided directly, Relay uses that value instead.
+The callback response is the normal job response and includes
+`cancel_requested`. A generated `train.py` must check that field and stop itself;
+Relay cannot hard-kill a running Kaggle kernel through the public Kaggle API.
+
+## Cancel Training
+
+Relay supports cooperative cancellation:
+
+```text
+POST /v1/jobs/{job_id}/cancel
+Authorization: Bearer <RELAY_API_TOKEN>
+```
+
+The endpoint marks the job as `cancel_requested` once the kernel may already be
+running. The next successful progress callback returns:
+
+```json
+{
+  "status": "cancel_requested",
+  "cancel_requested": true,
+  "cancel_reason": "cancel requested"
+}
+```
+
+Client requirements:
+
+- Keep sending a per-job callback token, not the main relay API token, from
+  Kaggle code.
+- Make `train.py` call the progress callback at least once per epoch. For long
+  epochs, also check every N steps.
+- When `cancel_requested=true`, save the latest checkpoint or useful outputs to
+  `/kaggle/working`, print a final log line, and exit with status `0`.
+- Relay will download Kaggle output and mark the job `canceled`; if artifacts
+  exist, `artifacts.zip` remains downloadable.
 
 ## Notebook Code Template
 
@@ -218,9 +300,16 @@ def relay_progress(payload):
 
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            resp.read()
+            body = resp.read()
+        return json.loads(body.decode("utf-8") or "{}")
     except Exception as exc:
         print(f"[WARN] relay callback failed: {exc}", flush=True)
+        return {}
+
+
+def relay_should_stop(payload):
+    response = relay_progress(payload)
+    return bool(response.get("cancel_requested"))
 ```
 
 Call it wherever the training code emits structured progress:
@@ -238,7 +327,10 @@ payload = {
 }
 
 print("TRAINING_PLATFORM_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
-relay_progress(payload)
+if relay_should_stop(payload):
+    save_checkpoint_to_kaggle_working()
+    print("[INFO] relay cancel requested; checkpoint saved", flush=True)
+    raise SystemExit(0)
 ```
 
 Keep the existing `TRAINING_PLATFORM_PROGRESS` print. Relay still supports
