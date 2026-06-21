@@ -1,0 +1,14 @@
+services:
+  kaggle-relay:
+    image: ${KAGGLE_RELAY_IMAGE:-ghcr.io/jsdfhasuh/kaggle_relay:latest}
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      RELAY_STORAGE_DIR: /data
+    volumes:
+      - ./relay-data:/data
+      # Optional: mount Kaggle credentials instead of KAGGLE_API_TOKEN.
+      # - ~/.kaggle:/root/.kaggle:ro
+    command: sh -c "mkdir -p /tmp/kaggle-config && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
