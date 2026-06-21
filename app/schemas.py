@@ -11,8 +11,10 @@ JobStatus = Literal[
     "waiting_dataset",
     "pushing_kernel",
     "waiting_kernel",
+    "cancel_requested",
     "downloading_output",
     "complete",
+    "canceled",
     "failed",
 ]
 
@@ -43,6 +45,12 @@ class JobResponse(BaseModel):
     error: str = ""
     payload_hash: str = ""
     callback_enabled: bool = False
+    created_at: float
+    updated_at: float
+    completed_at: Optional[float] = None
+    cancel_requested: bool = False
+    cancel_requested_at: Optional[float] = None
+    cancel_reason: str = ""
     artifact_path: str = ""
     can_download: bool = False
     artifact_size: Optional[int] = None

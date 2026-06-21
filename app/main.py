@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import aiofiles
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -34,6 +34,7 @@ from app.schemas import (
     HealthResponse,
     JobProgressRequest,
     JobResponse,
+    JobStatus,
     UiLoginRequest,
     UpdateKaggleKeyRequest,
 )
@@ -45,11 +46,32 @@ from app.ui_auth import (
     set_ui_session_cookie,
     ui_session_max_age_seconds,
 )
-from app.worker import has_ready_dataset_cache, process_job, validate_kernel_payload, validate_payloads
+from app.worker import (
+    TERMINAL_JOB_STATUSES,
+    has_ready_dataset_cache,
+    is_ready_dataset_status,
+    process_job,
+    resume_kernel_job,
+    rewrite_ref_owner,
+    validate_kernel_payload,
+    validate_payloads,
+)
 
 VERSION = "0.1.0"
 AUTH_CONFIG_LOCK = threading.RLock()
 KAGGLE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+JOB_STATUS_VALUES = set(get_args(JobStatus))
+RUNNING_JOB_STATUSES = {
+    "assembling",
+    "queued",
+    "uploading_dataset",
+    "waiting_dataset",
+    "pushing_kernel",
+    "waiting_kernel",
+    "cancel_requested",
+    "downloading_output",
+}
+ACTIVE_JOB_STATUSES = JOB_STATUS_VALUES - TERMINAL_JOB_STATUSES
 
 
 def get_settings(request: Request) -> Settings:
@@ -95,7 +117,7 @@ def can_access_job(job: dict, principal: RelayPrincipal, auth_store: AuthStore) 
     if auth_store.legacy:
         return not job_owner or job_owner == principal.id
     if job_owner:
-        return job_owner == principal.id
+        return principal.allow_all_keys or job_owner == principal.id
     return principal.allow_all_keys
 
 
@@ -117,6 +139,26 @@ def get_authorized_job(
     return job
 
 
+def split_query_values(values: list[str] | None) -> set[str]:
+    result: set[str] = set()
+    for value in values or []:
+        for item in str(value or "").split(","):
+            item = item.strip()
+            if item:
+                result.add(item)
+    return result
+
+
+def status_filter_for_list(status_values: list[str] | None, active: bool) -> set[str] | None:
+    statuses = split_query_values(status_values)
+    invalid = sorted(statuses - JOB_STATUS_VALUES)
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"unknown job status: {', '.join(invalid)}")
+    if active:
+        return statuses & ACTIVE_JOB_STATUSES if statuses else set(ACTIVE_JOB_STATUSES)
+    return statuses or None
+
+
 def job_response(db: RelayDb, job_id: str) -> JobResponse:
     job = db.get_job(job_id)
     if not job:
@@ -132,7 +174,7 @@ def artifact_download_metadata(job: dict) -> dict:
         "artifact_filename": filename,
         "download_unavailable_reason": "",
     }
-    if job["status"] != "complete":
+    if job["status"] not in {"complete", "canceled"}:
         metadata["download_unavailable_reason"] = "job is not complete"
         return metadata
     if not job.get("artifact_path"):
@@ -170,6 +212,7 @@ def job_to_response(db: RelayDb, job: dict) -> JobResponse:
             {
                 **job,
                 "callback_enabled": bool(job.get("callback_token_sha256")),
+                "cancel_requested": bool(job.get("cancel_requested_at")),
                 **artifact_download_metadata(job),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
@@ -314,33 +357,16 @@ def quota_remaining_hours(quota: dict, preferred_resource: str = "GPU") -> float
     return max(float(item.get("remaining_hours") or 0) for item in accelerators)
 
 
-def select_kaggle_key_by_quota(
+def quota_key_candidates(
     settings: Settings,
     auth_store: AuthStore,
-    principal: RelayPrincipal,
-    owner: str = "",
-) -> str:
-    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
-    owner = owner.strip()
-    if owner:
-        matching_key_ids = []
-        for key_id in allowed_key_ids:
-            credentials = auth_store.credentials_for(key_id)
-            username = str(getattr(credentials, "username", "") or "").strip()
-            if username.lower() == owner.lower():
-                matching_key_ids.append(key_id)
-        if not matching_key_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"no allowed kaggle key matches requested owner {owner}",
-            )
-        allowed_key_ids = matching_key_ids
-
+    key_ids: list[str],
+) -> tuple[list[tuple[float, str]], list[str], list[str]]:
     candidates: list[tuple[float, str]] = []
     exhausted: list[str] = []
     unavailable: list[str] = []
 
-    for key_id in allowed_key_ids:
+    for key_id in key_ids:
         try:
             credentials = auth_store.credentials_for(key_id)
             quota = KaggleAdapter(settings, lambda _message: None, credentials=credentials).quota()
@@ -356,16 +382,55 @@ def select_kaggle_key_by_quota(
         else:
             exhausted.append(key_id)
 
+    return candidates, exhausted, unavailable
+
+
+def select_kaggle_key_by_quota(
+    settings: Settings,
+    auth_store: AuthStore,
+    principal: RelayPrincipal,
+    preferred_owner: str = "",
+) -> str:
+    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
+    preferred_owner = preferred_owner.strip()
+    all_exhausted: list[str] = []
+    all_unavailable: list[str] = []
+
+    if preferred_owner:
+        preferred_key_ids = []
+        fallback_key_ids = []
+        for key_id in allowed_key_ids:
+            credentials = auth_store.credentials_for(key_id)
+            username = str(getattr(credentials, "username", "") or "").strip()
+            if username.lower() == preferred_owner.lower():
+                preferred_key_ids.append(key_id)
+            elif username:
+                fallback_key_ids.append(key_id)
+            else:
+                all_unavailable.append(f"{key_id}: username required to rewrite owner")
+
+        if preferred_key_ids:
+            candidates, exhausted, unavailable = quota_key_candidates(settings, auth_store, preferred_key_ids)
+            if candidates:
+                return max(candidates)[1]
+            all_exhausted.extend(exhausted)
+            all_unavailable.extend(unavailable)
+        allowed_key_ids = fallback_key_ids
+
+    candidates, exhausted, unavailable = quota_key_candidates(settings, auth_store, allowed_key_ids)
+    all_exhausted.extend(exhausted)
+    all_unavailable.extend(unavailable)
+
     if candidates:
         return max(candidates)[1]
-    if exhausted:
+    if all_exhausted:
         raise HTTPException(
             status_code=409,
             detail="no allowed kaggle key has remaining GPU quota",
         )
     detail = "unable to read quota for allowed kaggle keys"
-    if unavailable:
-        detail = f"{detail}: {'; '.join(unavailable)}"
+    if all_unavailable:
+        detail = f"{detail}: {'; '.join(all_unavailable)}"
     raise HTTPException(status_code=503, detail=detail)
 
 
@@ -386,7 +451,7 @@ def resolve_job_kaggle_key_id(
         settings,
         auth_store,
         principal,
-        owner=requested_owner_from_refs(dataset_ref, kernel_ref),
+        preferred_owner=requested_owner_from_refs(dataset_ref, kernel_ref),
     )
 
 
@@ -407,6 +472,16 @@ def requested_owner_from_refs(dataset_ref: str, kernel_ref: str) -> str:
             detail=f"dataset_ref owner {dataset_owner} does not match kernel_ref owner {kernel_owner}",
         )
     return dataset_owner or kernel_owner
+
+
+def final_job_refs(dataset_ref: str, kernel_ref: str, username: str) -> tuple[str, str]:
+    username = str(username or "").strip()
+    if not username:
+        return dataset_ref, kernel_ref
+    try:
+        return rewrite_ref_owner(dataset_ref, username), rewrite_ref_owner(kernel_ref, username)
+    except ArchiveError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def session_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
@@ -614,22 +689,262 @@ def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest)
         "kaggle_output": clean_message[-4000:],
         "progress": progress_from_callback(job, payload),
     }
-    if job["status"] not in {"complete", "failed"}:
-        updates["status"] = "waiting_kernel"
+    if job["status"] not in TERMINAL_JOB_STATUSES:
+        updates["status"] = "cancel_requested" if job.get("cancel_requested_at") else "waiting_kernel"
     db.update_job(job["job_id"], **updates)
+
+
+def request_job_cancel(db: RelayDb, job: dict) -> None:
+    status = str(job.get("status") or "")
+    if status in {"complete", "failed"}:
+        raise HTTPException(status_code=409, detail=f"job is already {status}")
+    if status in {"cancel_requested", "canceled"}:
+        return
+
+    stamp = time.time()
+    reason = "cancel requested"
+    updates = {
+        "cancel_requested_at": stamp,
+        "cancel_reason": reason,
+        "error": "",
+    }
+    if status == "receiving":
+        updates.update(
+            {
+                "status": "canceled",
+                "error": "canceled before submission",
+            }
+        )
+    else:
+        updates["status"] = "cancel_requested"
+    db.update_job(job["job_id"], **updates)
+    db.append_log(job["job_id"], reason)
+
+
+def assemble_and_validate_job(settings: Settings, db: RelayDb, auth_store: AuthStore, job: dict) -> None:
+    job_id = job["job_id"]
+    job_dir = settings.jobs_dir / job_id
+    archives_dir = job_dir / "archives"
+    extracted_dir = job_dir / "extracted"
+    credentials = auth_store.credentials_for(job.get("kaggle_key_id", ""))
+    kernel_zip = archives_dir / "kernel.zip"
+    dataset_cache_hit = has_ready_dataset_cache(
+        db,
+        job["dataset_ref"],
+        job["payload_hash"],
+        kaggle_key_id=job.get("kaggle_key_id", ""),
+    )
+    if not dataset_cache_hit:
+        dataset_zip = archives_dir / "dataset.zip"
+        assemble_archive(
+            job_dir / "chunks" / "dataset",
+            dataset_zip,
+            job["dataset_size"],
+            job["chunk_size"],
+            job["dataset_archive_sha256"],
+        )
+        safe_extract_zip(dataset_zip, extracted_dir / "dataset", job["dataset_size"])
+    assemble_archive(
+        job_dir / "chunks" / "kernel",
+        kernel_zip,
+        job["kernel_size"],
+        job["chunk_size"],
+        job["kernel_archive_sha256"],
+    )
+    safe_extract_zip(kernel_zip, extracted_dir / "kernel", job["kernel_size"])
+    if dataset_cache_hit:
+        validate_kernel_payload(
+            extracted_dir / "kernel",
+            job["kernel_ref"],
+            credentials,
+            dataset_ref=job["dataset_ref"],
+        )
+    else:
+        validate_payloads(
+            extracted_dir / "dataset",
+            extracted_dir / "kernel",
+            job["dataset_ref"],
+            job["kernel_ref"],
+            credentials,
+        )
+
+
+def append_internal_log(db: RelayDb, job_id: str, message: str) -> None:
+    clean = redact_secrets(message)
+    db.append_log(job_id, clean)
+    db.update_job(job_id, kaggle_output=clean[-4000:])
+
+
+def recovery_adapter(settings: Settings, db: RelayDb, auth_store: AuthStore, job: dict) -> KaggleAdapter:
+    credentials = auth_store.credentials_for(job.get("kaggle_key_id", ""))
+    return KaggleAdapter(settings, lambda message: append_internal_log(db, job["job_id"], message), credentials=credentials)
+
+
+def not_found_error(exc: Exception) -> bool:
+    detail = str(exc).lower()
+    return any(marker in detail for marker in ["404", "not found", "no kernel", "not exist"])
+
+
+def kernel_was_submitted(db: RelayDb, job: dict) -> bool:
+    try:
+        if float(job.get("progress") or 0) >= 60:
+            return True
+    except (TypeError, ValueError):
+        pass
+    logs = "\n".join(db.recent_logs(job["job_id"], limit=500)).lower()
+    return "kernel version" in logs and "successfully pushed" in logs
+
+
+def fail_recovered_job(db: RelayDb, job_id: str, message: str) -> None:
+    clean = redact_secrets(message)
+    db.update_job(job_id, status="failed", progress=0, error=clean)
+    db.append_log(job_id, clean)
+
+
+def recover_job_after_restart(
+    settings: Settings,
+    db: RelayDb,
+    auth_store: AuthStore,
+    job: dict,
+) -> dict | None:
+    job_id = job["job_id"]
+    status = str(job.get("status") or "")
+    append_internal_log(db, job_id, f"recovering job after relay restart from status {status}")
+
+    if status == "queued":
+        return {"action": "process", "job_id": job_id}
+
+    if status in {"waiting_kernel", "downloading_output"}:
+        return {"action": "resume_kernel", "job_id": job_id}
+
+    if status == "cancel_requested":
+        if kernel_was_submitted(db, job):
+            return {"action": "resume_kernel", "job_id": job_id, "final_status": "canceled"}
+        db.update_job(job_id, status="canceled", error=job.get("cancel_reason") or "cancel requested")
+        db.append_log(job_id, "canceled during restart recovery before Kaggle kernel submission")
+        return None
+
+    if status == "pushing_kernel":
+        adapter = recovery_adapter(settings, db, auth_store, job)
+        try:
+            adapter.kernel_status(job["kernel_ref"])
+        except Exception as exc:
+            if not_found_error(exc):
+                fail_recovered_job(
+                    db,
+                    job_id,
+                    "restart during kernel push before submission could be verified; resubmit job",
+                )
+            else:
+                fail_recovered_job(
+                    db,
+                    job_id,
+                    f"restart during kernel push and kernel status could not be verified; resubmit job: {exc}",
+                )
+            return None
+        return {"action": "resume_kernel", "job_id": job_id}
+
+    if status in {"uploading_dataset", "waiting_dataset"}:
+        adapter = recovery_adapter(settings, db, auth_store, job)
+        try:
+            dataset_status = adapter.dataset_status(job["dataset_ref"])
+        except Exception as exc:
+            fail_recovered_job(
+                db,
+                job_id,
+                f"restart during dataset upload/wait before readiness could be verified; resubmit job: {exc}",
+            )
+            return None
+        if not is_ready_dataset_status(dataset_status):
+            fail_recovered_job(
+                db,
+                job_id,
+                "restart during dataset upload/wait before dataset was ready; resubmit job",
+            )
+            return None
+        db.upsert_dataset_cache(
+            dataset_ref=job["dataset_ref"],
+            payload_hash=job["payload_hash"],
+            status="ready",
+            dataset_status=dataset_status,
+            source_job_id=job_id,
+            kaggle_key_id=job.get("kaggle_key_id", ""),
+        )
+        db.upsert_last_dataset_job(
+            dataset_ref=job["dataset_ref"],
+            payload_hash=job["payload_hash"],
+            dataset_status=dataset_status,
+            job_id=job_id,
+            kaggle_key_id=job.get("kaggle_key_id", ""),
+        )
+        db.update_job(job_id, status="queued", dataset_status=dataset_status, progress=40, error="")
+        return {"action": "process", "job_id": job_id}
+
+    if status == "assembling":
+        try:
+            assemble_and_validate_job(settings, db, auth_store, job)
+        except Exception as exc:
+            fail_recovered_job(db, job_id, redact_secrets(str(exc)))
+            return None
+        db.update_job(job_id, status="queued", progress=15, error="")
+        return {"action": "process", "job_id": job_id}
+
+    return None
+
+
+async def recover_incomplete_jobs(app: FastAPI) -> None:
+    jobs = app.state.db.list_jobs_by_status(RUNNING_JOB_STATUSES)
+    for job in jobs:
+        item = await asyncio.to_thread(
+            recover_job_after_restart,
+            app.state.settings,
+            app.state.db,
+            app.state.auth_store,
+            job,
+        )
+        if item:
+            await app.state.queue.put(item)
+
+
+def normalize_queue_item(item) -> dict:
+    if isinstance(item, dict):
+        return item
+    return {"action": "process", "job_id": item}
+
+
+def mark_worker_exception(db: RelayDb, job_id: str, exc: Exception) -> None:
+    message = redact_secrets(str(exc))
+    db.append_log(job_id, message)
+    job = db.get_job(job_id)
+    if job and job.get("status") not in TERMINAL_JOB_STATUSES:
+        db.update_job(job_id, status="failed", progress=0, error=message)
 
 
 async def worker_loop(app: FastAPI) -> None:
     while True:
-        job_id = await app.state.queue.get()
+        item = normalize_queue_item(await app.state.queue.get())
+        job_id = item["job_id"]
         try:
-            await asyncio.to_thread(
-                process_job,
-                app.state.settings,
-                app.state.db,
-                job_id,
-                app.state.auth_store,
-            )
+            action = item.get("action", "process")
+            if action == "resume_kernel":
+                await asyncio.to_thread(
+                    resume_kernel_job,
+                    app.state.settings,
+                    app.state.db,
+                    job_id,
+                    app.state.auth_store,
+                    item.get("final_status"),
+                )
+            else:
+                await asyncio.to_thread(
+                    process_job,
+                    app.state.settings,
+                    app.state.db,
+                    job_id,
+                    app.state.auth_store,
+                )
+        except Exception as exc:
+            mark_worker_exception(app.state.db, job_id, exc)
         finally:
             app.state.queue.task_done()
 
@@ -663,6 +978,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         app.state.worker_task = asyncio.create_task(worker_loop(app))
         app.state.cleanup_task = asyncio.create_task(cleanup_loop(app))
+        await recover_incomplete_jobs(app)
         try:
             yield
         finally:
@@ -872,11 +1188,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except AuthSelectionError as exc:
             raise selection_error(exc) from exc
+        credentials = auth_store.credentials_for(kaggle_key_id)
+        dataset_ref, kernel_ref = final_job_refs(
+            payload.dataset_ref,
+            payload.kernel_ref,
+            str(getattr(credentials, "username", "") or ""),
+        )
         job_id = uuid.uuid4().hex
         (settings.jobs_dir / job_id / "chunks" / "dataset").mkdir(parents=True, exist_ok=True)
         (settings.jobs_dir / job_id / "chunks" / "kernel").mkdir(parents=True, exist_ok=True)
         values = {
             **payload.model_dump(),
+            "dataset_ref": dataset_ref,
+            "kernel_ref": kernel_ref,
             "job_id": job_id,
             "relay_token_id": principal.id,
             "kaggle_key_id": kaggle_key_id,
@@ -887,17 +1211,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/jobs", response_model=list[JobResponse])
     def list_jobs(
         limit: int = Query(default=50, ge=1, le=200),
+        active: bool = Query(default=False),
+        status: list[str] | None = Query(default=None),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> list[JobResponse]:
         key_filter = None if principal.allow_all_keys else set(auth_store.allowed_key_ids(principal))
-        owner_filter = None if auth_store.legacy else principal.id
-        include_unowned = bool(owner_filter and principal.allow_all_keys)
+        owner_filter = None if auth_store.legacy or principal.allow_all_keys else principal.id
+        status_filter = status_filter_for_list(status, active)
         jobs = db.list_jobs(
             kaggle_key_ids=key_filter,
             relay_token_id=owner_filter,
-            include_unowned=include_unowned,
+            statuses=status_filter,
             limit=limit,
         )
         return [job_to_response(db, job) for job in jobs]
@@ -980,59 +1306,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request = None,
     ) -> JobResponse:
         job = get_authorized_job(db, job_id, principal, auth_store)
-        if job["status"] in {"queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "downloading_output", "complete"}:
+        if job["status"] in RUNNING_JOB_STATUSES | {"complete", "canceled"}:
             return job_response(db, job_id)
 
-        job_dir = settings.jobs_dir / job_id
-        archives_dir = job_dir / "archives"
-        extracted_dir = job_dir / "extracted"
-        credentials = auth_store.credentials_for(job.get("kaggle_key_id", ""))
         db.update_job(job_id, status="assembling", progress=10)
         try:
-            kernel_zip = archives_dir / "kernel.zip"
-            dataset_cache_hit = has_ready_dataset_cache(
-                db,
-                job["dataset_ref"],
-                job["payload_hash"],
-                kaggle_key_id=job.get("kaggle_key_id", ""),
-            )
-            if not dataset_cache_hit:
-                dataset_zip = archives_dir / "dataset.zip"
-                assemble_archive(
-                    job_dir / "chunks" / "dataset",
-                    dataset_zip,
-                    job["dataset_size"],
-                    job["chunk_size"],
-                    job["dataset_archive_sha256"],
-                )
-                safe_extract_zip(dataset_zip, extracted_dir / "dataset", job["dataset_size"])
-            assemble_archive(
-                job_dir / "chunks" / "kernel",
-                kernel_zip,
-                job["kernel_size"],
-                job["chunk_size"],
-                job["kernel_archive_sha256"],
-            )
-            safe_extract_zip(kernel_zip, extracted_dir / "kernel", job["kernel_size"])
-            if dataset_cache_hit:
-                validate_kernel_payload(
-                    extracted_dir / "kernel",
-                    job["kernel_ref"],
-                    credentials,
-                )
-            else:
-                validate_payloads(
-                    extracted_dir / "dataset",
-                    extracted_dir / "kernel",
-                    job["dataset_ref"],
-                    job["kernel_ref"],
-                    credentials,
-                )
+            assemble_and_validate_job(settings, db, auth_store, job)
         except Exception as exc:
             db.update_job(job_id, status="failed", progress=0, error=redact_secrets(str(exc)))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         db.update_job(job_id, status="queued", progress=15)
-        await request.app.state.queue.put(job_id)
+        await request.app.state.queue.put({"action": "process", "job_id": job_id})
         return job_response(db, job_id)
 
     @app.post("/v1/jobs/by-kernel/progress", response_model=JobResponse)
@@ -1050,14 +1334,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         key_filter = None
         if principal and not principal.allow_all_keys:
             key_filter = set(auth_store.allowed_key_ids(principal))
-        owner_filter = None if not principal or auth_store.legacy else principal.id
-        include_unowned = bool(owner_filter and principal.allow_all_keys)
+        owner_filter = None if not principal or auth_store.legacy or principal.allow_all_keys else principal.id
 
         candidates = db.get_jobs_by_kernel_ref(
             kernel_ref,
             kaggle_key_ids=key_filter,
             relay_token_id=owner_filter,
-            include_unowned=include_unowned,
             limit=50,
         )
         if not candidates:
@@ -1090,6 +1372,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         apply_progress_callback(db, job, payload)
         return job_response(db, job_id)
 
+    @app.post("/v1/jobs/{job_id}/cancel", response_model=JobResponse)
+    def cancel_job(
+        job_id: str,
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> JobResponse:
+        job = get_authorized_job(db, job_id, principal, auth_store)
+        request_job_cancel(db, job)
+        return job_response(db, job_id)
+
     @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
     def get_job(
         job_id: str,
@@ -1110,7 +1403,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job = get_authorized_job(db, job_id, principal, auth_store)
         download = artifact_download_metadata(job)
         if not download["can_download"]:
-            status_code = 404 if job["status"] == "complete" and job.get("artifact_path") else 409
+            status_code = 404 if job["status"] in {"complete", "canceled"} and job.get("artifact_path") else 409
             raise HTTPException(status_code=status_code, detail=download["download_unavailable_reason"])
         artifact_path = Path(job["artifact_path"])
         return FileResponse(

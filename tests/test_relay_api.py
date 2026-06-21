@@ -145,11 +145,67 @@ def upload_all(
         assert response.status_code == 200
 
 
+def seed_job(
+    app,
+    status: str,
+    progress: float = 0,
+    payload_hash: str = "payload-1",
+    job_id: str | None = None,
+    dataset_ref: str = "demo/data",
+    kernel_ref: str = "demo/kernel",
+):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    job_id = job_id or hashlib.sha256(f"{status}-{time.time()}".encode("utf-8")).hexdigest()[:32]
+    values = {
+        **job_request_body(
+            dataset_zip,
+            kernel_zip,
+            payload_hash=payload_hash,
+            dataset_ref=dataset_ref,
+            kernel_ref=kernel_ref,
+        ),
+        "job_id": job_id,
+    }
+    app.state.db.create_job(values)
+    app.state.db.update_job(job_id, status=status, progress=progress, dataset_status="ready")
+    return job_id
+
+
+def wait_for_status(client: TestClient, job_id: str, expected: set[str], token: str = "secret") -> dict:
+    payload = {}
+    for _ in range(50):
+        response = client.get(f"/v1/jobs/{job_id}", headers=auth_headers(token=token))
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] in expected:
+            return payload
+        time.sleep(0.05)
+    return payload
+
+
 def test_auth_required(tmp_path):
     app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
         response = client.get("/v1/health")
     assert response.status_code == 401
+
+
+def test_job_response_includes_timestamps(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    app = create_app(make_settings(tmp_path))
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        response = client.get(f"/v1/jobs/{job_id}", headers=auth_headers())
+
+    data = response.json()
+    assert response.status_code == 200
+    assert isinstance(data["created_at"], float)
+    assert isinstance(data["updated_at"], float)
+    assert data["created_at"] <= data["updated_at"]
+    assert data["completed_at"] is None
 
 
 def test_single_key_token_auto_binds_job_to_kaggle_key(tmp_path):
@@ -240,10 +296,69 @@ def test_multi_key_token_auto_selects_key_and_enforces_job_access(tmp_path, monk
     assert forbidden_key.status_code == 403
     assert admin_get.status_code == 200
     assert same_key_non_owner_get.status_code == 404
-    assert admin_non_owner_get.status_code == 404
+    assert admin_non_owner_get.status_code == 200
     assert other_get.status_code == 404
-    assert {job["job_id"] for job in admin_jobs} == {auto_key.json()["job_id"], admin_job_id}
+    assert {job["job_id"] for job in admin_jobs} == {auto_key.json()["job_id"], admin_job_id, user_a_job_id}
+    assert admin_jobs[0]["job_id"] == user_a_job_id
     assert {job["job_id"] for job in user_a_jobs} == {user_a_job_id}
+
+
+def test_list_jobs_filters_by_authorization_token_and_status(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    config = multi_key_auth_config()
+    app = create_app(make_auth_config_settings(tmp_path, config))
+
+    with TestClient(app) as client:
+        active_job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            headers=auth_headers(token="user-a-token"),
+        )
+        complete_job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            headers=auth_headers(token="user-a-token"),
+        )
+        other_job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            headers=auth_headers(token="user-b-token"),
+        )
+        app.state.db.update_job(active_job_id, status="waiting_kernel", progress=60)
+        app.state.db.update_job(complete_job_id, status="complete", progress=100)
+        app.state.db.update_job(other_job_id, status="queued", progress=15)
+
+        user_active = client.get(
+            "/v1/jobs?active=true",
+            headers=auth_headers(token="user-a-token"),
+        )
+        user_exact_statuses = client.get(
+            "/v1/jobs?status=waiting_kernel,complete",
+            headers=auth_headers(token="user-a-token"),
+        )
+        user_b_active = client.get(
+            "/v1/jobs?active=true",
+            headers=auth_headers(token="user-b-token"),
+        )
+        admin_active = client.get(
+            "/v1/jobs?active=true",
+            headers=auth_headers(token="admin-token"),
+        )
+        invalid_status = client.get(
+            "/v1/jobs?status=unknown",
+            headers=auth_headers(token="admin-token"),
+        )
+
+    assert user_active.status_code == 200
+    assert [job["job_id"] for job in user_active.json()] == [active_job_id]
+    assert [job["job_id"] for job in user_exact_statuses.json()] == [complete_job_id, active_job_id]
+    assert [job["job_id"] for job in user_b_active.json()] == [other_job_id]
+    assert {job["job_id"] for job in admin_active.json()} == {active_job_id, other_job_id}
+    assert invalid_status.status_code == 400
 
 
 def test_relay_tokens_sharing_a_kaggle_key_cannot_resume_each_others_jobs(tmp_path):
@@ -289,7 +404,7 @@ def test_dataset_cache_is_scoped_by_kaggle_key(tmp_path):
 
     with TestClient(app) as client:
         app.state.db.upsert_dataset_cache(
-            dataset_ref="demo/data",
+            dataset_ref="alice/data",
             payload_hash="payload-1",
             status="ready",
             dataset_status="ready",
@@ -358,10 +473,58 @@ def test_create_job_auto_selects_available_kaggle_key_by_quota(tmp_path, monkeyp
 
     assert response.status_code == 200
     assert response.json()["kaggle_key_id"] == "kb"
+    assert response.json()["dataset_ref"] == "bob/data"
+    assert response.json()["kernel_ref"] == "bob/kernel"
     assert app.state.db.get_job(response.json()["job_id"])["kaggle_key_id"] == "kb"
 
 
-def test_create_job_auto_select_rejects_owner_without_allowed_key(tmp_path, monkeypatch):
+def test_create_job_falls_back_and_rewrites_refs_when_owner_quota_is_exhausted(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b'{"id":"alice/data"}'})
+    kernel_zip = build_zip({
+        "kernel-metadata.json": b'{"id":"alice/kernel","code_file":"train.py"}',
+        "train.py": b"print(1)",
+    })
+    app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            self.credentials = credentials
+
+        def quota(self):
+            remaining = 0.0 if self.credentials.username == "alice" else 12.0
+            return {
+                "available": True,
+                "refresh_at": "2026-06-20T00:00:00",
+                "accelerators": [
+                    {"resource": "GPU", "used_hours": 30.0 - remaining, "remaining_hours": remaining, "total_hours": 30.0},
+                ],
+                "error": "",
+            }
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/jobs",
+            headers=auth_headers(token="admin-token"),
+            json=job_request_body(
+                dataset_zip,
+                kernel_zip,
+                dataset_ref="alice/data",
+                kernel_ref="alice/kernel",
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["kaggle_key_id"] == "kb"
+    assert response.json()["dataset_ref"] == "bob/data"
+    assert response.json()["kernel_ref"] == "bob/kernel"
+    stored = app.state.db.get_job(response.json()["job_id"])
+    assert stored["dataset_ref"] == "bob/data"
+    assert stored["kernel_ref"] == "bob/kernel"
+
+
+def test_create_job_falls_back_and_rewrites_refs_when_owner_has_no_key(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b'{"id":"carol/data"}'})
     kernel_zip = build_zip({
         "kernel-metadata.json": b'{"id":"carol/kernel","code_file":"train.py"}',
@@ -374,11 +537,12 @@ def test_create_job_auto_select_rejects_owner_without_allowed_key(tmp_path, monk
             self.credentials = credentials
 
         def quota(self):
+            remaining = 10.0 if self.credentials.username == "alice" else 20.0
             return {
                 "available": True,
                 "refresh_at": "2026-06-20T00:00:00",
                 "accelerators": [
-                    {"resource": "GPU", "used_hours": 0.0, "remaining_hours": 30.0, "total_hours": 30.0},
+                    {"resource": "GPU", "used_hours": 30.0 - remaining, "remaining_hours": remaining, "total_hours": 30.0},
                 ],
                 "error": "",
             }
@@ -397,8 +561,10 @@ def test_create_job_auto_select_rejects_owner_without_allowed_key(tmp_path, monk
             ),
         )
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "no allowed kaggle key matches requested owner carol"
+    assert response.status_code == 200
+    assert response.json()["kaggle_key_id"] == "kb"
+    assert response.json()["dataset_ref"] == "bob/data"
+    assert response.json()["kernel_ref"] == "bob/kernel"
 
 
 def test_create_job_returns_conflict_when_all_allowed_key_quotas_are_exhausted(tmp_path, monkeypatch):
@@ -775,12 +941,16 @@ def test_complete_requires_dataset_when_cache_miss(tmp_path):
     assert complete.status_code == 400
 
 
-def test_complete_rejects_metadata_owner_mismatch_for_selected_kaggle_key(tmp_path):
+def test_complete_rewrites_metadata_owner_for_selected_kaggle_key(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b'{"id":"bob/data"}'})
     kernel_zip = build_zip({
-        "kernel-metadata.json": b'{"id":"bob/kernel","code_file":"train.py"}',
+        "kernel-metadata.json": (
+            b'{"id":"bob/kernel","code_file":"train.py",'
+            b'"dataset_sources":["bob/data","other/source"]}'
+        ),
         "train.py": b"print(1)",
     })
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
     with TestClient(app) as client:
         job_id = create_job(
@@ -796,20 +966,35 @@ def test_complete_rejects_metadata_owner_mismatch_for_selected_kaggle_key(tmp_pa
         upload_all(client, job_id, "kernel", kernel_zip, token="admin-token")
         complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers(token="admin-token"))
 
-    assert complete.status_code == 400
-    assert complete.json()["detail"] == "dataset-metadata.json owner bob does not match Kaggle key username alice"
+    dataset_metadata = json.loads(
+        (tmp_path / "jobs" / job_id / "extracted" / "dataset" / "dataset-metadata.json").read_text()
+    )
+    kernel_metadata = json.loads(
+        (tmp_path / "jobs" / job_id / "extracted" / "kernel" / "kernel-metadata.json").read_text()
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["dataset_ref"] == "alice/data"
+    assert complete.json()["kernel_ref"] == "alice/kernel"
+    assert dataset_metadata["id"] == "alice/data"
+    assert kernel_metadata["id"] == "alice/kernel"
+    assert kernel_metadata["dataset_sources"] == ["alice/data", "other/source"]
 
 
-def test_complete_rejects_kernel_metadata_owner_mismatch_when_dataset_is_cached(tmp_path):
+def test_complete_rewrites_kernel_metadata_when_dataset_is_cached(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b'{"id":"bob/data"}'})
     kernel_zip = build_zip({
-        "kernel-metadata.json": b'{"id":"bob/kernel","code_file":"train.py"}',
+        "kernel-metadata.json": (
+            b'{"id":"bob/kernel","code_file":"train.py",'
+            b'"dataset_sources":["bob/data"]}'
+        ),
         "train.py": b"print(1)",
     })
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
     with TestClient(app) as client:
         app.state.db.upsert_dataset_cache(
-            dataset_ref="bob/data",
+            dataset_ref="alice/data",
             payload_hash="payload-1",
             status="ready",
             dataset_status="ready",
@@ -829,8 +1014,16 @@ def test_complete_rejects_kernel_metadata_owner_mismatch_when_dataset_is_cached(
         upload_all(client, job_id, "kernel", kernel_zip, token="admin-token")
         complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers(token="admin-token"))
 
-    assert complete.status_code == 400
-    assert complete.json()["detail"] == "kernel-metadata.json owner bob does not match Kaggle key username alice"
+    kernel_metadata = json.loads(
+        (tmp_path / "jobs" / job_id / "extracted" / "kernel" / "kernel-metadata.json").read_text()
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["dataset_ref"] == "alice/data"
+    assert complete.json()["kernel_ref"] == "alice/kernel"
+    assert complete.json()["dataset_cache_hit"] is True
+    assert kernel_metadata["id"] == "alice/kernel"
+    assert kernel_metadata["dataset_sources"] == ["alice/data"]
 
 
 def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
@@ -959,6 +1152,370 @@ def test_worker_uses_job_bound_kaggle_credentials(tmp_path, monkeypatch):
     assert status["status"] == "complete"
 
 
+def test_worker_cancels_queued_job_before_kaggle_push(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    settings = make_settings(tmp_path)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    app = create_app(settings)
+    calls = {"upload_dataset": 0, "push_kernel": 0}
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            calls["upload_dataset"] += 1
+
+        def push_kernel(self, _kernel_dir):
+            calls["push_kernel"] += 1
+            return "pushed"
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
+        complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        cancel = client.post(f"/v1/jobs/{job_id}/cancel", headers=auth_headers())
+        assert complete.status_code == 200
+        assert cancel.status_code == 200
+
+        process_job(settings, app.state.db, job_id)
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+
+    assert calls == {"upload_dataset": 0, "push_kernel": 0}
+    assert status["status"] == "canceled"
+    assert status["cancel_requested"] is True
+    assert status["can_download"] is False
+
+
+def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    settings = make_settings(tmp_path)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    app = create_app(settings)
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            pass
+
+        def wait_dataset(self, *_args, **_kwargs):
+            return "ready"
+
+        def push_kernel(self, _kernel_dir):
+            return "pushed"
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            app.state.db.update_job(
+                job_id,
+                status="cancel_requested",
+                cancel_requested_at=time.time(),
+                cancel_reason="cancel requested",
+            )
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "checkpoint.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "checkpoint.pt", "checkpoint.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
+        complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        assert complete.status_code == 200
+
+        process_job(settings, app.state.db, job_id)
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+        download = client.get(f"/v1/jobs/{job_id}/artifacts.zip", headers=auth_headers())
+
+    assert status["status"] == "canceled"
+    assert status["cancel_requested"] is True
+    assert status["can_download"] is True
+    assert download.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+        assert archive.namelist() == ["checkpoint.pt"]
+
+
+@pytest.mark.parametrize("initial_status", ["waiting_kernel", "downloading_output"])
+def test_startup_recovery_resumes_kernel_finish_without_upload_or_push(tmp_path, monkeypatch, initial_status):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    job_id = seed_job(app, initial_status, progress=79)
+    calls = {"upload_dataset": 0, "push_kernel": 0, "wait_kernel": 0}
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            calls["upload_dataset"] += 1
+
+        def push_kernel(self, *_args, **_kwargs):
+            calls["push_kernel"] += 1
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            calls["wait_kernel"] += 1
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"complete"})
+        download = client.get(f"/v1/jobs/{job_id}/artifacts.zip", headers=auth_headers())
+
+    assert status["progress"] == 100
+    assert status["can_download"] is True
+    assert download.status_code == 200
+    assert calls == {"upload_dataset": 0, "push_kernel": 0, "wait_kernel": 1}
+
+
+def test_startup_recovery_requeues_queued_job(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    job_id = seed_job(app, "queued", progress=15)
+
+    def fake_process_job(settings, db, queued_job_id, auth_store=None):
+        artifact_path = settings.artifacts_dir / queued_job_id / "artifacts.zip"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(artifact_path, "w") as archive:
+            archive.writestr("best.pt", b"pt")
+        db.update_job(queued_job_id, status="complete", progress=100, artifact_path=str(artifact_path))
+
+    monkeypatch.setattr("app.main.process_job", fake_process_job)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"complete"})
+
+    assert status["status"] == "complete"
+    assert status["can_download"] is True
+
+
+def test_startup_recovery_cancel_requested_before_submission_goes_canceled(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "cancel_requested", progress=40)
+    app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
+
+    class FakeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("Kaggle should not be called for unsubmitted cancel")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"canceled"})
+
+    assert status["status"] == "canceled"
+    assert status["can_download"] is False
+
+
+def test_startup_recovery_cancel_requested_after_submission_finishes_canceled(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "cancel_requested", progress=60)
+    app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"canceled"})
+        download = client.get(f"/v1/jobs/{job_id}/artifacts.zip", headers=auth_headers())
+
+    assert status["status"] == "canceled"
+    assert status["can_download"] is True
+    assert download.status_code == 200
+
+
+def test_startup_recovery_pushing_kernel_visible_resumes(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "pushing_kernel", progress=45)
+
+    class FakeProbeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def kernel_status(self, _kernel_ref):
+            return "running"
+
+    class FakeWorkerAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeWorkerAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"complete"})
+
+    assert status["status"] == "complete"
+
+
+def test_startup_recovery_pushing_kernel_not_visible_fails_without_push(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "pushing_kernel", progress=45)
+
+    class FakeProbeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def kernel_status(self, _kernel_ref):
+            raise KaggleAdapterError("404 not found")
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"failed"})
+
+    assert status["status"] == "failed"
+    assert "restart during kernel push before submission could be verified" in status["error"]
+
+
+def test_startup_recovery_dataset_ready_requeues_without_upload(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "waiting_dataset", progress=35)
+    calls = {"process": 0}
+
+    class FakeProbeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def dataset_status(self, _dataset_ref):
+            return "Warning: Looks like you're using an outdated `kaggle` version\nready"
+
+    def fake_process_job(settings, db, queued_job_id, auth_store=None):
+        calls["process"] += 1
+        db.update_job(queued_job_id, status="complete", progress=100, dataset_status="ready")
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
+    monkeypatch.setattr("app.main.process_job", fake_process_job)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"complete"})
+        cache = app.state.db.get_dataset_cache("demo/data", "payload-1")
+
+    assert status["status"] == "complete"
+    assert cache["status"] == "ready"
+    assert cache["dataset_status"].endswith("ready")
+    assert calls == {"process": 1}
+
+
+def test_startup_recovery_dataset_not_ready_fails(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "uploading_dataset", progress=20)
+
+    class FakeProbeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def dataset_status(self, _dataset_ref):
+            return "processing"
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"failed"})
+
+    assert status["status"] == "failed"
+    assert "before dataset was ready" in status["error"]
+
+
+def test_startup_recovery_skips_terminal_and_receiving_jobs(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    complete_id = seed_job(app, "complete", progress=100)
+    receiving_id = seed_job(app, "receiving", progress=0)
+
+    class FakeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("terminal and receiving jobs should not recover")
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeAdapter)
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        complete_status = client.get(f"/v1/jobs/{complete_id}", headers=auth_headers()).json()
+        receiving_status = client.get(f"/v1/jobs/{receiving_id}", headers=auth_headers()).json()
+
+    assert complete_status["status"] == "complete"
+    assert receiving_status["status"] == "receiving"
+    assert not any("recovering job after relay restart" in log for log in complete_status["recent_logs"])
+    assert not any("recovering job after relay restart" in log for log in receiving_status["recent_logs"])
+
+
+def test_worker_loop_marks_failed_and_continues_after_exception(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    first_id = seed_job(app, "queued", progress=15, job_id="firstqueuedjob000000000000000000")
+    second_id = seed_job(app, "queued", progress=15, job_id="secondqueuedjob00000000000000000")
+
+    def fake_process_job(_settings, db, job_id, auth_store=None):
+        if job_id == first_id:
+            raise RuntimeError("bad job")
+        db.update_job(job_id, status="complete", progress=100)
+
+    monkeypatch.setattr("app.main.process_job", fake_process_job)
+
+    with TestClient(app) as client:
+        first_status = wait_for_status(client, first_id, {"failed"})
+        second_status = wait_for_status(client, second_id, {"complete"})
+
+    assert first_status["status"] == "failed"
+    assert first_status["error"] == "bad job"
+    assert second_status["status"] == "complete"
+
+
 def test_callback_token_updates_job_progress_and_logs(tmp_path):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -1050,6 +1607,74 @@ def test_relay_token_progress_update_requires_job_owner(tmp_path):
     assert owner_response.json()["recent_logs"][-1] == "right owner"
 
 
+def test_cancel_job_sets_cancel_requested_and_callback_returns_flag(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    callback_token = "callback-secret"
+    callback_hash = hashlib.sha256(callback_token.encode("utf-8")).hexdigest()
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    app = create_app(make_settings(tmp_path))
+
+    with TestClient(app) as client:
+        job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            callback_token_sha256=callback_hash,
+        )
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
+        complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        cancel = client.post(f"/v1/jobs/{job_id}/cancel", headers=auth_headers())
+        accepted = client.post(
+            f"/v1/jobs/{job_id}/progress",
+            headers={"Authorization": f"Bearer {callback_token}"},
+            json={"epoch": 10, "epochs": 100, "message": "cancel check"},
+        )
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+
+    assert complete.status_code == 200
+    assert cancel.status_code == 200
+    assert cancel.json()["status"] == "cancel_requested"
+    assert cancel.json()["cancel_requested"] is True
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "cancel_requested"
+    assert accepted.json()["cancel_requested"] is True
+    assert status["status"] == "cancel_requested"
+    assert status["recent_logs"][-1] == "cancel check"
+
+
+def test_cancel_job_requires_job_owner(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    config = multi_key_auth_config()
+    config["relay_tokens"].append(
+        {"id": "user-a-peer", "token": "user-a-peer-token", "allowed_kaggle_key_ids": ["ka"]}
+    )
+    app = create_app(make_auth_config_settings(tmp_path, config))
+
+    with TestClient(app) as client:
+        job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            headers=auth_headers(token="user-a-token"),
+        )
+        peer_response = client.post(
+            f"/v1/jobs/{job_id}/cancel",
+            headers=auth_headers(token="user-a-peer-token"),
+        )
+        owner_response = client.post(
+            f"/v1/jobs/{job_id}/cancel",
+            headers=auth_headers(token="user-a-token"),
+        )
+
+    assert peer_response.status_code == 404
+    assert owner_response.status_code == 200
+    assert owner_response.json()["status"] == "canceled"
+    assert owner_response.json()["cancel_requested"] is True
+
+
 def test_callback_can_update_progress_by_kernel_ref(tmp_path):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -1135,3 +1760,14 @@ def test_wait_dataset_retries_transient_forbidden_with_permission_grace(tmp_path
 
     assert adapter.wait_dataset("demo/private-dataset", permission_grace_seconds=60) == "ready"
     assert len(calls) == 2
+
+
+def test_wait_dataset_accepts_ready_with_kaggle_warning(tmp_path):
+    class Result:
+        returncode = 0
+        stdout = "Warning: Looks like you're using an outdated `kaggle` version\nready"
+
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    adapter._run = lambda *_args, **_kwargs: Result()
+
+    assert adapter.wait_dataset("demo/private-dataset") == Result.stdout

@@ -25,11 +25,20 @@ ARTIFACT_FILE_PATTERN = (
     r"PR_curve\.png|F1_curve\.png|P_curve\.png|R_curve\.png)$"
 )
 TRAINING_PROGRESS_PREFIX = "TRAINING_PLATFORM_PROGRESS"
+READY_KAGGLE_STATUSES = {"ready", "complete", "ok"}
 _ENV_LOCK = threading.RLock()
 
 
 class KaggleAdapterError(RuntimeError):
     pass
+
+
+def kaggle_status_lines(output: str) -> list[str]:
+    return [line.strip().lower() for line in (output or "").splitlines() if line.strip()]
+
+
+def is_ready_kaggle_status(output: str) -> bool:
+    return any(line in READY_KAGGLE_STATUSES for line in kaggle_status_lines(output))
 
 
 def parse_kaggle_duration(value: str) -> timedelta:
@@ -359,7 +368,7 @@ class KaggleAdapter:
             result = self._run(["datasets", "status", dataset_ref], check=False)
             output = result.stdout.strip() or f"returncode={result.returncode}"
             status_text = output.lower()
-            if result.returncode == 0 and status_text in {"ready", "complete", "ok"}:
+            if result.returncode == 0 and is_ready_kaggle_status(output):
                 return output
             if result.returncode == 0 and any(word in status_text for word in ["failed", "error", "deleted"]):
                 raise KaggleAdapterError(f"Dataset failed:\n{output}")
@@ -383,15 +392,28 @@ class KaggleAdapter:
                 raise TimeoutError(f"Dataset wait timed out:\n{output}")
             time.sleep(self.settings.dataset_poll_seconds)
 
+    def dataset_status(self, dataset_ref: str) -> str:
+        result = self._run(["datasets", "status", dataset_ref], check=False)
+        output = result.stdout.strip() or f"returncode={result.returncode}"
+        if result.returncode != 0:
+            raise KaggleAdapterError(f"Dataset status failed:\n{output}")
+        return output
+
     def push_kernel(self, kernel_dir: Path) -> str:
         return self._run(["kernels", "push", "-p", str(kernel_dir)]).stdout
+
+    def kernel_status(self, kernel_ref: str) -> str:
+        result = self._run(["kernels", "status", kernel_ref], check=False)
+        output = result.stdout.strip() or f"returncode={result.returncode}"
+        if result.returncode != 0:
+            raise KaggleAdapterError(f"Kernel status failed:\n{output}")
+        return output
 
     def wait_kernel(self, kernel_ref: str, progress_callback: Callable[[dict], None]) -> str:
         start = time.time()
         seen_progress = set()
         while True:
-            result = self._run(["kernels", "status", kernel_ref], check=False)
-            output = result.stdout.strip() or f"returncode={result.returncode}"
+            output = self.kernel_status(kernel_ref)
             logs = self._run(["kernels", "logs", kernel_ref], check=False).stdout
             for progress in parse_training_progress_logs(logs):
                 key = (progress.get("epoch"), progress.get("epochs"))
@@ -400,8 +422,6 @@ class KaggleAdapter:
                 seen_progress.add(key)
                 progress_callback(progress)
             status_text = output.lower()
-            if result.returncode != 0:
-                raise KaggleAdapterError(f"Kernel status failed:\n{output}")
             if any(word in status_text for word in ["complete", "succeeded", "success"]):
                 return output
             if any(word in status_text for word in ["error", "failed", "failure", "cancel"]):

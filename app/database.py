@@ -45,6 +45,8 @@ class RelayDb:
                     relay_token_id TEXT NOT NULL DEFAULT '',
                     kaggle_key_id TEXT NOT NULL DEFAULT '',
                     artifact_path TEXT NOT NULL DEFAULT '',
+                    cancel_requested_at REAL,
+                    cancel_reason TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     completed_at REAL
@@ -90,6 +92,8 @@ class RelayDb:
             self._ensure_column(conn, "jobs", "callback_token_sha256", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "relay_token_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "kaggle_key_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "cancel_requested_at", "REAL")
+            self._ensure_column(conn, "jobs", "cancel_reason", "TEXT NOT NULL DEFAULT ''")
             self._ensure_cache_key_dimension(conn, "kaggle_dataset_cache")
             self._ensure_cache_key_dimension(conn, "kaggle_last_job")
 
@@ -184,6 +188,8 @@ class RelayDb:
             "relay_token_id": values.get("relay_token_id", ""),
             "kaggle_key_id": values.get("kaggle_key_id", ""),
             "artifact_path": "",
+            "cancel_requested_at": None,
+            "cancel_reason": "",
             "created_at": stamp,
             "updated_at": stamp,
             "completed_at": None,
@@ -198,6 +204,7 @@ class RelayDb:
                     status, progress, dataset_status, kernel_status,
                     kaggle_output, error, payload_hash, callback_token_sha256,
                     relay_token_id, kaggle_key_id, artifact_path,
+                    cancel_requested_at, cancel_reason,
                     created_at, updated_at, completed_at
                 ) VALUES (
                     :job_id, :dataset_ref, :kernel_ref,
@@ -206,6 +213,7 @@ class RelayDb:
                     :status, :progress, :dataset_status, :kernel_status,
                     :kaggle_output, :error, :payload_hash, :callback_token_sha256,
                     :relay_token_id, :kaggle_key_id, :artifact_path,
+                    :cancel_requested_at, :cancel_reason,
                     :created_at, :updated_at, :completed_at
                 )
                 """,
@@ -221,6 +229,7 @@ class RelayDb:
         self,
         kaggle_key_ids: Optional[set[str]] = None,
         relay_token_id: Optional[str] = None,
+        statuses: Optional[set[str]] = None,
         include_unowned: bool = False,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
@@ -240,6 +249,12 @@ class RelayDb:
                 else:
                     conditions.append("relay_token_id = ?")
                 params.append(relay_token_id)
+            if statuses is not None:
+                if not statuses:
+                    return []
+                placeholders = ", ".join("?" for _ in statuses)
+                conditions.append(f"status IN ({placeholders})")
+                params.extend(sorted(statuses))
 
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             rows = conn.execute(
@@ -304,11 +319,27 @@ class RelayDb:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_jobs_by_status(self, statuses: set[str] | list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        ordered_statuses = sorted(set(statuses))
+        placeholders = ", ".join("?" for _ in ordered_statuses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE status IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                ordered_statuses,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_job(self, job_id: str, **values: Any) -> None:
         if not values:
             return
         values["updated_at"] = now_ts()
-        if values.get("status") in {"complete", "failed"}:
+        if values.get("status") in {"complete", "failed", "canceled"}:
             values.setdefault("completed_at", now_ts())
         assignments = ", ".join(f"{key} = :{key}" for key in values)
         payload = {"job_id": job_id, **values}
