@@ -218,7 +218,7 @@
 
     .status-strip {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 8px;
       padding: 10px 14px;
       border-bottom: 1px solid var(--border);
@@ -245,6 +245,21 @@
       line-height: 1.35;
       font-weight: 700;
       word-break: break-word;
+    }
+
+    .latest-job-value {
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    #selectedJobText {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
 
     .toolbar {
@@ -274,7 +289,7 @@
 
     table {
       width: 100%;
-      min-width: 980px;
+      min-width: 1180px;
       border-collapse: collapse;
       font-size: 13px;
     }
@@ -300,8 +315,20 @@
       background: #f8fbff;
     }
 
+    tr.latest-row td {
+      background: #f9fefc;
+    }
+
+    tr.latest-row:hover td {
+      background: #f0fbf7;
+    }
+
     .job-id-cell {
-      width: 132px;
+      width: 260px;
+    }
+
+    .time-cell {
+      width: 158px;
     }
 
     .progress-cell {
@@ -313,8 +340,26 @@
     }
 
     .actions-cell {
-      width: 116px;
+      width: 156px;
       white-space: nowrap;
+    }
+
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .job-id-stack {
+      display: grid;
+      gap: 5px;
+    }
+
+    .job-id-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
     }
 
     .mono {
@@ -641,6 +686,11 @@
               <div id="jobCountText" class="metric-value">-</div>
             </div>
             <div class="metric">
+              <div class="metric-label">最新任务</div>
+              <div id="latestJobText" class="metric-value mono latest-job-value">-</div>
+              <div class="muted small">按创建时间倒序</div>
+            </div>
+            <div class="metric">
               <div class="metric-label">当前账号</div>
               <div id="principalMetric" class="metric-value">-</div>
             </div>
@@ -665,6 +715,7 @@
               <thead>
                 <tr>
                   <th class="job-id-cell">Job</th>
+                  <th class="time-cell">创建时间</th>
                   <th>状态</th>
                   <th class="progress-cell">进度</th>
                   <th>Kaggle Key</th>
@@ -675,7 +726,7 @@
                 </tr>
               </thead>
               <tbody id="jobsBody">
-                <tr><td colspan="8" class="muted">加载中...</td></tr>
+                <tr><td colspan="9" class="muted">加载中...</td></tr>
               </tbody>
             </table>
           </div>
@@ -829,6 +880,7 @@
     let authConfigCache = null;
     let jobsCache = [];
     let selectedJobId = "";
+    let selectedJobPinned = false;
     let activePage = "runtime";
     let editingKaggleKeyId = "";
     const downloadingJobs = new Set();
@@ -864,6 +916,12 @@
         unitIndex += 1;
       }
       return `${current.toFixed(current >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+
+    function fmtTimestamp(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value) || value <= 0) return "-";
+      return new Date(value * 1000).toLocaleString();
     }
 
     function fmtHours(hours) {
@@ -912,8 +970,10 @@
         waiting_dataset: "等待数据集",
         pushing_kernel: "提交 Kernel",
         waiting_kernel: "等待 Kernel",
+        cancel_requested: "停止中",
         downloading_output: "下载输出",
         complete: "完成",
+        canceled: "已取消",
         failed: "失败"
       };
       return labels[status] || status || "-";
@@ -922,8 +982,9 @@
     function statusPill(status) {
       const value = String(status || "");
       if (value === "complete") return `<span class="pill ok">${statusLabel(value)}</span>`;
+      if (value === "canceled") return `<span class="pill neutral">${statusLabel(value)}</span>`;
       if (value === "failed") return `<span class="pill bad">${statusLabel(value)}</span>`;
-      if (["queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "downloading_output", "assembling", "receiving"].includes(value)) {
+      if (["queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "cancel_requested", "downloading_output", "assembling", "receiving"].includes(value)) {
         return `<span class="pill warn">${statusLabel(value)}</span>`;
       }
       return `<span class="pill neutral">${escapeHtml(statusLabel(value))}</span>`;
@@ -949,6 +1010,10 @@
 
     function artifactFilename(job) {
       return job.artifact_filename || `${job.job_id}-artifacts.zip`;
+    }
+
+    function canCancelJob(job) {
+      return !["complete", "failed", "canceled"].includes(String(job.status || "")) && !job.cancel_requested;
     }
 
     function renderArtifact(job) {
@@ -983,17 +1048,23 @@
     function renderJobs(jobs) {
       const tbody = qs("jobsBody");
       if (!jobs.length) {
-        tbody.innerHTML = `<tr><td colspan="8" class="muted">暂无任务。</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" class="muted">暂无任务。</td></tr>`;
         return;
       }
 
-      tbody.innerHTML = jobs.map((job) => {
+      tbody.innerHTML = jobs.map((job, index) => {
         const jobId = escapeHtml(job.job_id);
+        const latestBadge = index === 0 ? '<span class="pill ok">最新</span>' : "";
+        const selectedBadge = job.job_id === selectedJobId ? '<span class="pill neutral">详情</span>' : "";
         return `
-          <tr>
+          <tr class="${index === 0 ? "latest-row" : ""}">
             <td class="job-id-cell">
-              <div class="mono strong" title="${jobId}">${escapeHtml(shortId(job.job_id))}</div>
+              <div class="job-id-stack">
+                <div class="mono strong wrap" title="${jobId}">${jobId}</div>
+                <div class="job-id-meta">${latestBadge}${selectedBadge}</div>
+              </div>
             </td>
+            <td class="time-cell">${escapeHtml(fmtTimestamp(job.created_at))}</td>
             <td>
               ${statusPill(job.status)}
               <div class="muted small mono">${escapeHtml(job.status || "-")}</div>
@@ -1007,7 +1078,10 @@
             <td>${cachePill(job)}</td>
             <td class="artifact-cell">${renderArtifact(job)}</td>
             <td class="actions-cell">
-              <button class="light" type="button" data-job-detail="${jobId}">详情</button>
+              <div class="action-row">
+                <button class="light" type="button" data-job-detail="${jobId}">详情</button>
+                <button class="light" type="button" data-job-cancel="${jobId}" ${canCancelJob(job) ? "" : "disabled"}>停止</button>
+              </div>
             </td>
           </tr>
         `;
@@ -1063,15 +1137,33 @@
       jobsCache = jobs;
       qs("jobCountText").textContent = String(jobs.length);
       qs("lastRefreshText").textContent = `刷新：${new Date().toLocaleTimeString()}`;
+      qs("latestJobText").textContent = jobs[0]?.job_id || "-";
+      const latestJobId = jobs[0]?.job_id || "";
+      const selectedExists = selectedJobId && jobs.some((job) => job.job_id === selectedJobId);
+      if (latestJobId && (!selectedJobPinned || !selectedExists)) {
+        selectedJobId = latestJobId;
+        selectedJobPinned = false;
+      } else if (!latestJobId) {
+        selectedJobId = "";
+        selectedJobPinned = false;
+      }
       renderJobs(jobs);
-      if (selectedJobId && jobs.some((job) => job.job_id === selectedJobId)) {
-        loadJobDetail(selectedJobId, {silent: true}).catch(console.error);
+      if (selectedJobId) {
+        await loadJobDetail(selectedJobId, {silent: true});
+      } else {
+        qs("selectedJobText").textContent = "未选择任务";
+        qs("detailEmpty").hidden = false;
+        qs("detailContent").hidden = true;
       }
     }
 
     function renderDetail(data) {
       selectedJobId = data.job_id;
-      qs("selectedJobText").textContent = shortId(data.job_id, 18);
+      const isLatest = jobsCache[0]?.job_id === data.job_id;
+      qs("selectedJobText").innerHTML = `
+        ${isLatest ? '<span class="pill ok">最新</span>' : ""}
+        <span class="mono wrap">${escapeHtml(data.job_id)}</span>
+      `;
       qs("detailEmpty").hidden = true;
       qs("detailContent").hidden = false;
 
@@ -1095,12 +1187,26 @@
           <div class="metric-label">Kaggle Key</div>
           <div class="metric-value mono">${escapeHtml(data.kaggle_key_id || "legacy")}</div>
         </div>
+        <div class="metric">
+          <div class="metric-label">创建时间</div>
+          <div class="metric-value">${escapeHtml(fmtTimestamp(data.created_at))}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">更新时间</div>
+          <div class="metric-value">${escapeHtml(fmtTimestamp(data.updated_at))}</div>
+        </div>
       `;
 
       const errorBox = qs("detailError");
-      if (data.error) {
+      const cancelText = data.cancel_requested
+        ? `停止请求：${data.cancel_requested_at ? new Date(data.cancel_requested_at * 1000).toLocaleString() : "-"}${data.cancel_reason ? ` / ${data.cancel_reason}` : ""}`
+        : "";
+      if (data.error || cancelText) {
         errorBox.hidden = false;
-        errorBox.innerHTML = `<h3>错误</h3><pre>${escapeHtml(data.error)}</pre>`;
+        errorBox.innerHTML = `
+          ${cancelText ? `<h3>取消</h3><pre>${escapeHtml(cancelText)}</pre>` : ""}
+          ${data.error ? `<h3>错误</h3><pre>${escapeHtml(data.error)}</pre>` : ""}
+        `;
       } else {
         errorBox.hidden = true;
         errorBox.innerHTML = "";
@@ -1114,6 +1220,7 @@
     }
 
     async function loadJobDetail(jobId, options = {}) {
+      if (options.userSelected) selectedJobPinned = true;
       const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}`);
       renderDetail(data);
       if (!options.silent) {
@@ -1357,6 +1464,21 @@
       }
     }
 
+    async function cancelJob(jobId, button) {
+      const previousText = button.textContent;
+      button.disabled = true;
+      button.textContent = "停止中...";
+      try {
+        const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {method: "POST"});
+        renderDetail(data);
+        await loadJobs();
+      } catch (error) {
+        alert(`停止失败：${error.message || String(error)}`);
+        button.disabled = false;
+        button.textContent = previousText;
+      }
+    }
+
     function formMessage(id, text, isError = false) {
       const box = qs(id);
       box.textContent = text;
@@ -1532,12 +1654,17 @@
     document.addEventListener("click", (event) => {
       const detailButton = event.target.closest("[data-job-detail]");
       if (detailButton) {
-        loadJobDetail(detailButton.dataset.jobDetail).catch(console.error);
+        loadJobDetail(detailButton.dataset.jobDetail, {userSelected: true}).catch(console.error);
         return;
       }
       const downloadButton = event.target.closest("[data-job-download]");
       if (downloadButton) {
         downloadArtifacts(downloadButton.dataset.jobDownload);
+        return;
+      }
+      const cancelButton = event.target.closest("[data-job-cancel]");
+      if (cancelButton && !cancelButton.disabled) {
+        cancelJob(cancelButton.dataset.jobCancel, cancelButton).catch(console.error);
         return;
       }
       const probeButton = event.target.closest("[data-account-probe]");
