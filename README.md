@@ -9,6 +9,26 @@ cp .env.example .env
 docker compose up --build
 ```
 
+Live servers should deploy the current checkout with a forced local rebuild:
+
+```bash
+docker compose up -d --build --force-recreate kaggle-relay
+```
+
+Do not use `docker-compose.ghcr.yml` with an implicit `latest` image for
+recovery-sensitive deploys. If GHCR is required, set `KAGGLE_RELAY_IMAGE` to a
+verified tag or digest; see [docs/container-image.md](docs/container-image.md).
+
+Hosts intentionally managed by Watchtower can use the mutable GHCR deployment:
+
+```bash
+docker compose -f docker-compose.watchtower.yml up -d --pull always --force-recreate kaggle-relay
+```
+
+Only switch after the intended local commits are pushed and the matching
+GitHub Action run succeeds. This Compose file keeps `./relay-data:/data` and
+uses the same Compose project/service as the local build deployment.
+
 For legacy single-user mode, set `RELAY_API_TOKEN` to a long random value and
 provide Kaggle credentials with `KAGGLE_API_TOKEN`,
 `KAGGLE_USERNAME`/`KAGGLE_KEY`, or by mounting `/root/.kaggle`.

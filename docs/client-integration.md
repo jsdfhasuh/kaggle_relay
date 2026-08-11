@@ -46,15 +46,20 @@ Kernel/notebook chunks are always uploaded because each run uses a fresh kernel.
    Use the returned `dataset_ref`, `kernel_ref`, and `kaggle_key_id` as the
    source of truth after this call; Relay may rewrite the owner when it falls
    back to another Kaggle account with remaining quota.
-6. If the response has `dataset_upload_required=true`, upload dataset chunks.
+6. Compare the returned `kernel_ref` with the value embedded in `train.py`.
+   If they differ, do not upload the old `kernel.zip`: cancel this still-receiving
+   job, regenerate `train.py` and `kernel.zip` with the returned owner, and create
+   a replacement job using the returned `kaggle_key_id` so account selection is
+   stable.
+7. If the response has `dataset_upload_required=true`, upload dataset chunks.
    If the field is absent, default to `true` for old Relay compatibility.
-7. Always upload kernel chunks.
-8. Call `POST /v1/jobs/{job_id}/complete`.
-9. Poll `GET /v1/jobs/{job_id}` until `status` is `complete`, `canceled`, or `failed`.
-10. Download `GET /v1/jobs/{job_id}/artifacts.zip` after completion.
-11. To stop a running job cooperatively, call `POST /v1/jobs/{job_id}/cancel`.
+8. Always upload kernel chunks.
+9. Call `POST /v1/jobs/{job_id}/complete`.
+10. Poll `GET /v1/jobs/{job_id}` until `status` is `complete`, `canceled`, or `failed`.
+11. Download `GET /v1/jobs/{job_id}/artifacts.zip` after completion.
+12. To stop a running job cooperatively, call `POST /v1/jobs/{job_id}/cancel`.
     The Kaggle script must read the next callback response and exit cleanly.
-12. After a client restart or reconnect, keep using the same Relay Token and
+13. After a client restart or reconnect, keep using the same Relay Token and
     call `GET /v1/jobs?active=true` to find unfinished jobs bound to that token,
     then use `accepted_chunks`, `status`, and `can_download` to decide whether
     to resume chunk upload, keep polling, cancel, or download.
@@ -74,8 +79,15 @@ job = relay.create_job(
     callback_token_sha256=callback_token_sha256,
     kaggle_key_id=kaggle_key_id,
 )
-dataset_ref = job["dataset_ref"]
-kernel_ref = job["kernel_ref"]
+if job["kernel_ref"] != kernel_ref:
+    relay.cancel_job(job["job_id"])
+    raise OwnerRewriteRequired(
+        dataset_ref=job["dataset_ref"],
+        kernel_ref=job["kernel_ref"],
+        kaggle_key_id=job["kaggle_key_id"],
+    )  # Regenerate train.py/kernel.zip, then create a replacement job.
+
+dataset_ref, kernel_ref = job["dataset_ref"], job["kernel_ref"]
 kaggle_key_id = job["kaggle_key_id"]
 
 if job.get("dataset_upload_required", True):

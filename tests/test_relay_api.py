@@ -1367,6 +1367,68 @@ def test_startup_recovery_cancel_requested_after_submission_finishes_canceled(tm
     assert download.status_code == 200
 
 
+def test_startup_recovery_cancel_requested_during_push_resumes_visible_kernel(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "cancel_requested", progress=45)
+    app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
+
+    class FakeProbeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def kernel_status(self, _kernel_ref):
+            return "running"
+
+    class FakeWorkerAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeWorkerAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"canceled"})
+        download = client.get(f"/v1/jobs/{job_id}/artifacts.zip", headers=auth_headers())
+
+    assert status["status"] == "canceled"
+    assert status["can_download"] is True
+    assert download.status_code == 200
+
+
+def test_startup_recovery_cancel_requested_during_push_cancels_missing_kernel(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "cancel_requested", progress=45)
+    app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
+
+    class FakeProbeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def kernel_status(self, _kernel_ref):
+            raise KaggleAdapterError("404 not found")
+
+    monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"canceled"})
+
+    assert status["status"] == "canceled"
+    assert status["can_download"] is False
+
+
 def test_startup_recovery_pushing_kernel_visible_resumes(tmp_path, monkeypatch):
     app = create_app(make_settings(tmp_path))
     job_id = seed_job(app, "pushing_kernel", progress=45)

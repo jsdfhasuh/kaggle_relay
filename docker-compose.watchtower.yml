@@ -1,10 +1,8 @@
 services:
   kaggle-relay:
-    # Use this file only with an explicitly verified immutable tag or digest.
-    # Live recovery-sensitive deploys should use docker-compose.yml and build
-    # from the local checkout unless the remote image has been confirmed to
-    # contain the same code.
-    image: ${KAGGLE_RELAY_IMAGE:?set KAGGLE_RELAY_IMAGE to a verified tag or digest}
+    # Mutable GHCR tag for hosts intentionally managed by Watchtower.
+    image: ${KAGGLE_RELAY_IMAGE:-ghcr.io/jsdfhasuh/kaggle_relay:latest}
+    pull_policy: always
     ports:
       - "8000:8000"
     env_file:
@@ -15,4 +13,6 @@ services:
       - ./relay-data:/data
       # Optional: mount Kaggle credentials instead of KAGGLE_API_TOKEN.
       # - ~/.kaggle:/root/.kaggle:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     command: sh -c "mkdir -p /tmp/kaggle-config && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"

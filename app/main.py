@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -58,6 +59,7 @@ from app.worker import (
 )
 
 VERSION = "0.1.0"
+LOGGER = logging.getLogger("uvicorn.error")
 AUTH_CONFIG_LOCK = threading.RLock()
 KAGGLE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 JOB_STATUS_VALUES = set(get_args(JobStatus))
@@ -795,10 +797,25 @@ def kernel_was_submitted(db: RelayDb, job: dict) -> bool:
     return "kernel version" in logs and "successfully pushed" in logs
 
 
+def kernel_submission_may_be_in_flight(job: dict) -> bool:
+    try:
+        return float(job.get("progress") or 0) >= 45
+    except (TypeError, ValueError):
+        return False
+
+
 def fail_recovered_job(db: RelayDb, job_id: str, message: str) -> None:
     clean = redact_secrets(message)
+    LOGGER.warning("restart recovery failed job %s: %s", job_id, clean)
     db.update_job(job_id, status="failed", progress=0, error=clean)
     db.append_log(job_id, clean)
+
+
+def recovery_item_description(item: dict) -> str:
+    action = item.get("action", "process")
+    if action == "resume_kernel" and item.get("final_status"):
+        return f"{action} final_status={item['final_status']}"
+    return action
 
 
 def recover_job_after_restart(
@@ -810,21 +827,52 @@ def recover_job_after_restart(
     job_id = job["job_id"]
     status = str(job.get("status") or "")
     append_internal_log(db, job_id, f"recovering job after relay restart from status {status}")
+    LOGGER.info("restart recovery inspecting job %s from status %s", job_id, status)
 
     if status == "queued":
+        append_internal_log(db, job_id, "restart recovery action: requeue full process")
         return {"action": "process", "job_id": job_id}
 
     if status in {"waiting_kernel", "downloading_output"}:
+        append_internal_log(db, job_id, "restart recovery action: resume kernel finish path")
         return {"action": "resume_kernel", "job_id": job_id}
 
     if status == "cancel_requested":
         if kernel_was_submitted(db, job):
+            append_internal_log(
+                db,
+                job_id,
+                "restart recovery action: resume kernel finish path with canceled final status",
+            )
             return {"action": "resume_kernel", "job_id": job_id, "final_status": "canceled"}
+        if kernel_submission_may_be_in_flight(job):
+            append_internal_log(db, job_id, "restart recovery action: probe canceled kernel visibility")
+            adapter = recovery_adapter(settings, db, auth_store, job)
+            try:
+                adapter.kernel_status(job["kernel_ref"])
+            except Exception as exc:
+                if not not_found_error(exc):
+                    fail_recovered_job(
+                        db,
+                        job_id,
+                        "restart after cancellation could not verify whether the kernel was submitted; "
+                        f"inspect Kaggle before resubmitting: {exc}",
+                    )
+                    return None
+            else:
+                append_internal_log(
+                    db,
+                    job_id,
+                    "restart recovery action: resume visible kernel with canceled final status",
+                )
+                return {"action": "resume_kernel", "job_id": job_id, "final_status": "canceled"}
+        append_internal_log(db, job_id, "restart recovery action: mark canceled before Kaggle kernel submission")
         db.update_job(job_id, status="canceled", error=job.get("cancel_reason") or "cancel requested")
         db.append_log(job_id, "canceled during restart recovery before Kaggle kernel submission")
         return None
 
     if status == "pushing_kernel":
+        append_internal_log(db, job_id, "restart recovery action: probe kernel visibility")
         adapter = recovery_adapter(settings, db, auth_store, job)
         try:
             adapter.kernel_status(job["kernel_ref"])
@@ -842,9 +890,15 @@ def recover_job_after_restart(
                     f"restart during kernel push and kernel status could not be verified; resubmit job: {exc}",
                 )
             return None
+        append_internal_log(
+            db,
+            job_id,
+            "restart recovery action: resume kernel finish path after verified kernel submission",
+        )
         return {"action": "resume_kernel", "job_id": job_id}
 
     if status in {"uploading_dataset", "waiting_dataset"}:
+        append_internal_log(db, job_id, "restart recovery action: probe dataset readiness")
         adapter = recovery_adapter(settings, db, auth_store, job)
         try:
             dataset_status = adapter.dataset_status(job["dataset_ref"])
@@ -877,10 +931,12 @@ def recover_job_after_restart(
             job_id=job_id,
             kaggle_key_id=job.get("kaggle_key_id", ""),
         )
+        append_internal_log(db, job_id, "restart recovery action: requeue after verified ready dataset")
         db.update_job(job_id, status="queued", dataset_status=dataset_status, progress=40, error="")
         return {"action": "process", "job_id": job_id}
 
     if status == "assembling":
+        append_internal_log(db, job_id, "restart recovery action: resume archive assembly then process")
         try:
             assemble_and_validate_job(settings, db, auth_store, job)
         except Exception as exc:
@@ -894,6 +950,7 @@ def recover_job_after_restart(
 
 async def recover_incomplete_jobs(app: FastAPI) -> None:
     jobs = app.state.db.list_jobs_by_status(RUNNING_JOB_STATUSES)
+    LOGGER.info("startup recovery scan found %s incomplete job(s)", len(jobs))
     for job in jobs:
         item = await asyncio.to_thread(
             recover_job_after_restart,
@@ -903,6 +960,11 @@ async def recover_incomplete_jobs(app: FastAPI) -> None:
             job,
         )
         if item:
+            LOGGER.info(
+                "startup recovery queued job %s action %s",
+                item["job_id"],
+                recovery_item_description(item),
+            )
             await app.state.queue.put(item)
 
 
@@ -914,7 +976,7 @@ def normalize_queue_item(item) -> dict:
 
 def mark_worker_exception(db: RelayDb, job_id: str, exc: Exception) -> None:
     message = redact_secrets(str(exc))
-    db.append_log(job_id, message)
+    db.append_log(job_id, f"worker action failed: {message}")
     job = db.get_job(job_id)
     if job and job.get("status") not in TERMINAL_JOB_STATUSES:
         db.update_job(job_id, status="failed", progress=0, error=message)
@@ -944,6 +1006,12 @@ async def worker_loop(app: FastAPI) -> None:
                     app.state.auth_store,
                 )
         except Exception as exc:
+            LOGGER.error(
+                "worker action failed for job %s (%s): %s",
+                job_id,
+                type(exc).__name__,
+                redact_secrets(str(exc)),
+            )
             mark_worker_exception(app.state.db, job_id, exc)
         finally:
             app.state.queue.task_done()

@@ -2,8 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 python-multipart
-kaggle
+kaggle>=2.2.4,<3
 aiofiles
 pytest
 httpx
-
