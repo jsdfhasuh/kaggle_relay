@@ -40,12 +40,16 @@ Kernel/notebook chunks are always uploaded because each run uses a fresh kernel.
 
 4. Create `dataset.zip` and `kernel.zip`.
 5. Call `POST /v1/jobs` with archive sizes, archive SHA-256 hashes, `payload_hash`,
-   and `callback_token_sha256`. If the relay token can access more than one
+   and `callback_token_sha256`. PatchCore clients must also send the frozen
+   `dataset_id`, `identity_sha256`, `run_id`, and `run_identity_sha256`. If the relay token can access more than one
    Kaggle key, omit `kaggle_key_id` to let Relay choose an available key by owner
    and GPU quota, or include `kaggle_key_id` to force a specific key.
    Use the returned `dataset_ref`, `kernel_ref`, and `kaggle_key_id` as the
    source of truth after this call; Relay may rewrite the owner when it falls
    back to another Kaggle account with remaining quota.
+   PatchCore clients must compare all four returned identity fields with the
+   frozen request and stop before uploading any archive if a field is missing or
+   different.
 6. Compare the returned `kernel_ref` with the value embedded in `train.py`.
    If they differ, do not upload the old `kernel.zip`: cancel this still-receiving
    job, regenerate `train.py` and `kernel.zip` with the returned owner, and create
@@ -78,6 +82,10 @@ job = relay.create_job(
     payload_hash=payload_hash,
     callback_token_sha256=callback_token_sha256,
     kaggle_key_id=kaggle_key_id,
+    dataset_id=dataset_id,
+    identity_sha256=identity_sha256,
+    run_id=run_id,
+    run_identity_sha256=run_identity_sha256,
 )
 if job["kernel_ref"] != kernel_ref:
     relay.cancel_job(job["job_id"])
@@ -153,7 +161,11 @@ Request body:
   "kernel_size": 7396,
   "chunk_size": 67108864,
   "payload_hash": "<stable dataset payload hash>",
-  "callback_token_sha256": "<sha256(raw callback token)>"
+  "callback_token_sha256": "<sha256(raw callback token)>",
+  "dataset_id": "<frozen dataset id>",
+  "identity_sha256": "<frozen dataset identity sha256>",
+  "run_id": "<frozen run id>",
+  "run_identity_sha256": "<frozen run identity sha256>"
 }
 ```
 
@@ -165,6 +177,12 @@ Important field rules:
   local `dataset.zip`, even if Relay later says dataset upload can be skipped.
 - `callback_token_sha256` is optional but recommended. Relay stores only this
   hash. The raw callback token is embedded in the generated Kaggle script.
+- PatchCore requests must send `dataset_id`, `identity_sha256`, `run_id`, and
+  `run_identity_sha256` together. A partial identity returns `422` before a job
+  row or directory is created. Legacy YOLO clients may omit all four fields.
+- Relay persists these fields and echoes them unchanged in create, get, and list
+  responses. PatchCore clients must reject a missing or mismatched value rather
+  than falling back to a weaker identity check.
 - `kaggle_key_id` is optional. When the relay token maps to exactly one Kaggle
   key, Relay uses that key. When the token can access multiple keys and this
   field is omitted, Relay first prefers a key whose configured `username` matches
@@ -191,6 +209,10 @@ Relevant response fields:
 {
   "job_id": "7f198a0951434e81ad73f71ef8a57fb1",
   "kaggle_key_id": "ka",
+  "dataset_id": "<frozen dataset id>",
+  "identity_sha256": "<frozen dataset identity sha256>",
+  "run_id": "<frozen run id>",
+  "run_identity_sha256": "<frozen run identity sha256>",
   "dataset_cache_hit": true,
   "dataset_upload_required": false,
   "callback_enabled": true,

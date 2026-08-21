@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import sys
 import time
 import zipfile
@@ -17,6 +18,7 @@ os.environ.setdefault("RELAY_API_TOKEN", "secret")
 os.environ.setdefault("RELAY_STORAGE_DIR", str(ROOT / ".test-relay-data"))
 
 from app.config import Settings
+from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterError
 from app.main import create_app
 from app.worker import process_job
@@ -77,6 +79,7 @@ def job_request_body(
     kaggle_key_id: str | None = None,
     dataset_ref: str = "demo/data",
     kernel_ref: str = "demo/kernel",
+    identity: dict | None = None,
 ) -> dict:
     body = {
         "dataset_ref": dataset_ref,
@@ -91,6 +94,8 @@ def job_request_body(
     }
     if kaggle_key_id is not None:
         body["kaggle_key_id"] = kaggle_key_id
+    if identity is not None:
+        body.update(identity)
     return body
 
 
@@ -104,6 +109,7 @@ def create_job(
     dataset_ref: str = "demo/data",
     kernel_ref: str = "demo/kernel",
     headers: dict | None = None,
+    identity: dict | None = None,
 ):
     response = client.post(
         "/v1/jobs",
@@ -116,6 +122,7 @@ def create_job(
             kaggle_key_id=kaggle_key_id,
             dataset_ref=dataset_ref,
             kernel_ref=kernel_ref,
+            identity=identity,
         ),
     )
     assert response.status_code == 200
@@ -197,7 +204,17 @@ def test_job_response_includes_timestamps(tmp_path):
     app = create_app(make_settings(tmp_path))
 
     with TestClient(app) as client:
-        job_id = create_job(client, dataset_zip, kernel_zip)
+        job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            identity={
+                "dataset_id": "",
+                "identity_sha256": "",
+                "run_id": "",
+                "run_identity_sha256": "",
+            },
+        )
         response = client.get(f"/v1/jobs/{job_id}", headers=auth_headers())
 
     data = response.json()
@@ -206,6 +223,182 @@ def test_job_response_includes_timestamps(tmp_path):
     assert isinstance(data["updated_at"], float)
     assert data["created_at"] <= data["updated_at"]
     assert data["completed_at"] is None
+    assert data["dataset_id"] == ""
+    assert data["identity_sha256"] == ""
+    assert data["run_id"] == ""
+    assert data["run_identity_sha256"] == ""
+
+
+def test_patchcore_identity_is_persisted_and_returned_by_job_endpoints(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": b'{"code_file":"train.py"}',
+            "train.py": b"print(1)",
+        }
+    )
+    identity = {
+        "dataset_id": "d" * 64,
+        "identity_sha256": "i" * 64,
+        "run_id": "run-123",
+        "run_identity_sha256": "r" * 64,
+    }
+    app = create_app(make_settings(tmp_path))
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/jobs",
+            headers=auth_headers(),
+            json=job_request_body(
+                dataset_zip,
+                kernel_zip,
+                identity=identity,
+            ),
+        )
+        job_id = created.json()["job_id"]
+        fetched = client.get(
+            f"/v1/jobs/{job_id}",
+            headers=auth_headers(),
+        )
+        listed = client.get("/v1/jobs", headers=auth_headers())
+        stored = app.state.db.get_job(job_id)
+
+    assert created.status_code == 200
+    assert fetched.status_code == 200
+    assert listed.status_code == 200
+    for field, value in identity.items():
+        assert created.json()[field] == value
+        assert fetched.json()[field] == value
+        assert listed.json()[0][field] == value
+        assert stored[field] == value
+
+
+@pytest.mark.parametrize(
+    "identity_field",
+    (
+        "dataset_id",
+        "identity_sha256",
+        "run_id",
+        "run_identity_sha256",
+    ),
+)
+def test_create_job_rejects_partial_patchcore_identity_without_side_effects(
+    tmp_path,
+    identity_field,
+):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": b'{"code_file":"train.py"}',
+            "train.py": b"print(1)",
+        }
+    )
+    app = create_app(make_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/jobs",
+            headers=auth_headers(),
+            json=job_request_body(
+                dataset_zip,
+                kernel_zip,
+                identity={identity_field: "present"},
+            ),
+        )
+
+    assert response.status_code == 422
+    assert "all frozen fields" in response.text
+    assert app.state.db.list_jobs() == []
+    assert list(app.state.settings.jobs_dir.iterdir()) == []
+
+
+def test_relay_db_migrates_legacy_jobs_table_for_patchcore_identity(tmp_path):
+    db_path = tmp_path / "relay.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                dataset_ref TEXT NOT NULL,
+                kernel_ref TEXT NOT NULL,
+                dataset_archive_sha256 TEXT NOT NULL,
+                kernel_archive_sha256 TEXT NOT NULL,
+                dataset_size INTEGER NOT NULL,
+                kernel_size INTEGER NOT NULL,
+                chunk_size INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                progress REAL NOT NULL DEFAULT 0,
+                dataset_status TEXT NOT NULL DEFAULT '',
+                kernel_status TEXT NOT NULL DEFAULT '',
+                kaggle_output TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                payload_hash TEXT NOT NULL DEFAULT '',
+                callback_token_sha256 TEXT NOT NULL DEFAULT '',
+                relay_token_id TEXT NOT NULL DEFAULT '',
+                kaggle_key_id TEXT NOT NULL DEFAULT '',
+                artifact_path TEXT NOT NULL DEFAULT '',
+                cancel_requested_at REAL,
+                cancel_reason TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL
+            );
+            INSERT INTO jobs (
+                job_id, dataset_ref, kernel_ref,
+                dataset_archive_sha256, kernel_archive_sha256,
+                dataset_size, kernel_size, chunk_size,
+                status, created_at, updated_at
+            ) VALUES (
+                'legacy-job', 'demo/data', 'demo/kernel',
+                'dataset-sha', 'kernel-sha',
+                1, 1, 8,
+                'complete', 1.0, 1.0
+            );
+            """
+        )
+
+    db = RelayDb(db_path)
+    with db.connect() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+
+    identity_fields = {
+        "dataset_id",
+        "identity_sha256",
+        "run_id",
+        "run_identity_sha256",
+    }
+    assert identity_fields <= columns
+    legacy_job = db.get_job("legacy-job")
+    assert legacy_job is not None
+    for field in identity_fields:
+        assert legacy_job[field] == ""
+
+    identity = {
+        "dataset_id": "d" * 64,
+        "identity_sha256": "i" * 64,
+        "run_id": "run-after-migration",
+        "run_identity_sha256": "r" * 64,
+    }
+    db.create_job(
+        {
+            "job_id": "new-job",
+            "dataset_ref": "demo/data",
+            "kernel_ref": "demo/kernel",
+            "dataset_archive_sha256": "a" * 64,
+            "kernel_archive_sha256": "b" * 64,
+            "dataset_size": 1,
+            "kernel_size": 1,
+            "chunk_size": 8,
+            **identity,
+        }
+    )
+    migrated_job = db.get_job("new-job")
+    assert migrated_job is not None
+    for field, value in identity.items():
+        assert migrated_job[field] == value
 
 
 def test_single_key_token_auto_binds_job_to_kaggle_key(tmp_path):

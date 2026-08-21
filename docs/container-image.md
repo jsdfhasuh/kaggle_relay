@@ -9,7 +9,18 @@ cd /docker_volume/kaggle_relay
 docker compose up -d --build --force-recreate kaggle-relay
 ```
 
-这条命令会使用仓库里的 `docker-compose.yml` 和 `Dockerfile`，并保留现有的 `./relay-data:/data` 数据卷。替换容器前先备份 `relay-data/relay.db`。
+这条命令会使用仓库里的 `docker-compose.yml` 和 `Dockerfile`，并保留现有的 `./relay-data:/data` 数据卷。替换容器前必须做 SQLite 一致性备份。数据库使用 WAL 模式，不能只在宿主机复制 `relay.db`，否则可能遗漏 `relay.db-wal` 中尚未 checkpoint 的事务：
+
+```bash
+cd /docker_volume/kaggle_relay
+mkdir -p relay-data/backups
+BACKUP_NAME="pre-deploy-$(date -u +%Y%m%dT%H%M%SZ).db"
+docker compose exec -T kaggle-relay python -c "import sqlite3; src=sqlite3.connect('/data/relay.db'); dst=sqlite3.connect('/data/backups/$BACKUP_NAME'); src.backup(dst); dst.close(); src.close()"
+test -s "relay-data/backups/$BACKUP_NAME"
+sha256sum "relay-data/backups/$BACKUP_NAME"
+```
+
+保留输出的文件名和 SHA-256。部署失败需要回滚时，先停止 Relay，再恢复该备份；不要删除整个 `relay-data` 目录。
 
 部署后至少确认：
 

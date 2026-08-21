@@ -1,6 +1,6 @@
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 JobStatus = Literal[
@@ -30,6 +30,30 @@ class CreateJobRequest(BaseModel):
     chunk_size: int = Field(gt=0)
     payload_hash: str = ""
     callback_token_sha256: str = ""
+    dataset_id: str = ""
+    identity_sha256: str = ""
+    run_id: str = ""
+    run_identity_sha256: str = ""
+
+    @model_validator(mode="after")
+    def validate_frozen_identity(self):
+        fields = (
+            "dataset_id",
+            "identity_sha256",
+            "run_id",
+            "run_identity_sha256",
+        )
+        values = {
+            field: str(getattr(self, field, "") or "").strip()
+            for field in fields
+        }
+        if any(values.values()) and not all(values.values()):
+            raise ValueError(
+                "PatchCore job identity must contain all frozen fields"
+            )
+        for field, value in values.items():
+            setattr(self, field, value)
+        return self
 
 
 class JobResponse(BaseModel):
@@ -44,6 +68,10 @@ class JobResponse(BaseModel):
     kaggle_output: str = ""
     error: str = ""
     payload_hash: str = ""
+    dataset_id: str = ""
+    identity_sha256: str = ""
+    run_id: str = ""
+    run_identity_sha256: str = ""
     callback_enabled: bool = False
     created_at: float
     updated_at: float

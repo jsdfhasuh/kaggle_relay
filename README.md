@@ -92,6 +92,13 @@ rewrite `dataset_ref`, `kernel_ref`, and uploaded Kaggle metadata to that key's
 username. Supplying `kaggle_key_id` still forces that specific key when the token
 is allowed to use it, with the same owner rewrite if needed.
 
+PatchCore clients freeze four identity fields before creating a job:
+`dataset_id`, `identity_sha256`, `run_id`, and `run_identity_sha256`. They must
+be sent together or all omitted. Relay persists and returns the exact values from
+create, get, and list responses. Clients must stop before archive upload if any
+returned identity value is missing or differs from the frozen request. Legacy
+YOLO requests that omit all four fields remain supported.
+
 ## Kernel Progress Callback
 
 `POST /v1/jobs` may include `callback_token_sha256`. Store only the SHA-256

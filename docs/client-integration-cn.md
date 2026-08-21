@@ -45,6 +45,9 @@ Kaggle 执行、进度回调、协作式停止、下载产物的完整接入方�
 7. 检查创建响应：
    - 后续所有流程都以响应里的 `job_id`、`dataset_ref`、`kernel_ref`、
      `kaggle_key_id` 为准。
+   - PatchCore 请求还必须逐项核对响应里的 `dataset_id`、
+     `identity_sha256`、`run_id`、`run_identity_sha256` 与本地冻结值完全一致；
+     缺失或不一致时停止，不得上传 archive 或调用 complete。
    - 如果响应里的 `kernel_ref` 和 `train.py` 内嵌的 `RELAY_KERNEL_REF`
      不一致，说明 Relay 做了 owner fallback。此时不要继续上传旧
      `kernel.zip`；应该取消这个 job，按响应里的 owner 重新生成
@@ -85,7 +88,11 @@ Body:
   "kernel_size": 7396,
   "chunk_size": 67108864,
   "payload_hash": "<stable dataset payload hash>",
-  "callback_token_sha256": "<sha256(raw callback token)>"
+  "callback_token_sha256": "<sha256(raw callback token)>",
+  "dataset_id": "<frozen dataset id>",
+  "identity_sha256": "<frozen dataset identity sha256>",
+  "run_id": "<frozen run id>",
+  "run_identity_sha256": "<frozen run identity sha256>"
 }
 ```
 
@@ -97,6 +104,11 @@ Body:
   callback token 上报进度和读取停止信号。
 - 如果传了 `kaggle_key_id`，Relay 会绑定这个 key；如果不传，Relay 会按
   owner 和 GPU quota 自动选择可用 key。
+- PatchCore 必须同时传 `dataset_id`、`identity_sha256`、`run_id`、
+  `run_identity_sha256` 四个冻结字段；只传一部分会返回 `422`，且不会创建
+  job 或目录。YOLO/旧客户端可以四个字段全部省略。
+- Relay 会持久化四个冻结字段，并在 create/get/list 响应中原样回显。
+  PatchCore 客户端必须严格核对，不能对缺失字段做兼容回退。
 
 典型响应：
 
@@ -106,6 +118,10 @@ Body:
   "kaggle_key_id": "ka",
   "dataset_ref": "owner/dataset-slug",
   "kernel_ref": "owner/kernel-slug",
+  "dataset_id": "<frozen dataset id>",
+  "identity_sha256": "<frozen dataset identity sha256>",
+  "run_id": "<frozen run id>",
+  "run_identity_sha256": "<frozen run identity sha256>",
   "status": "receiving",
   "dataset_upload_required": true,
   "callback_enabled": true,

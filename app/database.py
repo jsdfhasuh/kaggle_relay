@@ -41,6 +41,10 @@ class RelayDb:
                     kaggle_output TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     payload_hash TEXT NOT NULL DEFAULT '',
+                    dataset_id TEXT NOT NULL DEFAULT '',
+                    identity_sha256 TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    run_identity_sha256 TEXT NOT NULL DEFAULT '',
                     callback_token_sha256 TEXT NOT NULL DEFAULT '',
                     relay_token_id TEXT NOT NULL DEFAULT '',
                     kaggle_key_id TEXT NOT NULL DEFAULT '',
@@ -90,6 +94,10 @@ class RelayDb:
                 """
             )
             self._ensure_column(conn, "jobs", "callback_token_sha256", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "dataset_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "identity_sha256", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "run_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "run_identity_sha256", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "relay_token_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "kaggle_key_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "cancel_requested_at", "REAL")
@@ -184,6 +192,10 @@ class RelayDb:
             "kaggle_output": "",
             "error": "",
             "payload_hash": values.get("payload_hash", ""),
+            "dataset_id": values.get("dataset_id", ""),
+            "identity_sha256": values.get("identity_sha256", ""),
+            "run_id": values.get("run_id", ""),
+            "run_identity_sha256": values.get("run_identity_sha256", ""),
             "callback_token_sha256": values.get("callback_token_sha256", ""),
             "relay_token_id": values.get("relay_token_id", ""),
             "kaggle_key_id": values.get("kaggle_key_id", ""),
@@ -202,7 +214,9 @@ class RelayDb:
                     dataset_archive_sha256, kernel_archive_sha256,
                     dataset_size, kernel_size, chunk_size,
                     status, progress, dataset_status, kernel_status,
-                    kaggle_output, error, payload_hash, callback_token_sha256,
+                    kaggle_output, error, payload_hash,
+                    dataset_id, identity_sha256, run_id, run_identity_sha256,
+                    callback_token_sha256,
                     relay_token_id, kaggle_key_id, artifact_path,
                     cancel_requested_at, cancel_reason,
                     created_at, updated_at, completed_at
@@ -211,7 +225,9 @@ class RelayDb:
                     :dataset_archive_sha256, :kernel_archive_sha256,
                     :dataset_size, :kernel_size, :chunk_size,
                     :status, :progress, :dataset_status, :kernel_status,
-                    :kaggle_output, :error, :payload_hash, :callback_token_sha256,
+                    :kaggle_output, :error, :payload_hash,
+                    :dataset_id, :identity_sha256, :run_id, :run_identity_sha256,
+                    :callback_token_sha256,
                     :relay_token_id, :kaggle_key_id, :artifact_path,
                     :cancel_requested_at, :cancel_reason,
                     :created_at, :updated_at, :completed_at
