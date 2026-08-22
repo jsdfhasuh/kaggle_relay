@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -521,6 +522,13 @@ def test_patchcore_artifact_download_and_packaging_contract(tmp_path):
     pattern = calls[0][calls[0].index("--file-pattern") + 1]
     assert "model\\.ckpt" in pattern
     assert "threshold\\.json" in pattern
+    assert re.fullmatch(pattern, "model.ckpt")
+    assert re.fullmatch(pattern, "threshold.json")
+    assert not re.fullmatch(pattern, "artifacts/model.ckpt")
+    assert not re.fullmatch(
+        pattern,
+        "Patchcore/training_platform_patchcore/v0/weights/lightning/model.ckpt",
+    )
 
     required = {
         "model.ckpt": b"model",
