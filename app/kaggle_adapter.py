@@ -500,16 +500,17 @@ class KaggleAdapter:
 
     def wait_kernel(self, kernel_ref: str, progress_callback: Callable[[dict], None]) -> str:
         start = time.time()
-        seen_progress = set()
+        last_progress_key = None
         while True:
             output = self.kernel_status(kernel_ref)
             logs = self._run(["kernels", "logs", kernel_ref], check=False).stdout
-            for progress in parse_training_progress_logs(logs):
+            progress_events = parse_training_progress_logs(logs)
+            if progress_events:
+                progress = progress_events[-1]
                 key = training_progress_key(progress)
-                if key in seen_progress:
-                    continue
-                seen_progress.add(key)
-                progress_callback(progress)
+                if key != last_progress_key:
+                    last_progress_key = key
+                    progress_callback(progress)
             status_text = output.lower()
             if any(word in status_text for word in ["complete", "succeeded", "success"]):
                 return output

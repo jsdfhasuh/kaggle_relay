@@ -1337,6 +1337,50 @@ def test_wait_kernel_keeps_yolo_epoch_deduplication(tmp_path, monkeypatch):
     ]
 
 
+def test_wait_kernel_coalesces_patchcore_history_to_latest_event(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    settings.kernel_poll_seconds = 0
+
+    def patchcore_event(current):
+        return {
+            "backend": "patchcore",
+            "implementation": "anomalib",
+            "phase": "coreset",
+            "phase_current": current,
+            "phase_total": 100,
+            "overall_progress": 20.0 + current / 100.0 * 60.0,
+        }
+
+    log_outputs = iter(
+        [
+            "\n".join(
+                "TRAINING_PLATFORM_PROGRESS: " + json.dumps(patchcore_event(current))
+                for current in range(1, 81)
+            ),
+            "\n".join(
+                "TRAINING_PLATFORM_PROGRESS: " + json.dumps(patchcore_event(current))
+                for current in range(1, 81)
+            ),
+        ]
+    )
+    kernel_statuses = iter(["running", "complete"])
+    adapter = KaggleAdapter(settings, lambda _message: None)
+    monkeypatch.setattr(adapter, "kernel_status", lambda _kernel_ref: next(kernel_statuses))
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+    )
+    monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
+    callbacks = []
+
+    assert adapter.wait_kernel("demo/kernel", callbacks.append) == "complete"
+    assert len(callbacks) == 1
+    assert callbacks[0]["phase"] == "coreset"
+    assert callbacks[0]["phase_current"] == 80
+    assert callbacks[0]["phase_total"] == 100
+
+
 def test_worker_prefers_structured_patchcore_kernel_failure(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip(
