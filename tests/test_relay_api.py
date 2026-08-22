@@ -1238,14 +1238,40 @@ def test_wait_kernel_keeps_patchcore_terminal_failure_event(tmp_path, monkeypatc
         "error": "no image files in train/good",
     }
     malformed = {**initial, "phase_current": []}
+    initial_line = "TRAINING_PLATFORM_PROGRESS: " + json.dumps(initial)
+    malformed_line = "TRAINING_PLATFORM_PROGRESS: " + json.dumps(malformed)
+    failure_line = "TRAINING_PLATFORM_PROGRESS: " + json.dumps(failure)
     log_outputs = iter(
         [
-            "TRAINING_PLATFORM_PROGRESS: " + json.dumps(initial),
+            json.dumps(
+                [
+                    {
+                        "stream_name": "stdout",
+                        "time": 1.0,
+                        "data": initial_line + "\n",
+                    }
+                ]
+            ),
             "\n".join(
                 [
-                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(initial),
-                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(malformed),
-                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(failure),
+                    "kaggle log stream",
+                    "["
+                    + json.dumps(
+                        {
+                            "stream_name": "stdout",
+                            "time": 1.0,
+                            "data": initial_line + "\n",
+                        }
+                    ),
+                    ","
+                    + json.dumps(
+                        {
+                            "stream_name": "stdout",
+                            "time": 2.0,
+                            "data": malformed_line + "\n" + failure_line + "\n",
+                        }
+                    ),
+                    "]",
                 ]
             ),
         ]

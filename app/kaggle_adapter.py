@@ -59,9 +59,51 @@ def patch_kaggle_duration_parser() -> None:
     TimeDeltaSerializer._from_dict_value = staticmethod(parse_kaggle_duration)
 
 
+def _wrapped_kaggle_log_lines(output: str) -> list[str]:
+    raw_output = str(output or "")
+    raw_lines = raw_output.splitlines()
+    extracted = []
+
+    def append_data(value) -> bool:
+        found = False
+        if isinstance(value, list):
+            for item in value:
+                found = append_data(item) or found
+        elif isinstance(value, dict) and isinstance(value.get("data"), str):
+            extracted.extend(value["data"].splitlines())
+            found = True
+        return found
+
+    try:
+        decoded = json.loads(raw_output)
+    except (TypeError, json.JSONDecodeError):
+        decoded = None
+    if append_data(decoded):
+        return raw_lines + extracted
+
+    for line in raw_lines:
+        candidate = line.strip()
+        if candidate.startswith("["):
+            candidate = candidate[1:].lstrip()
+        if candidate.startswith(","):
+            candidate = candidate[1:].lstrip()
+        if candidate.endswith("]"):
+            candidate = candidate[:-1].rstrip()
+        if candidate.endswith(","):
+            candidate = candidate[:-1].rstrip()
+        if not candidate:
+            continue
+        try:
+            decoded_line = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        append_data(decoded_line)
+    return raw_lines + extracted
+
+
 def parse_training_progress_logs(output: str) -> list[dict]:
     events = []
-    for line in (output or "").splitlines():
+    for line in _wrapped_kaggle_log_lines(output):
         marker_index = line.find(TRAINING_PROGRESS_PREFIX)
         if marker_index < 0:
             continue
