@@ -45,6 +45,7 @@ class RelayDb:
                     identity_sha256 TEXT NOT NULL DEFAULT '',
                     run_id TEXT NOT NULL DEFAULT '',
                     run_identity_sha256 TEXT NOT NULL DEFAULT '',
+                    artifact_contract TEXT NOT NULL DEFAULT 'yolo',
                     callback_token_sha256 TEXT NOT NULL DEFAULT '',
                     relay_token_id TEXT NOT NULL DEFAULT '',
                     kaggle_key_id TEXT NOT NULL DEFAULT '',
@@ -98,6 +99,21 @@ class RelayDb:
             self._ensure_column(conn, "jobs", "identity_sha256", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "run_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "run_identity_sha256", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "artifact_contract", "TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                UPDATE jobs
+                SET artifact_contract = CASE
+                    WHEN dataset_id <> ''
+                     AND identity_sha256 <> ''
+                     AND run_id <> ''
+                     AND run_identity_sha256 <> ''
+                    THEN 'patchcore'
+                    ELSE 'yolo'
+                END
+                WHERE artifact_contract NOT IN ('yolo', 'patchcore')
+                """
+            )
             self._ensure_column(conn, "jobs", "relay_token_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "kaggle_key_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "cancel_requested_at", "REAL")
@@ -196,6 +212,20 @@ class RelayDb:
             "identity_sha256": values.get("identity_sha256", ""),
             "run_id": values.get("run_id", ""),
             "run_identity_sha256": values.get("run_identity_sha256", ""),
+            "artifact_contract": values.get("artifact_contract")
+            or (
+                "patchcore"
+                if all(
+                    values.get(field)
+                    for field in (
+                        "dataset_id",
+                        "identity_sha256",
+                        "run_id",
+                        "run_identity_sha256",
+                    )
+                )
+                else "yolo"
+            ),
             "callback_token_sha256": values.get("callback_token_sha256", ""),
             "relay_token_id": values.get("relay_token_id", ""),
             "kaggle_key_id": values.get("kaggle_key_id", ""),
@@ -216,6 +246,7 @@ class RelayDb:
                     status, progress, dataset_status, kernel_status,
                     kaggle_output, error, payload_hash,
                     dataset_id, identity_sha256, run_id, run_identity_sha256,
+                    artifact_contract,
                     callback_token_sha256,
                     relay_token_id, kaggle_key_id, artifact_path,
                     cancel_requested_at, cancel_reason,
@@ -227,6 +258,7 @@ class RelayDb:
                     :status, :progress, :dataset_status, :kernel_status,
                     :kaggle_output, :error, :payload_hash,
                     :dataset_id, :identity_sha256, :run_id, :run_identity_sha256,
+                    :artifact_contract,
                     :callback_token_sha256,
                     :relay_token_id, :kaggle_key_id, :artifact_path,
                     :cancel_requested_at, :cancel_reason,

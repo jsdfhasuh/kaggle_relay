@@ -99,6 +99,14 @@ create, get, and list responses. Clients must stop before archive upload if any
 returned identity value is missing or differs from the frozen request. Legacy
 YOLO requests that omit all four fields remain supported.
 
+Clients also send `artifact_contract` as `yolo` or `patchcore`. Relay persists
+and returns it, then uses it for both Kaggle output filtering and required-file
+validation. PatchCore jobs require `model.ckpt`, `threshold.json`,
+`anomaly_metrics.json`, `environment.json`, and `training_artifacts.json`;
+YOLO jobs continue to require `best.pt`. For pre-contract jobs, Relay derives
+`patchcore` only when all four frozen identity fields are present, otherwise it
+uses `yolo`.
+
 ## Kernel Progress Callback
 
 `POST /v1/jobs` may include `callback_token_sha256`. Store only the SHA-256

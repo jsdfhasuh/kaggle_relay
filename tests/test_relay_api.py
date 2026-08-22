@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("RELAY_API_TOKEN", "secret")
 os.environ.setdefault("RELAY_STORAGE_DIR", str(ROOT / ".test-relay-data"))
 
+from app.archive import ArchiveError
 from app.config import Settings
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterError
@@ -81,6 +82,7 @@ def job_request_body(
     dataset_ref: str = "demo/data",
     kernel_ref: str = "demo/kernel",
     identity: dict | None = None,
+    artifact_contract: str | None = None,
 ) -> dict:
     body = {
         "dataset_ref": dataset_ref,
@@ -97,6 +99,8 @@ def job_request_body(
         body["kaggle_key_id"] = kaggle_key_id
     if identity is not None:
         body.update(identity)
+    if artifact_contract is not None:
+        body["artifact_contract"] = artifact_contract
     return body
 
 
@@ -111,6 +115,7 @@ def create_job(
     kernel_ref: str = "demo/kernel",
     headers: dict | None = None,
     identity: dict | None = None,
+    artifact_contract: str | None = None,
 ):
     response = client.post(
         "/v1/jobs",
@@ -124,6 +129,7 @@ def create_job(
             dataset_ref=dataset_ref,
             kernel_ref=kernel_ref,
             identity=identity,
+            artifact_contract=artifact_contract,
         ),
     )
     assert response.status_code == 200
@@ -228,6 +234,7 @@ def test_job_response_includes_timestamps(tmp_path):
     assert data["identity_sha256"] == ""
     assert data["run_id"] == ""
     assert data["run_identity_sha256"] == ""
+    assert data["artifact_contract"] == "yolo"
 
 
 def test_patchcore_identity_is_persisted_and_returned_by_job_endpoints(tmp_path):
@@ -272,6 +279,56 @@ def test_patchcore_identity_is_persisted_and_returned_by_job_endpoints(tmp_path)
         assert fetched.json()[field] == value
         assert listed.json()[0][field] == value
         assert stored[field] == value
+    assert created.json()["artifact_contract"] == "patchcore"
+    assert fetched.json()["artifact_contract"] == "patchcore"
+    assert listed.json()[0]["artifact_contract"] == "patchcore"
+    assert stored["artifact_contract"] == "patchcore"
+
+
+@pytest.mark.parametrize(
+    ("artifact_contract", "identity"),
+    (
+        ("patchcore", None),
+        (
+            "yolo",
+            {
+                "dataset_id": "d" * 64,
+                "identity_sha256": "i" * 64,
+                "run_id": "run-123",
+                "run_identity_sha256": "r" * 64,
+            },
+        ),
+    ),
+)
+def test_create_job_rejects_artifact_contract_identity_mismatch(
+    tmp_path,
+    artifact_contract,
+    identity,
+):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": b'{"code_file":"train.py"}',
+            "train.py": b"print(1)",
+        }
+    )
+    app = create_app(make_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/jobs",
+            headers=auth_headers(),
+            json=job_request_body(
+                dataset_zip,
+                kernel_zip,
+                identity=identity,
+                artifact_contract=artifact_contract,
+            ),
+        )
+
+    assert response.status_code == 422
+    assert "artifact contract" in response.text
+    assert app.state.db.list_jobs() == []
 
 
 @pytest.mark.parametrize(
@@ -371,11 +428,12 @@ def test_relay_db_migrates_legacy_jobs_table_for_patchcore_identity(tmp_path):
         "run_id",
         "run_identity_sha256",
     }
-    assert identity_fields <= columns
+    assert identity_fields | {"artifact_contract"} <= columns
     legacy_job = db.get_job("legacy-job")
     assert legacy_job is not None
     for field in identity_fields:
         assert legacy_job[field] == ""
+    assert legacy_job["artifact_contract"] == "yolo"
 
     identity = {
         "dataset_id": "d" * 64,
@@ -400,6 +458,101 @@ def test_relay_db_migrates_legacy_jobs_table_for_patchcore_identity(tmp_path):
     assert migrated_job is not None
     for field, value in identity.items():
         assert migrated_job[field] == value
+    assert migrated_job["artifact_contract"] == "patchcore"
+
+
+def test_relay_db_backfills_existing_patchcore_artifact_contract(tmp_path):
+    db_path = tmp_path / "relay.db"
+    RelayDb(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, dataset_ref, kernel_ref,
+                dataset_archive_sha256, kernel_archive_sha256,
+                dataset_size, kernel_size, chunk_size,
+                status, progress, dataset_id, identity_sha256,
+                run_id, run_identity_sha256, artifact_contract,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "patchcore-before-contract",
+                "demo/data",
+                "demo/kernel",
+                "a" * 64,
+                "b" * 64,
+                1,
+                1,
+                8,
+                "failed",
+                0,
+                "d" * 64,
+                "i" * 64,
+                "run-before-contract",
+                "r" * 64,
+                "",
+                1.0,
+                1.0,
+            ),
+        )
+
+    migrated = RelayDb(db_path).get_job("patchcore-before-contract")
+
+    assert migrated["artifact_contract"] == "patchcore"
+
+
+def test_patchcore_artifact_download_and_packaging_contract(tmp_path):
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    calls = []
+    adapter._run = lambda args, check=False: (
+        calls.append(args) or SimpleNamespace(stdout="downloaded")
+    )
+    output_dir = tmp_path / "output"
+
+    assert (
+        adapter.download_output(
+            "demo/kernel",
+            output_dir,
+            artifact_contract="patchcore",
+        )
+        == "downloaded"
+    )
+    pattern = calls[0][calls[0].index("--file-pattern") + 1]
+    assert "model\\.ckpt" in pattern
+    assert "threshold\\.json" in pattern
+
+    required = {
+        "model.ckpt": b"model",
+        "threshold.json": b"{}",
+        "anomaly_metrics.json": b"{}",
+        "environment.json": b"{}",
+        "training_artifacts.json": b"{}",
+    }
+    for name, content in required.items():
+        (output_dir / name).write_bytes(content)
+    artifact_zip = tmp_path / "artifacts.zip"
+    adapter.package_artifacts(
+        output_dir,
+        artifact_zip,
+        artifact_contract="patchcore",
+    )
+
+    with zipfile.ZipFile(artifact_zip) as archive:
+        assert set(required) <= set(archive.namelist())
+
+
+def test_patchcore_artifact_packaging_rejects_missing_model(tmp_path):
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    with pytest.raises(ArchiveError, match="required file missing: model.ckpt"):
+        adapter.package_artifacts(
+            output_dir,
+            tmp_path / "artifacts.zip",
+            artifact_contract="patchcore",
+        )
 
 
 def test_single_key_token_auto_binds_job_to_kaggle_key(tmp_path):
@@ -1480,12 +1633,12 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
             def wait_kernel(self, _kernel_ref, _progress_callback):
                 return "complete"
 
-            def download_output(self, _kernel_ref, output_dir):
+            def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
                 output_dir.mkdir(parents=True, exist_ok=True)
                 (output_dir / "best.pt").write_bytes(b"pt")
                 return "downloaded"
 
-            def package_artifacts(self, output_dir, artifact_zip):
+            def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
                 artifact_zip.parent.mkdir(parents=True, exist_ok=True)
                 with zipfile.ZipFile(artifact_zip, "w") as archive:
                     archive.write(output_dir / "best.pt", "best.pt")
@@ -1529,12 +1682,12 @@ def test_worker_uses_job_bound_kaggle_credentials(tmp_path, monkeypatch):
         def wait_kernel(self, _kernel_ref, _progress_callback):
             return "complete"
 
-        def download_output(self, _kernel_ref, output_dir):
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "best.pt").write_bytes(b"pt")
             return "downloaded"
 
-        def package_artifacts(self, output_dir, artifact_zip):
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
             artifact_zip.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(artifact_zip, "w") as archive:
                 archive.write(output_dir / "best.pt", "best.pt")
@@ -1635,12 +1788,12 @@ def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_pat
             )
             return "complete"
 
-        def download_output(self, _kernel_ref, output_dir):
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "checkpoint.pt").write_bytes(b"pt")
             return "downloaded"
 
-        def package_artifacts(self, output_dir, artifact_zip):
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
             artifact_zip.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(artifact_zip, "w") as archive:
                 archive.write(output_dir / "checkpoint.pt", "checkpoint.pt")
@@ -1687,12 +1840,12 @@ def test_startup_recovery_resumes_kernel_finish_without_upload_or_push(tmp_path,
             calls["wait_kernel"] += 1
             return "complete"
 
-        def download_output(self, _kernel_ref, output_dir):
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "best.pt").write_bytes(b"pt")
             return "downloaded"
 
-        def package_artifacts(self, output_dir, artifact_zip):
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
             artifact_zip.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(artifact_zip, "w") as archive:
                 archive.write(output_dir / "best.pt", "best.pt")
@@ -1761,12 +1914,12 @@ def test_startup_recovery_cancel_requested_after_submission_finishes_canceled(tm
         def wait_kernel(self, _kernel_ref, _progress_callback):
             return "complete"
 
-        def download_output(self, _kernel_ref, output_dir):
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "best.pt").write_bytes(b"pt")
             return "downloaded"
 
-        def package_artifacts(self, output_dir, artifact_zip):
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
             artifact_zip.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(artifact_zip, "w") as archive:
                 archive.write(output_dir / "best.pt", "best.pt")
@@ -1801,12 +1954,12 @@ def test_startup_recovery_cancel_requested_during_push_resumes_visible_kernel(tm
         def wait_kernel(self, _kernel_ref, _progress_callback):
             return "complete"
 
-        def download_output(self, _kernel_ref, output_dir):
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "best.pt").write_bytes(b"pt")
             return "downloaded"
 
-        def package_artifacts(self, output_dir, artifact_zip):
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
             artifact_zip.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(artifact_zip, "w") as archive:
                 archive.write(output_dir / "best.pt", "best.pt")
@@ -1862,12 +2015,12 @@ def test_startup_recovery_pushing_kernel_visible_resumes(tmp_path, monkeypatch):
         def wait_kernel(self, _kernel_ref, _progress_callback):
             return "complete"
 
-        def download_output(self, _kernel_ref, output_dir):
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "best.pt").write_bytes(b"pt")
             return "downloaded"
 
-        def package_artifacts(self, output_dir, artifact_zip):
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
             artifact_zip.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(artifact_zip, "w") as archive:
                 archive.write(output_dir / "best.pt", "best.pt")

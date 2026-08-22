@@ -284,9 +284,18 @@ def finish_kernel_job(
 
     current = latest_job()
     db.update_job(job_id, status="downloading_output", progress=max(float(current.get("progress") or 0), 85))
-    output = adapter.download_output(kernel_ref, paths["output_dir"])
+    artifact_contract = str(current.get("artifact_contract") or "yolo")
+    output = adapter.download_output(
+        kernel_ref,
+        paths["output_dir"],
+        artifact_contract=artifact_contract,
+    )
     log(output)
-    adapter.package_artifacts(paths["output_dir"], paths["artifact_zip"])
+    adapter.package_artifacts(
+        paths["output_dir"],
+        paths["artifact_zip"],
+        artifact_contract=artifact_contract,
+    )
     current = latest_job()
     status = final_status or ("canceled" if job_cancel_requested(current) else "complete")
     db.update_job(

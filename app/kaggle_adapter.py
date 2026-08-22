@@ -20,11 +20,30 @@ from app.config import Settings
 from app.security import redact_secrets
 
 
-ARTIFACT_FILE_PATTERN = (
+YOLO_ARTIFACT_FILE_PATTERN = (
     r".*(artifacts[/\\].*|best\.(pt|onnx)|training_artifacts\.json|"
     r"results\.(csv|png)|args\.yaml|confusion_matrix.*\.png|"
     r"PR_curve\.png|F1_curve\.png|P_curve\.png|R_curve\.png)$"
 )
+PATCHCORE_ARTIFACT_FILE_PATTERN = (
+    r".*(artifacts[/\\].*|model\.ckpt|threshold\.json|"
+    r"anomaly_metrics\.json|environment\.json|heatmap_sample\.png|"
+    r"overlay_sample\.png|training_artifacts\.json)$"
+)
+ARTIFACT_FILE_PATTERNS = {
+    "yolo": YOLO_ARTIFACT_FILE_PATTERN,
+    "patchcore": PATCHCORE_ARTIFACT_FILE_PATTERN,
+}
+REQUIRED_ARTIFACT_FILES = {
+    "yolo": ("best.pt",),
+    "patchcore": (
+        "model.ckpt",
+        "threshold.json",
+        "anomaly_metrics.json",
+        "environment.json",
+        "training_artifacts.json",
+    ),
+}
 TRAINING_PROGRESS_PREFIX = "TRAINING_PLATFORM_PROGRESS"
 READY_KAGGLE_STATUSES = {"ready", "complete", "ok"}
 _ENV_LOCK = threading.RLock()
@@ -520,7 +539,16 @@ class KaggleAdapter:
                 raise TimeoutError(f"Kernel wait timed out:\n{output}")
             time.sleep(self.settings.kernel_poll_seconds)
 
-    def download_output(self, kernel_ref: str, output_dir: Path) -> str:
+    def download_output(
+        self,
+        kernel_ref: str,
+        output_dir: Path,
+        artifact_contract: str = "yolo",
+    ) -> str:
+        if artifact_contract not in ARTIFACT_FILE_PATTERNS:
+            raise KaggleAdapterError(
+                f"unknown artifact contract: {artifact_contract}"
+            )
         if output_dir.exists():
             shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -533,13 +561,24 @@ class KaggleAdapter:
                 str(output_dir),
                 "--force",
                 "--file-pattern",
-                ARTIFACT_FILE_PATTERN,
+                ARTIFACT_FILE_PATTERNS[artifact_contract],
             ],
             check=False,
         ).stdout
 
-    def package_artifacts(self, output_dir: Path, artifact_zip: Path) -> None:
-        require_file(output_dir, "best.pt")
+    def package_artifacts(
+        self,
+        output_dir: Path,
+        artifact_zip: Path,
+        artifact_contract: str = "yolo",
+    ) -> None:
+        required_files = REQUIRED_ARTIFACT_FILES.get(artifact_contract)
+        if required_files is None:
+            raise KaggleAdapterError(
+                f"unknown artifact contract: {artifact_contract}"
+            )
+        for relative_path in required_files:
+            require_file(output_dir, relative_path)
         artifact_zip.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(artifact_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(output_dir.rglob("*")):

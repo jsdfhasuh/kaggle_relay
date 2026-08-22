@@ -34,6 +34,7 @@ class CreateJobRequest(BaseModel):
     identity_sha256: str = ""
     run_id: str = ""
     run_identity_sha256: str = ""
+    artifact_contract: Literal["", "yolo", "patchcore"] = ""
 
     @model_validator(mode="after")
     def validate_frozen_identity(self):
@@ -53,6 +54,18 @@ class CreateJobRequest(BaseModel):
             )
         for field, value in values.items():
             setattr(self, field, value)
+        artifact_contract = str(self.artifact_contract or "").strip().lower()
+        if not artifact_contract:
+            artifact_contract = "patchcore" if all(values.values()) else "yolo"
+        if artifact_contract == "patchcore" and not all(values.values()):
+            raise ValueError(
+                "PatchCore artifact contract requires all frozen identity fields"
+            )
+        if artifact_contract == "yolo" and any(values.values()):
+            raise ValueError(
+                "YOLO artifact contract cannot contain PatchCore frozen identity"
+            )
+        self.artifact_contract = artifact_contract
         return self
 
 
@@ -72,6 +85,7 @@ class JobResponse(BaseModel):
     identity_sha256: str = ""
     run_id: str = ""
     run_identity_sha256: str = ""
+    artifact_contract: Literal["yolo", "patchcore"] = "yolo"
     callback_enabled: bool = False
     created_at: float
     updated_at: float
