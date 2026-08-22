@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import shutil
@@ -73,16 +74,62 @@ def parse_training_progress_logs(output: str) -> list[dict]:
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("phase"):
+            if (
+                payload.get("backend") != "patchcore"
+                or not isinstance(payload.get("phase"), str)
+                or not payload["phase"].strip()
+            ):
+                continue
+            try:
+                overall_progress = float(payload["overall_progress"])
+                phase_current = int(payload["phase_current"])
+                phase_total = int(payload["phase_total"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                not math.isfinite(overall_progress)
+                or phase_current < 0
+                or phase_total < 0
+                or (phase_total > 0 and phase_current > phase_total)
+                or not isinstance(payload.get("status", ""), str)
+                or not isinstance(payload.get("error_code", ""), str)
+            ):
+                continue
+            payload["phase"] = payload["phase"].strip()
+            payload["phase_current"] = phase_current
+            payload["phase_total"] = phase_total
+            payload["remote_progress"] = round(
+                min(100.0, max(0.0, overall_progress)),
+                2,
+            )
+            events.append(payload)
+            continue
         try:
             epoch = int(payload["epoch"])
             epochs = int(payload["epochs"])
         except (KeyError, TypeError, ValueError):
+            continue
+        if epoch <= 0 or epochs <= 0:
             continue
         payload["epoch"] = epoch
         payload["epochs"] = epochs
         payload["remote_progress"] = round(min(100.0, max(0.0, epoch / epochs * 100)), 2)
         events.append(payload)
     return events
+
+
+def training_progress_key(progress: dict) -> tuple:
+    if progress.get("phase"):
+        return (
+            "patchcore",
+            progress.get("phase"),
+            progress.get("phase_current"),
+            progress.get("phase_total"),
+            progress.get("status"),
+            progress.get("error_code"),
+        )
+    return ("epoch", progress.get("epoch"), progress.get("epochs"))
 
 
 class KaggleAdapter:
@@ -416,7 +463,7 @@ class KaggleAdapter:
             output = self.kernel_status(kernel_ref)
             logs = self._run(["kernels", "logs", kernel_ref], check=False).stdout
             for progress in parse_training_progress_logs(logs):
-                key = (progress.get("epoch"), progress.get("epochs"))
+                key = training_progress_key(progress)
                 if key in seen_progress:
                     continue
                 seen_progress.add(key)

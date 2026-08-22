@@ -7,6 +7,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1217,6 +1218,157 @@ def test_complete_rewrites_kernel_metadata_when_dataset_is_cached(tmp_path, monk
     assert complete.json()["dataset_cache_hit"] is True
     assert kernel_metadata["id"] == "alice/kernel"
     assert kernel_metadata["dataset_sources"] == ["alice/data"]
+
+
+def test_wait_kernel_keeps_patchcore_terminal_failure_event(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    settings.kernel_poll_seconds = 0
+    initial = {
+        "backend": "patchcore",
+        "implementation": "anomalib",
+        "phase": "prepare",
+        "phase_current": 0,
+        "phase_total": 1,
+        "overall_progress": 0.0,
+    }
+    failure = {
+        **initial,
+        "status": "failed",
+        "error_code": "dataset_layout_invalid",
+        "error": "no image files in train/good",
+    }
+    malformed = {**initial, "phase_current": []}
+    log_outputs = iter(
+        [
+            "TRAINING_PLATFORM_PROGRESS: " + json.dumps(initial),
+            "\n".join(
+                [
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(initial),
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(malformed),
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(failure),
+                ]
+            ),
+        ]
+    )
+    kernel_statuses = iter(["running", "KernelWorkerStatus.ERROR"])
+    adapter = KaggleAdapter(settings, lambda _message: None)
+    monkeypatch.setattr(adapter, "kernel_status", lambda _kernel_ref: next(kernel_statuses))
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+    )
+    monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
+    callbacks = []
+
+    with pytest.raises(KaggleAdapterError, match="KernelWorkerStatus.ERROR"):
+        adapter.wait_kernel("demo/kernel", callbacks.append)
+
+    assert len(callbacks) == 2
+    assert callbacks[0].get("status", "") == ""
+    assert callbacks[-1]["status"] == "failed"
+    assert callbacks[-1]["error_code"] == "dataset_layout_invalid"
+    assert callbacks[-1]["error"] == "no image files in train/good"
+
+
+def test_wait_kernel_keeps_yolo_epoch_deduplication(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    settings.kernel_poll_seconds = 0
+    epoch_one = {"epoch": 1, "epochs": 2, "message": "first"}
+    epoch_two = {"epoch": 2, "epochs": 2, "message": "second"}
+    invalid_epoch = {"epoch": 1, "epochs": 0, "message": "invalid"}
+    log_outputs = iter(
+        [
+            "\n".join(
+                [
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(invalid_epoch),
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(epoch_one),
+                ]
+            ),
+            "\n".join(
+                [
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(epoch_one),
+                    "TRAINING_PLATFORM_PROGRESS: " + json.dumps(epoch_two),
+                ]
+            ),
+        ]
+    )
+    kernel_statuses = iter(["running", "complete"])
+    adapter = KaggleAdapter(settings, lambda _message: None)
+    monkeypatch.setattr(adapter, "kernel_status", lambda _kernel_ref: next(kernel_statuses))
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+    )
+    monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
+    callbacks = []
+
+    assert adapter.wait_kernel("demo/kernel", callbacks.append) == "complete"
+    assert [(event["epoch"], event["epochs"]) for event in callbacks] == [
+        (1, 2),
+        (2, 2),
+    ]
+
+
+def test_worker_prefers_structured_patchcore_kernel_failure(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": b'{"code_file":"train.py"}',
+            "train.py": b"print(1)",
+        }
+    )
+    settings = make_settings(tmp_path)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    app = create_app(settings)
+    failure = {
+        "backend": "patchcore",
+        "implementation": "anomalib",
+        "phase": "prepare",
+        "phase_current": 0,
+        "phase_total": 1,
+        "overall_progress": 0.0,
+        "remote_progress": 0.0,
+        "status": "failed",
+        "error_code": "dataset_layout_invalid",
+        "error": "no image files in train/good, val/good",
+    }
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            pass
+
+        def wait_dataset(self, *_args, **_kwargs):
+            return "ready"
+
+        def push_kernel(self, _kernel_dir):
+            return "pushed"
+
+        def wait_kernel(self, _kernel_ref, progress_callback):
+            progress_callback(failure)
+            raise KaggleAdapterError('demo/kernel has status "KernelWorkerStatus.ERROR"')
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
+        complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        assert complete.status_code == 200
+
+        process_job(settings, app.state.db, job_id)
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+
+    assert status["status"] == "failed"
+    assert json.loads(status["kernel_status"])["error_code"] == "dataset_layout_invalid"
+    assert status["error"] == failure["error"]
+    assert "KernelWorkerStatus.ERROR" not in status["error"]
+    assert status["recent_logs"][-1] == failure["error"]
 
 
 def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):

@@ -217,6 +217,34 @@ def validate_payloads(
     return validate_kernel_payload(kernel_dir, kernel_ref, credentials, dataset_ref=dataset_ref)
 
 
+def structured_kernel_failure_error(kernel_status) -> str:
+    if isinstance(kernel_status, dict):
+        payload = kernel_status
+    elif isinstance(kernel_status, str):
+        try:
+            payload = json.loads(kernel_status)
+        except (TypeError, json.JSONDecodeError):
+            return ""
+    else:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if str(payload.get("status") or "").strip().lower() not in {
+        "failed",
+        "error",
+        "canceled",
+    }:
+        return ""
+    error = str(payload.get("error") or "").strip()
+    if error:
+        return error
+    error_code = str(payload.get("error_code") or "").strip()
+    message = str(payload.get("message") or "").strip()
+    if error_code and message:
+        return f"{error_code}: {message}"
+    return error_code or message
+
+
 def finish_kernel_job(
     settings,
     db: RelayDb,
@@ -379,5 +407,8 @@ def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None
         db.update_job(job_id, status="canceled", error=message)
         db.append_log(job_id, message)
     except Exception as exc:
-        db.update_job(job_id, status="failed", progress=0, error=redact_secrets(str(exc)))
-        db.append_log(job_id, redact_secrets(str(exc)))
+        current = latest_job()
+        message = structured_kernel_failure_error(current.get("kernel_status")) or str(exc)
+        message = redact_secrets(message)
+        db.update_job(job_id, status="failed", progress=0, error=message)
+        db.append_log(job_id, message)
