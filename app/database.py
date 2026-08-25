@@ -394,6 +394,88 @@ class RelayDb:
         with self.connect() as conn:
             conn.execute(f"UPDATE jobs SET {assignments} WHERE job_id = :job_id", payload)
 
+    def update_job_if_status(
+        self,
+        job_id: str,
+        expected_statuses: set[str] | list[str] | tuple[str, ...],
+        *,
+        require_not_canceled: bool = False,
+        **values: Any,
+    ) -> bool:
+        ordered_statuses = sorted(set(expected_statuses))
+        if not ordered_statuses or not values:
+            return False
+        values["updated_at"] = now_ts()
+        if values.get("status") in {"complete", "failed", "canceled"}:
+            values.setdefault("completed_at", now_ts())
+        assignments = ", ".join(f"{key} = :{key}" for key in values)
+        status_placeholders = ", ".join(
+            f":expected_status_{index}"
+            for index in range(len(ordered_statuses))
+        )
+        payload = {
+            "job_id": job_id,
+            **values,
+            **{
+                f"expected_status_{index}": status
+                for index, status in enumerate(ordered_statuses)
+            },
+        }
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE jobs
+                SET {assignments}
+                WHERE job_id = :job_id
+                  AND status IN ({status_placeholders})
+                  {"AND cancel_requested_at IS NULL" if require_not_canceled else ""}
+                """,
+                payload,
+            )
+        return cursor.rowcount == 1
+
+    def finalize_job(
+        self,
+        job_id: str,
+        preferred_status: str,
+        **values: Any,
+    ) -> Optional[str]:
+        if preferred_status not in {"complete", "failed", "canceled"}:
+            raise ValueError(f"invalid terminal job status: {preferred_status}")
+        if "status" in values:
+            raise ValueError("finalize_job sets status atomically")
+
+        stamp = now_ts()
+        values["updated_at"] = stamp
+        values["completed_at"] = stamp
+        assignments = ", ".join(f"{key} = :{key}" for key in values)
+        payload = {
+            "job_id": job_id,
+            "preferred_status": preferred_status,
+            **values,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = CASE
+                        WHEN cancel_requested_at IS NOT NULL
+                          OR status = 'cancel_requested'
+                        THEN 'canceled'
+                        ELSE :preferred_status
+                    END,
+                    {assignments}
+                WHERE job_id = :job_id
+                  AND status NOT IN ('complete', 'failed', 'canceled')
+                """,
+                payload,
+            )
+            row = conn.execute(
+                "SELECT status FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return str(row["status"]) if row else None
+
     def add_chunk(
         self,
         job_id: str,

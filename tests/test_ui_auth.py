@@ -7,7 +7,9 @@ import sys
 import zipfile
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,8 +18,10 @@ os.environ.setdefault("RELAY_API_TOKEN", "secret")
 os.environ.setdefault("RELAY_STORAGE_DIR", str(ROOT / ".test-relay-data"))
 os.environ["RELAY_UI_COOKIE_SECURE"] = "false"
 
+from app.auth_config import AuthConfigError, AuthStore
 from app.config import Settings
 from app.main import create_app
+from app.security import auth_source
 from app.ui_auth import UI_COOKIE_NAME, create_ui_session_cookie
 
 
@@ -25,14 +29,28 @@ def make_settings(tmp_path: Path) -> Settings:
     return Settings(api_token="secret", storage_dir=tmp_path, chunk_size=8)
 
 
-def make_auth_config_settings(tmp_path: Path, config: dict) -> Settings:
+def make_auth_config_settings(tmp_path: Path, config: dict, admin_token: str = "") -> Settings:
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(json.dumps(config), encoding="utf-8")
-    return Settings(api_token="", storage_dir=tmp_path, chunk_size=8, auth_config_path=auth_path)
+    return Settings(
+        api_token="",
+        storage_dir=tmp_path,
+        chunk_size=8,
+        auth_config_path=auth_path,
+        admin_token=admin_token,
+    )
 
 
 def auth_headers(token: str = "secret") -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def ui_login(client: TestClient, token: str, origin: str = "http://testserver"):
+    return client.post(
+        "/v1/ui/login",
+        headers={"Origin": origin},
+        json={"token": token},
+    )
 
 
 def multi_key_auth_config() -> dict:
@@ -93,6 +111,68 @@ def test_login_page_returns_200(tmp_path):
 
     assert response.status_code == 200
     assert "Kaggle Relay" in response.text
+    assert "管理密钥" in response.text
+
+
+def test_admin_token_requires_multi_key_auth_config(tmp_path):
+    with pytest.raises(ValueError, match="admin_token requires auth_config_path"):
+        Settings(
+            api_token="secret",
+            storage_dir=tmp_path,
+            admin_token="custom-management-token",
+        )
+
+
+def test_admin_token_minimum_length_is_eight_characters(tmp_path):
+    auth_path = tmp_path / "auth.json"
+
+    settings = Settings(
+        api_token="",
+        storage_dir=tmp_path,
+        auth_config_path=auth_path,
+        admin_token="12345678",
+    )
+
+    assert settings.admin_token == "12345678"
+    trimmed_settings = Settings(
+        api_token="",
+        storage_dir=tmp_path,
+        auth_config_path=auth_path,
+        admin_token="  12345678  ",
+    )
+    assert trimmed_settings.admin_token == "12345678"
+    with pytest.raises(ValueError, match="at least 8 characters"):
+        Settings(
+            api_token="",
+            storage_dir=tmp_path,
+            auth_config_path=auth_path,
+            admin_token="1234567",
+        )
+    with pytest.raises(AuthConfigError, match="at least 8 characters"):
+        AuthStore(
+            relay_tokens=[("admin", "admin-token", None)],
+            kaggle_keys={},
+            admin_token="1234567",
+        )
+
+
+def test_settings_reads_admin_token_without_exposing_it_in_repr(tmp_path, monkeypatch):
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps(multi_key_auth_config()), encoding="utf-8")
+    management_token = "custom-management-token"
+    monkeypatch.setenv("RELAY_AUTH_CONFIG", str(auth_path))
+    monkeypatch.setenv("RELAY_ADMIN_TOKEN", management_token)
+    monkeypatch.setenv("RELAY_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setenv("RELAY_PUBLIC_ORIGIN", "https://relay.example/")
+    monkeypatch.setenv("RELAY_TRUSTED_PROXY_IPS", "127.0.0.1, ::1")
+
+    settings = Settings.from_env()
+
+    assert settings.auth_config_path == auth_path
+    assert settings.admin_token == management_token
+    assert settings.public_origin == "https://relay.example"
+    assert settings.trusted_proxy_ips == frozenset({"127.0.0.1", "::1"})
+    assert management_token not in repr(settings)
 
 
 def test_ui_pages_redirect_to_login_without_session(tmp_path):
@@ -107,15 +187,79 @@ def test_ui_pages_redirect_to_login_without_session(tmp_path):
 def test_ui_login_rejects_invalid_token(tmp_path):
     app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
-        response = client.post("/v1/ui/login", json={"token": "wrong"})
+        response = ui_login(client, "wrong")
 
     assert response.status_code == 401
+
+
+def test_ui_login_requires_same_origin(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    with TestClient(app) as client:
+        missing = client.post("/v1/ui/login", json={"token": "secret"})
+        cross_origin = ui_login(client, "secret", "https://attacker.example")
+        same_origin = ui_login(client, "secret")
+
+    assert missing.status_code == 403
+    assert cross_origin.status_code == 403
+    assert same_origin.status_code == 200
+
+
+def test_auth_failures_are_rate_limited_by_channel(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.auth_failure_limit = 2
+    settings.auth_lockout_seconds = 60
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        first_login = ui_login(client, "wrong-1")
+        blocked_login = ui_login(client, "wrong-2")
+        valid_login_while_blocked = ui_login(client, "secret")
+
+        first_bearer = client.get("/v1/health", headers=auth_headers("wrong-1"))
+        blocked_bearer = client.get("/v1/health", headers=auth_headers("wrong-2"))
+        valid_bearer_while_blocked = client.get(
+            "/v1/health",
+            headers=auth_headers("secret"),
+        )
+
+    assert first_login.status_code == 401
+    assert blocked_login.status_code == 429
+    assert valid_login_while_blocked.status_code == 429
+    assert int(blocked_login.headers["retry-after"]) > 0
+    assert first_bearer.status_code == 401
+    assert blocked_bearer.status_code == 429
+    assert valid_bearer_while_blocked.status_code == 429
+    assert int(blocked_bearer.headers["retry-after"]) > 0
+
+
+def test_auth_source_uses_unspoofable_end_of_trusted_proxy_chain():
+    request = Request(
+        {
+            "type": "http",
+            "client": ("192.168.0.1", 12345),
+            "headers": [
+                (b"x-forwarded-for", b"203.0.113.66, 198.51.100.8"),
+            ],
+        }
+    )
+    untrusted_request = Request(
+        {
+            "type": "http",
+            "client": ("198.51.100.9", 12345),
+            "headers": [
+                (b"x-forwarded-for", b"203.0.113.66"),
+            ],
+        }
+    )
+
+    assert auth_source(request, frozenset({"192.168.0.1"})) == "198.51.100.8"
+    assert auth_source(untrusted_request, frozenset({"192.168.0.1"})) == "198.51.100.9"
 
 
 def test_ui_login_sets_http_only_session_cookie(tmp_path):
     app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
-        response = client.post("/v1/ui/login", json={"token": "secret"})
+        response = ui_login(client, "secret")
         cookie_value = client.cookies.get(UI_COOKIE_NAME)
 
     set_cookie = response.headers.get("set-cookie", "")
@@ -132,11 +276,24 @@ def test_ui_login_sets_http_only_session_cookie(tmp_path):
     assert "token" not in payload
 
 
+def test_https_public_origin_enables_secure_ui_cookie(tmp_path, monkeypatch):
+    monkeypatch.delenv("RELAY_UI_COOKIE_SECURE", raising=False)
+    settings = make_settings(tmp_path)
+    settings.public_origin = "https://relay.example"
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = ui_login(client, "secret", "https://relay.example")
+
+    assert response.status_code == 200
+    assert "Secure" in response.headers.get("set-cookie", "")
+
+
 def test_logged_in_user_can_access_ui_and_health_without_authorization_header(tmp_path):
     app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
         denied = client.get("/v1/health")
-        login = client.post("/v1/ui/login", json={"token": "secret"})
+        login = ui_login(client, "secret")
         ui_responses = [client.get(path, follow_redirects=False) for path in ("/", "/ui", "/admin")]
         health = client.get("/v1/health")
 
@@ -159,11 +316,14 @@ def test_ui_session_returns_false_when_not_logged_in(tmp_path):
 def test_ui_logout_removes_session_cookie(tmp_path):
     app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
-        login = client.post("/v1/ui/login", json={"token": "secret"})
+        login = ui_login(client, "secret")
         assert login.status_code == 200
         assert client.get("/v1/health").status_code == 200
 
-        logout = client.post("/v1/ui/logout")
+        logout = client.post(
+            "/v1/ui/logout",
+            headers={"Origin": "http://testserver"},
+        )
         denied = client.get("/v1/health")
 
     assert logout.status_code == 200
@@ -177,7 +337,7 @@ def test_tampered_or_expired_ui_session_is_rejected(tmp_path):
     expired_cookie = create_ui_session_cookie(app.state.settings, app.state.auth_store, principal, -1)
 
     with TestClient(app) as client:
-        login = client.post("/v1/ui/login", json={"token": "secret"})
+        login = ui_login(client, "secret")
         assert login.status_code == 200
         cookie_value = client.cookies.get(UI_COOKIE_NAME)
         tampered_cookie = f"{cookie_value[:-1]}{'A' if cookie_value[-1] != 'A' else 'B'}"
@@ -196,7 +356,7 @@ def test_tampered_or_expired_ui_session_is_rejected(tmp_path):
 def test_existing_bearer_auth_still_works_and_takes_priority(tmp_path):
     app = create_app(make_settings(tmp_path))
     with TestClient(app) as client:
-        login = client.post("/v1/ui/login", json={"token": "secret"})
+        login = ui_login(client, "secret")
         bad_bearer = client.get("/v1/health", headers=auth_headers("wrong"))
         good_bearer = client.get("/v1/health", headers=auth_headers("secret"))
 
@@ -212,11 +372,16 @@ def test_multi_user_key_permissions_work_with_ui_cookie(tmp_path):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     with TestClient(app) as client:
-        login = client.post("/v1/ui/login", json={"token": "user-a-token"})
+        login = ui_login(client, "user-a-token")
         session = client.get("/v1/ui/session")
-        created = client.post("/v1/jobs", json=job_request_body(dataset_zip, kernel_zip))
+        created = client.post(
+            "/v1/jobs",
+            headers={"Origin": "http://testserver"},
+            json=job_request_body(dataset_zip, kernel_zip),
+        )
         forbidden = client.post(
             "/v1/jobs",
+            headers={"Origin": "http://testserver"},
             json=job_request_body(dataset_zip, kernel_zip, kaggle_key_id="kb"),
         )
         jobs = client.get("/v1/jobs")
@@ -240,7 +405,7 @@ def test_auth_config_is_filtered_and_does_not_return_secrets(tmp_path):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     with TestClient(app) as client:
-        login = client.post("/v1/ui/login", json={"token": "user-a-token"})
+        login = ui_login(client, "user-a-token")
         config = client.get("/v1/auth/config")
 
     body = config.json()
@@ -291,6 +456,114 @@ def test_admin_can_add_kaggle_key_and_relay_token(tmp_path):
     assert [key["id"] for key in new_user_config.json()["kaggle_keys"]] == ["kc"]
     assert "user-c-token-secret" not in new_user_config.text
     assert "carol-key" not in new_user_config.text
+
+
+def test_cookie_auth_mutations_require_same_origin_and_session_survives_update(tmp_path):
+    app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
+    token_body = {
+        "id": "user-c",
+        "token": "user-c-token-secret",
+        "allowed_kaggle_key_ids": ["ka"],
+    }
+
+    with TestClient(app) as client:
+        login = ui_login(client, "admin-token")
+        missing_origin = client.post("/v1/auth/relay-tokens", json=token_body)
+        cross_origin = client.post(
+            "/v1/auth/relay-tokens",
+            headers={"Origin": "https://attacker.example"},
+            json=token_body,
+        )
+        same_origin = client.post(
+            "/v1/auth/relay-tokens",
+            headers={"Origin": "http://testserver"},
+            json=token_body,
+        )
+        session_after_update = client.get("/v1/auth/config")
+        bearer_without_origin = client.post(
+            "/v1/auth/relay-tokens",
+            headers=auth_headers("admin-token"),
+            json={
+                "id": "user-d",
+                "token": "user-d-token-secret",
+                "allowed_kaggle_key_ids": ["kb"],
+            },
+        )
+
+    assert login.status_code == 200
+    assert missing_origin.status_code == 403
+    assert cross_origin.status_code == 403
+    assert same_origin.status_code == 200
+    assert session_after_update.status_code == 200
+    assert session_after_update.json()["principal_id"] == "admin"
+    assert bearer_without_origin.status_code == 200
+
+
+def test_dedicated_management_token_is_only_admin_and_survives_config_updates(tmp_path):
+    management_token = "custom-management-token"
+    app = create_app(
+        make_auth_config_settings(
+            tmp_path,
+            multi_key_auth_config(),
+            admin_token=management_token,
+        )
+    )
+
+    with TestClient(app) as client:
+        login = ui_login(client, management_token)
+        management_config = client.get("/v1/auth/config")
+        former_admin_config = client.get(
+            "/v1/auth/config",
+            headers=auth_headers("admin-token"),
+        )
+        denied = client.post(
+            "/v1/auth/kaggle-keys",
+            headers=auth_headers("admin-token"),
+            json={"id": "kc", "username": "carol", "key": "carol-key"},
+        )
+        add_key = client.post(
+            "/v1/auth/kaggle-keys",
+            headers=auth_headers(management_token),
+            json={"id": "kc", "username": "carol", "key": "carol-key"},
+        )
+        add_token = client.post(
+            "/v1/auth/relay-tokens",
+            headers=auth_headers(management_token),
+            json={
+                "id": "user-c",
+                "token": "user-c-token-secret",
+                "allowed_kaggle_key_ids": ["kc"],
+            },
+        )
+        management_after_updates = client.get("/v1/auth/config")
+        new_user_health = client.get(
+            "/v1/health",
+            headers=auth_headers("user-c-token-secret"),
+        )
+
+    saved_config = (tmp_path / "auth.json").read_text(encoding="utf-8")
+    management_principal = next(
+        token
+        for token in management_config.json()["relay_tokens"]
+        if token["id"] == "management-key"
+    )
+
+    assert login.status_code == 200
+    assert login.json()["principal_id"] == "management-key"
+    assert management_config.status_code == 200
+    assert management_config.json()["can_manage_auth"] is True
+    assert management_config.json()["management_token_configured"] is True
+    assert management_principal["management"] is True
+    assert management_token not in management_config.text
+    assert former_admin_config.status_code == 200
+    assert former_admin_config.json()["can_manage_auth"] is False
+    assert denied.status_code == 403
+    assert add_key.status_code == 200
+    assert add_token.status_code == 200
+    assert management_after_updates.status_code == 200
+    assert management_after_updates.json()["can_manage_auth"] is True
+    assert new_user_health.status_code == 200
+    assert management_token not in saved_config
 
 
 def test_admin_can_update_existing_kaggle_key_without_reentering_secret(tmp_path):

@@ -1254,6 +1254,7 @@
             <div class="muted">
               <strong>${escapeHtml(token.id)}</strong>
               ${token.current ? '<span class="pill ok">当前</span>' : ""}
+              ${token.management ? '<span class="pill warn">管理密钥</span>' : ""}
               <br />允许：${escapeHtml(formatAllowed(token.allowed_kaggle_key_ids))}
             </div>
           `).join("") || '<div class="muted">无</div>'}

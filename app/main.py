@@ -9,6 +9,7 @@ import shutil
 import threading
 import time
 import uuid
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, get_args
@@ -26,7 +27,7 @@ from app.archive import (
 from app.auth_config import AuthConfigError, AuthSelectionError, AuthStore, RelayPrincipal, bearer_token
 from app.config import Settings
 from app.database import RelayDb
-from app.kaggle_adapter import KaggleAdapter
+from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted
 from app.schemas import (
     ChunkResponse,
     CreateKaggleKeyRequest,
@@ -39,7 +40,12 @@ from app.schemas import (
     UiLoginRequest,
     UpdateKaggleKeyRequest,
 )
-from app.security import redact_secrets
+from app.security import (
+    AuthFailureLimiter,
+    auth_source,
+    is_same_origin_request,
+    redact_secrets,
+)
 from app.ui_auth import (
     authenticate_ui_session,
     create_ui_session_cookie,
@@ -74,6 +80,19 @@ RUNNING_JOB_STATUSES = {
     "downloading_output",
 }
 ACTIVE_JOB_STATUSES = JOB_STATUS_VALUES - TERMINAL_JOB_STATUSES
+UNSAFE_HTTP_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+class JobLockedFileResponse(FileResponse):
+    def __init__(self, *args, job_lock: asyncio.Lock, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.job_lock = job_lock
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.job_lock.release()
 
 
 def get_settings(request: Request) -> Settings:
@@ -88,6 +107,31 @@ def get_auth_store(request: Request) -> AuthStore:
     return request.app.state.auth_store
 
 
+def auth_limit_key(request: Request, channel: str) -> str:
+    trusted_proxy_ips = request.app.state.settings.trusted_proxy_ips
+    return f"{channel}:{auth_source(request, trusted_proxy_ips)}"
+
+
+def reject_if_auth_blocked(limiter: AuthFailureLimiter, key: str) -> None:
+    retry_after = limiter.retry_after(key)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="too many authentication failures",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def record_auth_failure(limiter: AuthFailureLimiter, key: str) -> None:
+    retry_after = limiter.record_failure(key)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="too many authentication failures",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
 async def require_auth(
     request: Request,
     authorization: str = Header(default=""),
@@ -96,13 +140,23 @@ async def require_auth(
 ) -> RelayPrincipal:
     token = bearer_token(authorization)
     if token:
+        limiter = request.app.state.auth_failure_limiter
+        limit_key = auth_limit_key(request, "bearer")
+        reject_if_auth_blocked(limiter, limit_key)
         principal = auth_store.authenticate_token(token)
         if principal:
+            limiter.clear(limit_key)
             return principal
+        record_auth_failure(limiter, limit_key)
         raise HTTPException(status_code=401, detail="unauthorized")
 
     principal = authenticate_ui_session(request, settings, auth_store)
     if principal:
+        if request.method.upper() in UNSAFE_HTTP_METHODS and not is_same_origin_request(
+            request,
+            settings.public_origin,
+        ):
+            raise HTTPException(status_code=403, detail="same-origin request required")
         return principal
     raise HTTPException(status_code=401, detail="unauthorized")
 
@@ -273,6 +327,7 @@ def public_relay_tokens(auth_store: AuthStore, principal: RelayPrincipal) -> lis
                 "id": token_principal.id,
                 "allowed_kaggle_key_ids": allowed,
                 "current": token_principal.id == principal.id,
+                "management": token_principal.management_admin,
             }
         )
     return tokens
@@ -285,7 +340,8 @@ def auth_config_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dic
         "principal_id": principal.id,
         "current_token_id": principal.id,
         "allowed_kaggle_key_ids": allowed_key_ids,
-        "can_manage_auth": principal.allow_all_keys and not auth_store.legacy,
+        "can_manage_auth": principal.management_admin and not auth_store.legacy,
+        "management_token_configured": auth_store.management_token_configured,
         "relay_tokens": public_relay_tokens(auth_store, principal),
         "kaggle_keys": public_kaggle_keys(auth_store, principal),
     }
@@ -497,7 +553,7 @@ def session_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
 def require_config_admin(settings: Settings, principal: RelayPrincipal) -> Path:
     if not settings.auth_config_path:
         raise HTTPException(status_code=400, detail="RELAY_AUTH_CONFIG is required")
-    if not principal.allow_all_keys:
+    if not principal.management_admin:
         raise HTTPException(status_code=403, detail="admin permission is required")
     return Path(settings.auth_config_path)
 
@@ -518,13 +574,13 @@ def read_auth_config(path: Path) -> dict:
     return data
 
 
-def validate_and_write_auth_config(path: Path, data: dict) -> AuthStore:
+def validate_and_write_auth_config(path: Path, data: dict, admin_token: str = "") -> AuthStore:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     try:
         tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.chmod(tmp_path, 0o600)
-        new_store = AuthStore.from_file(tmp_path)
+        new_store = AuthStore.from_file(tmp_path, admin_token=admin_token)
         os.replace(tmp_path, path)
         os.chmod(path, 0o600)
         return new_store
@@ -571,7 +627,7 @@ def add_kaggle_key_config(settings: Settings, principal: RelayPrincipal, payload
         if any(str(item.get("id", "")).strip() == key_id for item in data["kaggle_keys"] if isinstance(item, dict)):
             raise HTTPException(status_code=409, detail="kaggle key id already exists")
         data["kaggle_keys"].append(entry)
-        return validate_and_write_auth_config(path, data)
+        return validate_and_write_auth_config(path, data, settings.admin_token)
 
 
 def update_kaggle_key_config(
@@ -622,7 +678,7 @@ def update_kaggle_key_config(
             raise HTTPException(status_code=400, detail="kaggle credentials are required")
 
         data["kaggle_keys"][index] = existing
-        return validate_and_write_auth_config(path, data)
+        return validate_and_write_auth_config(path, data, settings.admin_token)
 
 
 def add_relay_token_config(settings: Settings, principal: RelayPrincipal, payload: CreateRelayTokenRequest) -> AuthStore:
@@ -647,7 +703,7 @@ def add_relay_token_config(settings: Settings, principal: RelayPrincipal, payloa
                 "allowed_kaggle_key_ids": allowed,
             }
         )
-        return validate_and_write_auth_config(path, data)
+        return validate_and_write_auth_config(path, data, settings.admin_token)
 
 
 def authorize_job_callback(job: dict, authorization: str, auth_store: AuthStore) -> bool:
@@ -686,41 +742,61 @@ def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest)
     clean_message = redact_secrets(callback_log_message(data))[-8000:]
     if clean_message:
         db.append_log(job["job_id"], clean_message)
-    updates = {
-        "kernel_status": json.dumps(data, ensure_ascii=False, sort_keys=True),
-        "kaggle_output": clean_message[-4000:],
-        "progress": progress_from_callback(job, payload),
-    }
-    if job["status"] not in TERMINAL_JOB_STATUSES:
-        updates["status"] = "cancel_requested" if job.get("cancel_requested_at") else "waiting_kernel"
-    db.update_job(job["job_id"], **updates)
+    for _attempt in range(5):
+        current = db.get_job(job["job_id"])
+        if not current:
+            return
+        updates = {
+            "kernel_status": json.dumps(data, ensure_ascii=False, sort_keys=True),
+            "kaggle_output": clean_message[-4000:],
+            "progress": progress_from_callback(current, payload),
+        }
+        if current["status"] not in TERMINAL_JOB_STATUSES:
+            updates["status"] = (
+                "cancel_requested"
+                if current.get("cancel_requested_at")
+                else "waiting_kernel"
+            )
+        if db.update_job_if_status(
+            job["job_id"],
+            {current["status"]},
+            **updates,
+        ):
+            return
+    raise RuntimeError("job status changed repeatedly while applying progress callback")
 
 
 def request_job_cancel(db: RelayDb, job: dict) -> None:
-    status = str(job.get("status") or "")
-    if status in {"complete", "failed"}:
-        raise HTTPException(status_code=409, detail=f"job is already {status}")
-    if status in {"cancel_requested", "canceled"}:
-        return
+    for _attempt in range(5):
+        status = str(job.get("status") or "")
+        if status in {"complete", "failed"}:
+            raise HTTPException(status_code=409, detail=f"job is already {status}")
+        if status in {"cancel_requested", "canceled"}:
+            return
 
-    stamp = time.time()
-    reason = "cancel requested"
-    updates = {
-        "cancel_requested_at": stamp,
-        "cancel_reason": reason,
-        "error": "",
-    }
-    if status == "receiving":
-        updates.update(
-            {
-                "status": "canceled",
-                "error": "canceled before submission",
-            }
-        )
-    else:
-        updates["status"] = "cancel_requested"
-    db.update_job(job["job_id"], **updates)
-    db.append_log(job["job_id"], reason)
+        stamp = time.time()
+        reason = "cancel requested"
+        updates = {
+            "cancel_requested_at": stamp,
+            "cancel_reason": reason,
+            "error": "",
+        }
+        if status in {"receiving", "assembling", "queued"}:
+            updates.update(
+                {
+                    "status": "canceled",
+                    "error": "canceled before submission",
+                }
+            )
+        else:
+            updates["status"] = "cancel_requested"
+        if db.update_job_if_status(job["job_id"], {status}, **updates):
+            db.append_log(job["job_id"], reason)
+            return
+        job = db.get_job(job["job_id"])
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+    raise HTTPException(status_code=409, detail="job status changed; retry cancellation")
 
 
 def assemble_and_validate_job(settings: Settings, db: RelayDb, auth_store: AuthStore, job: dict) -> None:
@@ -974,37 +1050,121 @@ def normalize_queue_item(item) -> dict:
     return {"action": "process", "job_id": item}
 
 
+def job_submission_lock(app: FastAPI, job_id: str) -> asyncio.Lock:
+    lock = app.state.job_submission_locks.get(job_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        app.state.job_submission_locks[job_id] = lock
+    return lock
+
+
 def mark_worker_exception(db: RelayDb, job_id: str, exc: Exception) -> None:
     message = redact_secrets(str(exc))
     db.append_log(job_id, f"worker action failed: {message}")
     job = db.get_job(job_id)
     if job and job.get("status") not in TERMINAL_JOB_STATUSES:
-        db.update_job(job_id, status="failed", progress=0, error=message)
+        db.finalize_job(job_id, "failed", progress=0, error=message)
 
 
-async def worker_loop(app: FastAPI) -> None:
+async def run_thread_to_completion(
+    app: FastAPI,
+    operation,
+    *args,
+) -> tuple[bool, BaseException | None]:
+    thread_task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    app.state.worker_thread_tasks.add(thread_task)
+    was_cancelled = False
+    try:
+        while True:
+            try:
+                await asyncio.shield(thread_task)
+                break
+            except asyncio.CancelledError:
+                was_cancelled = True
+                LOGGER.info("waiting for in-flight thread operation to finish")
+            except BaseException:
+                break
+        try:
+            thread_task.result()
+        except BaseException as exc:
+            return was_cancelled, exc
+        return was_cancelled, None
+    finally:
+        app.state.worker_thread_tasks.discard(thread_task)
+
+
+async def run_worker_item(app: FastAPI, item: dict) -> None:
+    job_id = item["job_id"]
+    action = item.get("action", "process")
+    if action == "resume_kernel":
+        args = (
+            app.state.settings,
+            app.state.db,
+            job_id,
+            app.state.auth_store,
+            item.get("final_status"),
+        )
+        operation = resume_kernel_job
+    else:
+        args = (
+            app.state.settings,
+            app.state.db,
+            job_id,
+            app.state.auth_store,
+        )
+        operation = process_job
+
+    was_cancelled, operation_error = await run_thread_to_completion(
+        app,
+        operation,
+        *args,
+    )
+    if operation_error is not None:
+        if was_cancelled and isinstance(operation_error, KaggleAdapterInterrupted):
+            raise asyncio.CancelledError
+        if was_cancelled and isinstance(operation_error, Exception):
+            mark_worker_exception(app.state.db, job_id, operation_error)
+            raise asyncio.CancelledError
+        raise operation_error
+    if was_cancelled:
+        raise asyncio.CancelledError
+
+
+def queue_item_expected_statuses(item: dict) -> set[str]:
+    if item.get("action") == "resume_kernel":
+        return {
+            "pushing_kernel",
+            "waiting_kernel",
+            "downloading_output",
+            "cancel_requested",
+        }
+    return {"queued"}
+
+
+async def worker_loop(app: FastAPI, worker_index: int = 0) -> None:
+    LOGGER.info("relay worker %s started", worker_index)
     while True:
         item = normalize_queue_item(await app.state.queue.get())
         job_id = item["job_id"]
+        job = app.state.db.get_job(job_id)
+        expected_statuses = queue_item_expected_statuses(item)
+        if not job or job.get("status") not in expected_statuses:
+            LOGGER.warning(
+                "skipping stale queued item for job %s in status %s",
+                job_id,
+                job.get("status") if job else "missing",
+            )
+            app.state.queue.task_done()
+            continue
+        if job_id in app.state.active_job_ids:
+            LOGGER.warning("skipping duplicate queued item for active job %s", job_id)
+            app.state.queue.task_done()
+            continue
+        app.state.active_job_ids.add(job_id)
         try:
-            action = item.get("action", "process")
-            if action == "resume_kernel":
-                await asyncio.to_thread(
-                    resume_kernel_job,
-                    app.state.settings,
-                    app.state.db,
-                    job_id,
-                    app.state.auth_store,
-                    item.get("final_status"),
-                )
-            else:
-                await asyncio.to_thread(
-                    process_job,
-                    app.state.settings,
-                    app.state.db,
-                    job_id,
-                    app.state.auth_store,
-                )
+            await run_worker_item(app, item)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             LOGGER.error(
                 "worker action failed for job %s (%s): %s",
@@ -1014,25 +1174,49 @@ async def worker_loop(app: FastAPI) -> None:
             )
             mark_worker_exception(app.state.db, job_id, exc)
         finally:
+            app.state.active_job_ids.discard(job_id)
             app.state.queue.task_done()
 
 
-def cleanup_expired(settings: Settings, db: RelayDb) -> None:
+def cleanup_expired_job(settings: Settings, db: RelayDb, job_id: str) -> None:
+    shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
+    shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
+    db.update_job(
+        job_id,
+        artifact_path="",
+        kaggle_output="expired by relay retention cleanup",
+    )
+    db.append_log(job_id, "expired by relay retention cleanup")
+
+
+async def cleanup_expired_jobs(app: FastAPI) -> None:
+    settings = app.state.settings
+    db = app.state.db
     cutoff = time.time() - settings.retention_hours * 60 * 60
     for job_id in db.completed_before(cutoff):
-        shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
-        shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
-        db.update_job(
-            job_id,
-            artifact_path="",
-            kaggle_output="expired by relay retention cleanup",
-        )
-        db.append_log(job_id, "expired by relay retention cleanup")
+        async with job_submission_lock(app, job_id):
+            was_cancelled, operation_error = await run_thread_to_completion(
+                app,
+                cleanup_expired_job,
+                settings,
+                db,
+                job_id,
+            )
+        if operation_error is not None:
+            if was_cancelled:
+                LOGGER.error(
+                    "cleanup failed during shutdown: %s",
+                    redact_secrets(str(operation_error)),
+                )
+                raise asyncio.CancelledError
+            raise operation_error
+        if was_cancelled:
+            raise asyncio.CancelledError
 
 
 async def cleanup_loop(app: FastAPI) -> None:
     while True:
-        await asyncio.to_thread(cleanup_expired, app.state.settings, app.state.db)
+        await cleanup_expired_jobs(app)
         await asyncio.sleep(60 * 60)
 
 
@@ -1044,18 +1228,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.worker_task = asyncio.create_task(worker_loop(app))
-        app.state.cleanup_task = asyncio.create_task(cleanup_loop(app))
         await recover_incomplete_jobs(app)
+        app.state.worker_tasks = [
+            asyncio.create_task(worker_loop(app, worker_index=index))
+            for index in range(settings.worker_count)
+        ]
+        app.state.worker_task = app.state.worker_tasks[0]
+        app.state.cleanup_task = asyncio.create_task(cleanup_loop(app))
         try:
             yield
         finally:
-            app.state.worker_task.cancel()
+            app.state.shutdown_event.set()
+            for worker_task in app.state.worker_tasks:
+                worker_task.cancel()
             app.state.cleanup_task.cancel()
-            try:
-                await app.state.worker_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(*app.state.worker_tasks, return_exceptions=True)
             try:
                 await app.state.cleanup_task
             except asyncio.CancelledError:
@@ -1065,7 +1252,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.db = RelayDb(settings.db_path)
     app.state.auth_store = AuthStore.from_settings(settings)
+    app.state.auth_failure_limiter = AuthFailureLimiter(
+        settings.auth_failure_limit,
+        settings.auth_failure_window_seconds,
+        settings.auth_lockout_seconds,
+    )
     app.state.queue = asyncio.Queue()
+    app.state.worker_tasks = []
+    app.state.worker_task = None
+    app.state.worker_thread_tasks = set()
+    app.state.active_job_ids = set()
+    app.state.shutdown_event = threading.Event()
+    settings._shutdown_event = app.state.shutdown_event
+    app.state.job_submission_locks = weakref.WeakValueDictionary()
 
     def static_file(name: str) -> Path:
         return Path(__file__).parent / "static" / name
@@ -1111,12 +1310,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/ui/login")
     def ui_login(
         payload: UiLoginRequest,
+        request: Request,
         settings: Settings = Depends(get_settings),
         auth_store: AuthStore = Depends(get_auth_store),
     ) -> JSONResponse:
+        if not is_same_origin_request(request, settings.public_origin):
+            raise HTTPException(status_code=403, detail="same-origin request required")
+        limiter = request.app.state.auth_failure_limiter
+        limit_key = auth_limit_key(request, "ui-login")
+        reject_if_auth_blocked(limiter, limit_key)
         principal = auth_store.authenticate_token(payload.token.strip())
         if not principal:
+            record_auth_failure(limiter, limit_key)
             raise HTTPException(status_code=401, detail="invalid token")
+        limiter.clear(limit_key)
         max_age = ui_session_max_age_seconds()
         response = JSONResponse(
             {
@@ -1129,13 +1336,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             response,
             create_ui_session_cookie(settings, auth_store, principal, max_age),
             max_age,
+            settings,
         )
         return response
 
     @app.post("/v1/ui/logout")
-    def ui_logout() -> JSONResponse:
+    def ui_logout(
+        settings: Settings = Depends(get_settings),
+        _principal: RelayPrincipal = Depends(require_auth),
+    ) -> JSONResponse:
         response = JSONResponse({"ok": True})
-        delete_ui_session_cookie(response)
+        delete_ui_session_cookie(response, settings)
         return response
 
     @app.get("/v1/ui/session")
@@ -1312,88 +1523,131 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> ChunkResponse:
-        job = get_authorized_job(db, job_id, principal, auth_store)
-        total_size = job[f"{archive_type}_size"]
-        try:
-            validate_chunk_index(index, total_size, job["chunk_size"])
-        except ArchiveError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with job_submission_lock(request.app, job_id):
+            job = get_authorized_job(db, job_id, principal, auth_store)
+            if job["status"] != "receiving":
+                raise HTTPException(status_code=409, detail="job is no longer receiving chunks")
+            total_size = job[f"{archive_type}_size"]
+            try:
+                validate_chunk_index(index, total_size, job["chunk_size"])
+            except ArchiveError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        existing = db.get_chunk(job_id, archive_type, index)
-        chunk_dir = settings.jobs_dir / job_id / "chunks" / archive_type
-        chunk_path = chunk_dir / f"{index}.part"
-        if existing:
-            if existing["sha256"] == x_chunk_sha256 and existing["size"] == x_chunk_size and chunk_path.exists():
-                return ChunkResponse(
-                    job_id=job_id,
-                    archive_type=archive_type,
-                    index=index,
-                    size=x_chunk_size,
-                    sha256=x_chunk_sha256,
-                    duplicate=True,
-                )
-            raise HTTPException(status_code=409, detail="chunk already exists with different checksum")
+            existing = db.get_chunk(job_id, archive_type, index)
+            chunk_dir = settings.jobs_dir / job_id / "chunks" / archive_type
+            chunk_path = chunk_dir / f"{index}.part"
+            if existing:
+                if existing["sha256"] == x_chunk_sha256 and existing["size"] == x_chunk_size and chunk_path.exists():
+                    return ChunkResponse(
+                        job_id=job_id,
+                        archive_type=archive_type,
+                        index=index,
+                        size=x_chunk_size,
+                        sha256=x_chunk_sha256,
+                        duplicate=True,
+                    )
+                raise HTTPException(status_code=409, detail="chunk already exists with different checksum")
 
-        chunk_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = chunk_dir / f"{index}.tmp"
-        digest = hashlib.sha256()
-        size = 0
-        async with aiofiles.open(tmp_path, "wb") as handle:
-            async for part in request.stream():
-                size += len(part)
-                if size > x_chunk_size:
-                    await handle.close()
-                    tmp_path.unlink(missing_ok=True)
-                    raise HTTPException(status_code=400, detail="chunk larger than X-Chunk-Size")
-                digest.update(part)
-                await handle.write(part)
-        actual_sha = digest.hexdigest()
-        if size != x_chunk_size:
-            tmp_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail="chunk size mismatch")
-        if actual_sha.lower() != x_chunk_sha256.lower():
-            tmp_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail="chunk sha256 mismatch")
-        tmp_path.replace(chunk_path)
-        db.add_chunk(job_id, archive_type, index, size, actual_sha)
-        return ChunkResponse(
-            job_id=job_id,
-            archive_type=archive_type,
-            index=index,
-            size=size,
-            sha256=actual_sha,
-        )
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = chunk_dir / f"{index}.{uuid.uuid4().hex}.tmp"
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                async with aiofiles.open(tmp_path, "wb") as handle:
+                    async for part in request.stream():
+                        size += len(part)
+                        if size > x_chunk_size:
+                            raise HTTPException(status_code=400, detail="chunk larger than X-Chunk-Size")
+                        digest.update(part)
+                        await handle.write(part)
+                actual_sha = digest.hexdigest()
+                if size != x_chunk_size:
+                    raise HTTPException(status_code=400, detail="chunk size mismatch")
+                if actual_sha.lower() != x_chunk_sha256.lower():
+                    raise HTTPException(status_code=400, detail="chunk sha256 mismatch")
+                tmp_path.replace(chunk_path)
+                db.add_chunk(job_id, archive_type, index, size, actual_sha)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+            return ChunkResponse(
+                job_id=job_id,
+                archive_type=archive_type,
+                index=index,
+                size=size,
+                sha256=actual_sha,
+            )
 
     @app.post("/v1/jobs/{job_id}/complete", response_model=JobResponse)
     async def complete_job(
         job_id: str,
+        request: Request,
         settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
-        request: Request = None,
     ) -> JobResponse:
-        job = get_authorized_job(db, job_id, principal, auth_store)
-        if job["status"] in RUNNING_JOB_STATUSES | {"complete", "canceled"}:
-            return job_response(db, job_id)
+        async with job_submission_lock(request.app, job_id):
+            job = get_authorized_job(db, job_id, principal, auth_store)
+            if job["status"] != "receiving":
+                return job_response(db, job_id)
 
-        db.update_job(job_id, status="assembling", progress=10)
-        try:
-            assemble_and_validate_job(settings, db, auth_store, job)
-        except Exception as exc:
-            db.update_job(job_id, status="failed", progress=0, error=redact_secrets(str(exc)))
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        db.update_job(job_id, status="queued", progress=15)
-        await request.app.state.queue.put({"action": "process", "job_id": job_id})
-        return job_response(db, job_id)
+            if not db.update_job_if_status(
+                job_id,
+                {"receiving"},
+                status="assembling",
+                progress=10,
+            ):
+                return job_response(db, job_id)
+            was_cancelled = False
+            try:
+                was_cancelled, operation_error = await run_thread_to_completion(
+                    request.app,
+                    assemble_and_validate_job,
+                    settings,
+                    db,
+                    auth_store,
+                    job,
+                )
+                if operation_error is not None:
+                    raise operation_error
+            except Exception as exc:
+                db.update_job_if_status(
+                    job_id,
+                    {"assembling"},
+                    status="failed",
+                    progress=0,
+                    error=redact_secrets(str(exc)),
+                )
+                if was_cancelled:
+                    raise asyncio.CancelledError from exc
+                raise HTTPException(
+                    status_code=400,
+                    detail=redact_secrets(str(exc)),
+                ) from exc
+            queued = db.update_job_if_status(
+                job_id,
+                {"assembling"},
+                status="queued",
+                progress=15,
+            )
+            if queued:
+                await request.app.state.queue.put({"action": "process", "job_id": job_id})
+            response = job_response(db, job_id)
+            if was_cancelled:
+                raise asyncio.CancelledError
+            return response
 
     @app.post("/v1/jobs/by-kernel/progress", response_model=JobResponse)
     def update_job_progress_by_kernel(
         payload: JobProgressRequest,
+        request: Request,
         authorization: str = Header(default=""),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
     ) -> JobResponse:
+        limiter = request.app.state.auth_failure_limiter
+        limit_key = auth_limit_key(request, "callback")
+        reject_if_auth_blocked(limiter, limit_key)
         kernel_ref = str(payload.model_extra.get("kernel_ref") or "").strip() if payload.model_extra else ""
         if not kernel_ref:
             raise HTTPException(status_code=400, detail="kernel_ref is required")
@@ -1418,8 +1672,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             None,
         )
         if not job:
+            record_auth_failure(limiter, limit_key)
             raise HTTPException(status_code=401, detail="unauthorized")
 
+        limiter.clear(limit_key)
         apply_progress_callback(db, job, payload)
         return job_response(db, job["job_id"])
 
@@ -1427,29 +1683,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_job_progress(
         job_id: str,
         payload: JobProgressRequest,
+        request: Request,
         authorization: str = Header(default=""),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
     ) -> JobResponse:
+        limiter = request.app.state.auth_failure_limiter
+        limit_key = auth_limit_key(request, "callback")
+        reject_if_auth_blocked(limiter, limit_key)
         job = db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
         if not authorize_job_callback(job, authorization, auth_store):
+            record_auth_failure(limiter, limit_key)
             raise HTTPException(status_code=401, detail="unauthorized")
 
+        limiter.clear(limit_key)
         apply_progress_callback(db, job, payload)
         return job_response(db, job_id)
 
     @app.post("/v1/jobs/{job_id}/cancel", response_model=JobResponse)
-    def cancel_job(
+    async def cancel_job(
         job_id: str,
+        request: Request,
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> JobResponse:
-        job = get_authorized_job(db, job_id, principal, auth_store)
-        request_job_cancel(db, job)
-        return job_response(db, job_id)
+        async with job_submission_lock(request.app, job_id):
+            job = get_authorized_job(db, job_id, principal, auth_store)
+            request_job_cancel(db, job)
+            return job_response(db, job_id)
 
     @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
     def get_job(
@@ -1462,37 +1726,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return job_response(db, job_id)
 
     @app.get("/v1/jobs/{job_id}/artifacts.zip")
-    def download_artifacts(
+    async def download_artifacts(
         job_id: str,
+        request: Request,
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> FileResponse:
-        job = get_authorized_job(db, job_id, principal, auth_store)
-        download = artifact_download_metadata(job)
-        if not download["can_download"]:
-            status_code = 404 if job["status"] in {"complete", "canceled"} and job.get("artifact_path") else 409
-            raise HTTPException(status_code=status_code, detail=download["download_unavailable_reason"])
-        artifact_path = Path(job["artifact_path"])
-        return FileResponse(
-            artifact_path,
-            media_type="application/zip",
-            filename=str(download["artifact_filename"]),
-        )
+        lock = job_submission_lock(request.app, job_id)
+        await lock.acquire()
+        try:
+            job = get_authorized_job(db, job_id, principal, auth_store)
+            download = artifact_download_metadata(job)
+            if not download["can_download"]:
+                status_code = (
+                    404
+                    if job["status"] in {"complete", "canceled"}
+                    and job.get("artifact_path")
+                    else 409
+                )
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=download["download_unavailable_reason"],
+                )
+            artifact_path = Path(job["artifact_path"])
+            return JobLockedFileResponse(
+                artifact_path,
+                job_lock=lock,
+                media_type="application/zip",
+                filename=str(download["artifact_filename"]),
+            )
+        except BaseException:
+            lock.release()
+            raise
 
     @app.delete("/v1/jobs/{job_id}")
-    def delete_job(
+    async def delete_job(
         job_id: str,
+        request: Request,
         settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> Response:
-        get_authorized_job(db, job_id, principal, auth_store)
-        shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
-        shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
-        db.update_job(job_id, status="failed", error="deleted")
-        return Response(status_code=204)
+        async with job_submission_lock(request.app, job_id):
+            job = get_authorized_job(db, job_id, principal, auth_store)
+            if job["status"] not in TERMINAL_JOB_STATUSES | {"receiving"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="cancel the active job before deleting it",
+                )
+            if job_id in request.app.state.active_job_ids:
+                raise HTTPException(status_code=409, detail="job worker is still active")
+            if not db.update_job_if_status(
+                job_id,
+                {job["status"]},
+                status="failed",
+                error="deleted",
+                artifact_path="",
+            ):
+                raise HTTPException(status_code=409, detail="job status changed; retry deletion")
+            shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
+            shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
+            return Response(status_code=204)
 
     return app
 

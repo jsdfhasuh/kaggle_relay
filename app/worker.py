@@ -1,17 +1,57 @@
 import json
+import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 from app.archive import ArchiveError, require_file
 from app.database import RelayDb
 from app.auth_config import AuthStore
-from app.kaggle_adapter import KaggleAdapter, is_ready_kaggle_status
+from app.kaggle_adapter import (
+    KaggleAdapter,
+    KaggleAdapterInterrupted,
+    is_ready_kaggle_status,
+)
 from app.security import redact_secrets
 
 TERMINAL_JOB_STATUSES = {"complete", "failed", "canceled"}
+_DATASET_SUBMISSION_LOCKS: dict[str, list] = {}
+_DATASET_SUBMISSION_LOCKS_GUARD = threading.Lock()
 
 
 class JobCanceled(Exception):
     pass
+
+
+@contextmanager
+def dataset_submission_lock(
+    dataset_ref: str,
+    shutdown_event: threading.Event | None = None,
+):
+    key = str(dataset_ref or "").strip().lower()
+    with _DATASET_SUBMISSION_LOCKS_GUARD:
+        entry = _DATASET_SUBMISSION_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _DATASET_SUBMISSION_LOCKS[key] = entry
+        entry[1] += 1
+    lock = entry[0]
+    acquired = False
+    try:
+        while not acquired:
+            if shutdown_event and shutdown_event.is_set():
+                raise KaggleAdapterInterrupted(
+                    "relay shutdown interrupted dataset submission wait"
+                )
+            acquired = lock.acquire(timeout=0.5) if shutdown_event else lock.acquire()
+        yield
+    finally:
+        if acquired:
+            lock.release()
+        with _DATASET_SUBMISSION_LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] == 0 and _DATASET_SUBMISSION_LOCKS.get(key) is entry:
+                _DATASET_SUBMISSION_LOCKS.pop(key, None)
 
 
 def is_ready_dataset_status(status: str) -> bool:
@@ -107,10 +147,23 @@ def job_log(db: RelayDb, job_id: str):
     return log
 
 
-def job_adapter(settings, db: RelayDb, job: dict, auth_store: AuthStore | None = None) -> KaggleAdapter:
+def job_adapter(
+    settings,
+    db: RelayDb,
+    job: dict,
+    auth_store: AuthStore | None = None,
+) -> KaggleAdapter:
     kaggle_key_id = job.get("kaggle_key_id", "")
     credentials = auth_store.credentials_for(kaggle_key_id) if auth_store else None
-    return KaggleAdapter(settings, job_log(db, job["job_id"]), credentials=credentials)
+    adapter = KaggleAdapter(
+        settings,
+        job_log(db, job["job_id"]),
+        credentials=credentials,
+    )
+    shutdown_event = getattr(settings, "_shutdown_event", None)
+    if shutdown_event is not None:
+        adapter.shutdown_event = shutdown_event
+    return adapter
 
 
 def rewrite_dataset_sources(metadata: dict, final_dataset_ref: str) -> bool:
@@ -258,22 +311,49 @@ def finish_kernel_job(
     def latest_job() -> dict:
         return db.get_job(job_id) or {}
 
-    def progress_callback(progress_data: dict) -> None:
-        current = latest_job()
-        remote_progress = float(progress_data.get("remote_progress", 0) or 0)
-        status = "cancel_requested" if job_cancel_requested(current) else "waiting_kernel"
-        db.update_job(
-            job_id,
-            status=status,
-            progress=max(float(current.get("progress") or 0), min(80, 60 + int(remote_progress / 100 * 20))),
-            kernel_status=json.dumps(progress_data, ensure_ascii=False),
+    def update_finish_status(
+        running_status: str,
+        values_for_job: Callable[[dict], dict],
+    ) -> dict:
+        for _attempt in range(5):
+            current = latest_job()
+            current_status = str(current.get("status") or "")
+            if not current_status or current_status in TERMINAL_JOB_STATUSES:
+                return current
+            status = (
+                "cancel_requested"
+                if job_cancel_requested(current)
+                else running_status
+            )
+            if db.update_job_if_status(
+                job_id,
+                {current_status},
+                status=status,
+                **values_for_job(current),
+            ):
+                return latest_job()
+        raise RuntimeError(
+            f"job {job_id} status changed repeatedly during {running_status} transition"
         )
 
-    current = latest_job()
-    db.update_job(
-        job_id,
-        status="cancel_requested" if job_cancel_requested(current) else "waiting_kernel",
-        progress=max(float(current.get("progress") or 0), 60),
+    def progress_callback(progress_data: dict) -> None:
+        remote_progress = float(progress_data.get("remote_progress", 0) or 0)
+        update_finish_status(
+            "waiting_kernel",
+            lambda current: {
+                "progress": max(
+                    float(current.get("progress") or 0),
+                    min(80, 60 + int(remote_progress / 100 * 20)),
+                ),
+                "kernel_status": json.dumps(progress_data, ensure_ascii=False),
+            },
+        )
+
+    current = update_finish_status(
+        "waiting_kernel",
+        lambda job: {
+            "progress": max(float(job.get("progress") or 0), 60),
+        },
     )
     kernel_ref = str(current.get("kernel_ref") or "")
     if not kernel_ref:
@@ -282,8 +362,12 @@ def finish_kernel_job(
     current = latest_job()
     db.update_job(job_id, kernel_status=kernel_status, progress=max(float(current.get("progress") or 0), 82))
 
-    current = latest_job()
-    db.update_job(job_id, status="downloading_output", progress=max(float(current.get("progress") or 0), 85))
+    current = update_finish_status(
+        "downloading_output",
+        lambda job: {
+            "progress": max(float(job.get("progress") or 0), 85),
+        },
+    )
     artifact_contract = str(current.get("artifact_contract") or "yolo")
     output = adapter.download_output(
         kernel_ref,
@@ -296,11 +380,9 @@ def finish_kernel_job(
         paths["artifact_zip"],
         artifact_contract=artifact_contract,
     )
-    current = latest_job()
-    status = final_status or ("canceled" if job_cancel_requested(current) else "complete")
-    db.update_job(
+    db.finalize_job(
         job_id,
-        status=status,
+        final_status or "complete",
         progress=100,
         artifact_path=str(paths["artifact_zip"]),
         error="",
@@ -321,7 +403,12 @@ def resume_kernel_job(
     finish_kernel_job(settings, db, job_id, adapter, final_status=final_status)
 
 
-def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None = None) -> None:
+def process_job(
+    settings,
+    db: RelayDb,
+    job_id: str,
+    auth_store: AuthStore | None = None,
+) -> None:
     job = db.get_job(job_id)
     if not job:
         return
@@ -345,79 +432,105 @@ def process_job(settings, db: RelayDb, job_id: str, auth_store: AuthStore | None
         if cancel_requested():
             raise JobCanceled(message)
 
+    def transition_before_submission(
+        expected_statuses: set[str],
+        status: str,
+        progress: float,
+    ) -> None:
+        if db.update_job_if_status(
+            job_id,
+            expected_statuses,
+            require_not_canceled=True,
+            status=status,
+            progress=progress,
+        ):
+            return
+        stop_if_cancel_requested()
+        current_status = str(latest_job().get("status") or "missing")
+        raise RuntimeError(
+            f"job {job_id} changed to {current_status} before {status} transition"
+        )
+
     try:
         credentials = auth_store.credentials_for(kaggle_key_id) if auth_store else None
         adapter = KaggleAdapter(settings, log, credentials=credentials)
-        stop_if_cancel_requested()
-        dataset_cache_hit = has_ready_dataset_cache(
-            db,
-            job["dataset_ref"],
-            job["payload_hash"],
-            kaggle_key_id=kaggle_key_id,
-        )
-        if dataset_cache_hit:
-            validate_kernel_payload(
-                kernel_dir,
-                job["kernel_ref"],
-                credentials,
-                dataset_ref=job["dataset_ref"],
-            )
-            db.update_job(job_id, dataset_status="ready", progress=40)
-            log(f"Reusing ready dataset cache for {job['dataset_ref']}")
-        else:
+        shutdown_event = getattr(settings, "_shutdown_event", None)
+        if shutdown_event is not None:
+            adapter.shutdown_event = shutdown_event
+        with dataset_submission_lock(job["dataset_ref"], shutdown_event):
             stop_if_cancel_requested()
-            validate_payloads(
-                dataset_dir,
-                kernel_dir,
+            dataset_cache_hit = has_ready_dataset_cache(
+                db,
                 job["dataset_ref"],
-                job["kernel_ref"],
-                credentials,
+                job["payload_hash"],
+                kaggle_key_id=kaggle_key_id,
             )
-            stop_if_cancel_requested()
-            db.update_job(job_id, status="uploading_dataset", progress=20)
-            adapter.upload_dataset(
-                dataset_dir,
-                job["dataset_ref"],
-                update_message=f"update relay dataset for {job['kernel_ref']}",
-            )
-
-            stop_if_cancel_requested()
-            db.update_job(job_id, status="waiting_dataset", progress=35)
-            dataset_status = adapter.wait_dataset(
-                job["dataset_ref"],
-                permission_grace_seconds=settings.dataset_status_permission_grace_seconds,
-            )
-            db.update_job(job_id, dataset_status=dataset_status, progress=40)
-            stop_if_cancel_requested()
-            if is_ready_dataset_status(dataset_status):
-                db.upsert_dataset_cache(
+            if dataset_cache_hit:
+                validate_kernel_payload(
+                    kernel_dir,
+                    job["kernel_ref"],
+                    credentials,
                     dataset_ref=job["dataset_ref"],
-                    payload_hash=job["payload_hash"],
-                    status="ready",
-                    dataset_status=dataset_status,
-                    source_job_id=job_id,
-                    kaggle_key_id=kaggle_key_id,
                 )
-                db.upsert_last_dataset_job(
-                    dataset_ref=job["dataset_ref"],
-                    payload_hash=job["payload_hash"],
-                    dataset_status=dataset_status,
-                    job_id=job_id,
-                    kaggle_key_id=kaggle_key_id,
+                db.update_job(job_id, dataset_status="ready", progress=40)
+                log(f"Reusing ready dataset cache for {job['dataset_ref']}")
+            else:
+                stop_if_cancel_requested()
+                validate_payloads(
+                    dataset_dir,
+                    kernel_dir,
+                    job["dataset_ref"],
+                    job["kernel_ref"],
+                    credentials,
+                )
+                transition_before_submission({"queued"}, "uploading_dataset", 20)
+                adapter.upload_dataset(
+                    dataset_dir,
+                    job["dataset_ref"],
+                    update_message=f"update relay dataset for {job['kernel_ref']}",
                 )
 
-        stop_if_cancel_requested()
-        db.update_job(job_id, status="pushing_kernel", progress=45)
-        push_output = adapter.push_kernel(kernel_dir)
-        log(push_output)
+                transition_before_submission({"uploading_dataset"}, "waiting_dataset", 35)
+                dataset_status = adapter.wait_dataset(
+                    job["dataset_ref"],
+                    permission_grace_seconds=settings.dataset_status_permission_grace_seconds,
+                )
+                db.update_job(job_id, dataset_status=dataset_status, progress=40)
+                stop_if_cancel_requested()
+                if is_ready_dataset_status(dataset_status):
+                    db.upsert_dataset_cache(
+                        dataset_ref=job["dataset_ref"],
+                        payload_hash=job["payload_hash"],
+                        status="ready",
+                        dataset_status=dataset_status,
+                        source_job_id=job_id,
+                        kaggle_key_id=kaggle_key_id,
+                    )
+                    db.upsert_last_dataset_job(
+                        dataset_ref=job["dataset_ref"],
+                        payload_hash=job["payload_hash"],
+                        dataset_status=dataset_status,
+                        job_id=job_id,
+                        kaggle_key_id=kaggle_key_id,
+                    )
+
+            transition_before_submission(
+                {"queued", "waiting_dataset"},
+                "pushing_kernel",
+                45,
+            )
+            push_output = adapter.push_kernel(kernel_dir)
+            log(push_output)
         finish_kernel_job(settings, db, job_id, adapter)
+    except KaggleAdapterInterrupted as exc:
+        db.append_log(job_id, redact_secrets(str(exc)))
     except JobCanceled as exc:
         message = redact_secrets(str(exc) or cancel_reason())
-        db.update_job(job_id, status="canceled", error=message)
+        db.finalize_job(job_id, "canceled", error=message)
         db.append_log(job_id, message)
     except Exception as exc:
         current = latest_job()
         message = structured_kernel_failure_error(current.get("kernel_status")) or str(exc)
         message = redact_secrets(message)
-        db.update_job(job_id, status="failed", progress=0, error=message)
+        db.finalize_job(job_id, "failed", progress=0, error=message)
         db.append_log(job_id, message)

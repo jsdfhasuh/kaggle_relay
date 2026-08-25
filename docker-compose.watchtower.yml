@@ -4,7 +4,7 @@ services:
     image: ${KAGGLE_RELAY_IMAGE:-ghcr.io/jsdfhasuh/kaggle_relay:latest}
     pull_policy: always
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     environment:

@@ -97,16 +97,16 @@
 <body>
   <main>
     <h1>Kaggle Relay 登录</h1>
-    <p>输入 Relay API Token。登录成功后由后端设置 HttpOnly Cookie，页面请求会自动使用同源登录态。</p>
+    <p>输入 Relay Token 或自定义管理密钥。登录成功后由后端设置 HttpOnly Cookie，页面请求会自动使用同源登录态。</p>
 
     <form id="loginForm">
-      <label for="token">Relay API Token</label>
+      <label for="token">Relay Token / 管理密钥</label>
       <input id="token" type="password" autocomplete="current-password" autofocus />
       <button id="loginButton" type="submit">登录</button>
       <div id="error" class="error" aria-live="polite"></div>
     </form>
 
-    <div class="hint">多用户模式下，可以使用配置文件中任一 relay token 登录；登录后只显示该 principal 有权访问的任务和 Kaggle Key。</div>
+    <div class="hint">管理密钥拥有账号和用户配置权限；普通 Relay Token 仅显示该用户有权访问的任务和 Kaggle Key。</div>
   </main>
 
   <script>
@@ -120,7 +120,7 @@
       errorBox.textContent = "";
       const token = tokenInput.value.trim();
       if (!token) {
-        errorBox.textContent = "请输入 Relay API Token";
+        errorBox.textContent = "请输入 Relay Token 或管理密钥";
         return;
       }
 
@@ -134,7 +134,9 @@
           body: JSON.stringify({token})
         });
         if (!response.ok) {
-          let message = "登录失败，请检查 token";
+          let message = response.status === 429
+            ? "登录失败次数过多，请稍后再试"
+            : "登录失败，请检查 token";
           try {
             const data = await response.json();
             message = data.detail || message;

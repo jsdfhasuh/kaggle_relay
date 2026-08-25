@@ -22,11 +22,17 @@ sha256sum "relay-data/backups/$BACKUP_NAME"
 
 保留输出的文件名和 SHA-256。部署失败需要回滚时，先停止 Relay，再恢复该备份；不要删除整个 `relay-data` 目录。
 
+生产 `.env` 应显式设置 `RELAY_WORKER_COUNT`、浏览器实际访问的
+`RELAY_PUBLIC_ORIGIN` 和 `RELAY_UI_COOKIE_SECURE=true`。反向代理需要传递
+客户端 IP 时，只把直接代理地址加入 `RELAY_TRUSTED_PROXY_IPS`。启用专用管理密钥时还必须同时设置
+`RELAY_AUTH_CONFIG` 与 `RELAY_ADMIN_TOKEN`；不要把这些变量的值输出到部署日志。
+
 部署后至少确认：
 
 ```bash
 docker compose exec -T kaggle-relay grep -n "recover_incomplete_jobs" /app/app/main.py
 docker compose exec -T kaggle-relay grep -n "resume_kernel_job" /app/app/worker.py
+docker compose logs kaggle-relay | grep "relay worker .* started"
 curl -i http://127.0.0.1:8000/v1/health
 ```
 

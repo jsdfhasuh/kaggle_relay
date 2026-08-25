@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import json
@@ -5,8 +6,10 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,13 +25,27 @@ os.environ.setdefault("RELAY_STORAGE_DIR", str(ROOT / ".test-relay-data"))
 from app.archive import ArchiveError
 from app.config import Settings
 from app.database import RelayDb
-from app.kaggle_adapter import KaggleAdapter, KaggleAdapterError
-from app.main import create_app
-from app.worker import process_job
+from app.kaggle_adapter import (
+    KaggleAdapter,
+    KaggleAdapterError,
+    KaggleAdapterInterrupted,
+)
+from app.main import (
+    JobLockedFileResponse,
+    cleanup_expired_jobs,
+    create_app,
+    run_thread_to_completion,
+)
+from app.worker import finish_kernel_job, process_job
 
 
-def make_settings(tmp_path: Path) -> Settings:
-    return Settings(api_token="secret", storage_dir=tmp_path, chunk_size=8)
+def make_settings(tmp_path: Path, worker_count: int = 1) -> Settings:
+    return Settings(
+        api_token="secret",
+        storage_dir=tmp_path,
+        chunk_size=8,
+        worker_count=worker_count,
+    )
 
 
 def make_auth_config_settings(tmp_path: Path, config: dict) -> Settings:
@@ -1137,6 +1154,99 @@ def test_complete_rejects_zip_path_traversal(tmp_path):
     assert "unsafe zip path" in response.json()["detail"]
 
 
+def test_concurrent_complete_assembles_and_queues_once(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "receiving")
+    calls = 0
+    calls_lock = threading.Lock()
+    request_barrier = threading.Barrier(3)
+
+    def fake_assemble(*_args, **_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.1)
+
+    monkeypatch.setattr("app.main.assemble_and_validate_job", fake_assemble)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+
+    with TestClient(app) as client:
+        responses = []
+
+        def submit_complete():
+            request_barrier.wait(timeout=5)
+            responses.append(
+                client.post(
+                    f"/v1/jobs/{job_id}/complete",
+                    headers=auth_headers(),
+                )
+            )
+
+        threads = [threading.Thread(target=submit_complete) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        request_barrier.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(response.status_code for response in responses) == [200, 200]
+    assert calls == 1
+    assert status["status"] == "queued"
+
+
+def test_failed_complete_is_idempotent_and_redacts_secrets(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "receiving")
+    calls = 0
+
+    def fail_assembly(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("archive exposed secret")
+
+    monkeypatch.setattr("app.main.assemble_and_validate_job", fail_assembly)
+
+    with TestClient(app) as client:
+        first = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        second = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+
+    assert first.status_code == 400
+    assert first.json()["detail"] == "archive exposed ***"
+    assert second.status_code == 200
+    assert second.json()["status"] == "failed"
+    assert "secret" not in second.text
+    assert calls == 1
+
+
+def test_chunk_upload_is_rejected_after_complete_submission(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    app = create_app(make_settings(tmp_path))
+    monkeypatch.setattr("app.main.assemble_and_validate_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        chunk = dataset_zip[:8]
+        upload = client.put(
+            f"/v1/jobs/{job_id}/archives/dataset/chunks/0",
+            headers=auth_headers(
+                {
+                    "X-Chunk-Sha256": hashlib.sha256(chunk).hexdigest(),
+                    "X-Chunk-Size": str(len(chunk)),
+                }
+            ),
+            content=chunk,
+        )
+
+    assert complete.status_code == 200
+    assert upload.status_code == 409
+
+
 def test_complete_runs_mock_worker_and_downloads_artifacts(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -1660,6 +1770,93 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
     assert status["dataset_status"] == "ready"
 
 
+def test_workers_serialize_shared_dataset_until_kernel_push(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b'{"id":"demo/data"}'})
+    kernel_zips = [
+        build_zip(
+            {
+                "kernel-metadata.json": json.dumps(
+                    {"id": f"demo/kernel-{index}", "code_file": "train.py"}
+                ).encode("utf-8"),
+                "train.py": b"print(1)",
+            }
+        )
+        for index in range(2)
+    ]
+    settings = make_settings(tmp_path)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    app = create_app(settings)
+    calls = {"upload_dataset": 0, "push_kernel": 0}
+    calls_lock = threading.Lock()
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            with calls_lock:
+                calls["upload_dataset"] += 1
+            time.sleep(0.1)
+
+        def wait_dataset(self, *_args, **_kwargs):
+            return "ready"
+
+        def push_kernel(self, _kernel_dir):
+            with calls_lock:
+                calls["push_kernel"] += 1
+            return "pushed"
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        job_ids = []
+        for index, kernel_zip in enumerate(kernel_zips):
+            job_id = create_job(
+                client,
+                dataset_zip,
+                kernel_zip,
+                payload_hash="shared-payload",
+                kernel_ref=f"demo/kernel-{index}",
+            )
+            upload_all(client, job_id, "dataset", dataset_zip)
+            upload_all(client, job_id, "kernel", kernel_zip)
+            complete = client.post(
+                f"/v1/jobs/{job_id}/complete",
+                headers=auth_headers(),
+            )
+            assert complete.status_code == 200
+            job_ids.append(job_id)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(process_job, settings, app.state.db, job_id)
+                for job_id in job_ids
+            ]
+            for future in futures:
+                future.result(timeout=5)
+
+        statuses = [
+            client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()["status"]
+            for job_id in job_ids
+        ]
+
+    assert calls == {"upload_dataset": 1, "push_kernel": 2}
+    assert statuses == ["complete", "complete"]
+
+
 def test_worker_uses_job_bound_kaggle_credentials(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b'{"id":"bob/data"}'})
     kernel_zip = build_zip({
@@ -1767,6 +1964,75 @@ def test_worker_cancels_queued_job_before_kaggle_push(tmp_path, monkeypatch):
     assert status["can_download"] is False
 
 
+def test_worker_does_not_resurrect_cancel_during_upload_transition(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    job_id = seed_job(app, "queued", progress=15)
+    dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
+    kernel_dir = settings.jobs_dir / job_id / "extracted" / "kernel"
+    dataset_dir.mkdir(parents=True)
+    kernel_dir.mkdir(parents=True)
+    (dataset_dir / "dataset-metadata.json").write_text(
+        json.dumps({"id": "demo/data"}),
+        encoding="utf-8",
+    )
+    (kernel_dir / "kernel-metadata.json").write_text(
+        json.dumps({"id": "demo/kernel", "code_file": "train.py"}),
+        encoding="utf-8",
+    )
+    (kernel_dir / "train.py").write_text("print(1)\n", encoding="utf-8")
+    calls = {"upload_dataset": 0}
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            calls["upload_dataset"] += 1
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+    original_update = app.state.db.update_job_if_status
+    cancel_injected = False
+
+    def update_with_cancel(
+        queued_job_id,
+        expected_statuses,
+        *,
+        require_not_canceled=False,
+        **values,
+    ):
+        nonlocal cancel_injected
+        if (
+            require_not_canceled
+            and values.get("status") == "uploading_dataset"
+            and not cancel_injected
+        ):
+            cancel_injected = True
+            assert original_update(
+                queued_job_id,
+                {"queued"},
+                status="canceled",
+                cancel_requested_at=time.time(),
+                cancel_reason="cancel requested",
+            )
+        return original_update(
+            queued_job_id,
+            expected_statuses,
+            require_not_canceled=require_not_canceled,
+            **values,
+        )
+
+    monkeypatch.setattr(app.state.db, "update_job_if_status", update_with_cancel)
+
+    process_job(settings, app.state.db, job_id)
+    job = app.state.db.get_job(job_id)
+
+    assert cancel_injected is True
+    assert calls == {"upload_dataset": 0}
+    assert job["status"] == "canceled"
+    assert job["cancel_requested_at"] is not None
+
+
 def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -1825,6 +2091,69 @@ def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_pat
     assert download.status_code == 200
     with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
         assert archive.namelist() == ["checkpoint.pt"]
+
+
+def test_finish_kernel_job_does_not_overwrite_concurrent_cancel(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    job_id = seed_job(app, "waiting_kernel", progress=60)
+    db = app.state.db
+    original_get = db.get_job
+    original_update = db.update_job
+    original_update_if_status = db.update_job_if_status
+    state = {"armed": False, "injected": False}
+    invalid_status_updates = []
+
+    def get_with_cancel_injection(queued_job_id):
+        job = original_get(queued_job_id)
+        if state["armed"] and not state["injected"]:
+            state["injected"] = True
+            assert original_update_if_status(
+                queued_job_id,
+                {job["status"]},
+                status="cancel_requested",
+                cancel_requested_at=time.time(),
+                cancel_reason="cancel requested",
+            )
+        return job
+
+    def monitored_update(queued_job_id, **values):
+        current = original_get(queued_job_id)
+        status = values.get("status")
+        if (
+            current.get("cancel_requested_at") is not None
+            and status not in {None, "cancel_requested", "canceled"}
+        ):
+            invalid_status_updates.append(status)
+        return original_update(queued_job_id, **values)
+
+    monkeypatch.setattr(db, "get_job", get_with_cancel_injection)
+    monkeypatch.setattr(db, "update_job", monitored_update)
+
+    class FakeAdapter:
+        def wait_kernel(self, _kernel_ref, progress_callback):
+            state["armed"] = True
+            progress_callback({"epoch": 1, "epochs": 2, "remote_progress": 50})
+            state["armed"] = False
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    finish_kernel_job(settings, db, job_id, FakeAdapter())
+    job = original_get(job_id)
+
+    assert state["injected"] is True
+    assert invalid_status_updates == []
+    assert job["status"] == "canceled"
+    assert job["artifact_path"]
 
 
 @pytest.mark.parametrize("initial_status", ["waiting_kernel", "downloading_output"])
@@ -2154,6 +2483,194 @@ def test_worker_loop_marks_failed_and_continues_after_exception(tmp_path, monkey
     assert second_status["status"] == "complete"
 
 
+def test_worker_loop_runs_jobs_concurrently_when_configured(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path, worker_count=2))
+    first_id = seed_job(app, "queued", progress=15, job_id="firstparalleljob000000000000000")
+    second_id = seed_job(app, "queued", progress=15, job_id="secondparalleljob00000000000000")
+    state_lock = threading.Lock()
+    active_count = 0
+    max_active_count = 0
+    both_started = threading.Barrier(2)
+
+    def fake_process_job(_settings, db, job_id, auth_store=None):
+        nonlocal active_count, max_active_count
+        with state_lock:
+            active_count += 1
+            max_active_count = max(max_active_count, active_count)
+        try:
+            both_started.wait(timeout=5)
+            db.update_job(job_id, status="complete", progress=100)
+        finally:
+            with state_lock:
+                active_count -= 1
+
+    monkeypatch.setattr("app.main.process_job", fake_process_job)
+
+    with TestClient(app) as client:
+        first_status = wait_for_status(client, first_id, {"complete"})
+        second_status = wait_for_status(client, second_id, {"complete"})
+
+    assert first_status["status"] == "complete"
+    assert second_status["status"] == "complete"
+    assert max_active_count == 2
+
+
+def test_worker_loop_skips_duplicate_items_after_job_finishes(tmp_path, monkeypatch):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "queued", progress=15)
+    calls = 0
+
+    def fake_process_job(_settings, db, queued_job_id, auth_store=None):
+        nonlocal calls
+        calls += 1
+        db.update_job(queued_job_id, status="complete", progress=100)
+
+    monkeypatch.setattr("app.main.process_job", fake_process_job)
+    app.state.queue.put_nowait({"action": "process", "job_id": job_id})
+    app.state.queue.put_nowait({"action": "process", "job_id": job_id})
+
+    with TestClient(app) as client:
+        status = wait_for_status(client, job_id, {"complete"})
+        time.sleep(0.1)
+
+    assert status["status"] == "complete"
+    assert calls == 1
+
+
+def test_finalize_job_and_cancel_update_are_atomic(tmp_path):
+    app = create_app(make_settings(tmp_path))
+
+    for index in range(10):
+        job_id = seed_job(
+            app,
+            "downloading_output",
+            progress=85,
+            job_id=f"terminalrace{index:02d}".ljust(32, "0"),
+        )
+        barrier = threading.Barrier(3)
+        result = {}
+
+        def cancel():
+            barrier.wait(timeout=5)
+            result["cancel"] = app.state.db.update_job_if_status(
+                job_id,
+                {"downloading_output"},
+                status="cancel_requested",
+                cancel_requested_at=time.time(),
+                cancel_reason="cancel requested",
+            )
+
+        def finish():
+            barrier.wait(timeout=5)
+            result["finish"] = app.state.db.finalize_job(
+                job_id,
+                "complete",
+                progress=100,
+            )
+
+        cancel_thread = threading.Thread(target=cancel)
+        finish_thread = threading.Thread(target=finish)
+        cancel_thread.start()
+        finish_thread.start()
+        barrier.wait(timeout=5)
+        cancel_thread.join(timeout=5)
+        finish_thread.join(timeout=5)
+
+        assert not cancel_thread.is_alive()
+        assert not finish_thread.is_alive()
+        final_status = app.state.db.get_job(job_id)["status"]
+        assert final_status == ("canceled" if result["cancel"] else "complete")
+
+
+def test_finalize_job_keeps_cancellation_when_finish_path_fails(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "cancel_requested", progress=85)
+    app.state.db.update_job(
+        job_id,
+        cancel_requested_at=time.time(),
+        cancel_reason="cancel requested",
+    )
+
+    status = app.state.db.finalize_job(
+        job_id,
+        "failed",
+        progress=0,
+        error="artifact download failed",
+    )
+    job = app.state.db.get_job(job_id)
+
+    assert status == "canceled"
+    assert job["status"] == "canceled"
+    assert job["error"] == "artifact download failed"
+
+
+def test_thread_operation_waits_for_in_flight_work_after_cancellation():
+    started = threading.Event()
+    release = threading.Event()
+    app = SimpleNamespace(state=SimpleNamespace(worker_thread_tasks=set()))
+
+    def blocking_operation():
+        started.set()
+        release.wait(timeout=5)
+
+    async def scenario():
+        task = asyncio.create_task(
+            run_thread_to_completion(app, blocking_operation)
+        )
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        assert await task == (True, None)
+        assert not app.state.worker_thread_tasks
+
+    asyncio.run(scenario())
+
+
+def test_kaggle_poll_sleep_is_interrupted_by_shutdown(tmp_path):
+    shutdown_event = threading.Event()
+    adapter = KaggleAdapter(
+        make_settings(tmp_path),
+        lambda _message: None,
+        shutdown_event=shutdown_event,
+    )
+    timer = threading.Timer(0.05, shutdown_event.set)
+
+    timer.start()
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(KaggleAdapterInterrupted):
+            adapter._sleep(10)
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started_at < 1
+
+
+def test_kaggle_command_is_terminated_by_shutdown(tmp_path):
+    shutdown_event = threading.Event()
+    settings = make_settings(tmp_path)
+    settings.kaggle_cmd = sys.executable
+    adapter = KaggleAdapter(
+        settings,
+        lambda _message: None,
+        shutdown_event=shutdown_event,
+    )
+    timer = threading.Timer(0.1, shutdown_event.set)
+
+    timer.start()
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(KaggleAdapterInterrupted):
+            adapter._run(["-c", "import time; time.sleep(30)"])
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started_at < 3
+
+
 def test_callback_token_updates_job_progress_and_logs(tmp_path):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -2263,6 +2780,7 @@ def test_cancel_job_sets_cancel_requested_and_callback_returns_flag(tmp_path, mo
         upload_all(client, job_id, "dataset", dataset_zip)
         upload_all(client, job_id, "kernel", kernel_zip)
         complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        app.state.db.update_job(job_id, status="waiting_kernel", progress=60)
         cancel = client.post(f"/v1/jobs/{job_id}/cancel", headers=auth_headers())
         accepted = client.post(
             f"/v1/jobs/{job_id}/progress",
@@ -2311,6 +2829,155 @@ def test_cancel_job_requires_job_owner(tmp_path):
     assert owner_response.status_code == 200
     assert owner_response.json()["status"] == "canceled"
     assert owner_response.json()["cancel_requested"] is True
+
+
+def test_delete_rejects_active_job_and_allows_terminal_job(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    app = create_app(make_settings(tmp_path))
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        app.state.db.update_job(job_id, status="waiting_kernel", progress=60)
+        active_delete = client.delete(
+            f"/v1/jobs/{job_id}",
+            headers=auth_headers(),
+        )
+        app.state.db.update_job(job_id, status="canceled", progress=100)
+        terminal_delete = client.delete(
+            f"/v1/jobs/{job_id}",
+            headers=auth_headers(),
+        )
+        saved = app.state.db.get_job(job_id)
+
+    assert active_delete.status_code == 409
+    assert terminal_delete.status_code == 204
+    assert saved["status"] == "failed"
+    assert saved["error"] == "deleted"
+    assert not (tmp_path / "jobs" / job_id).exists()
+
+
+def test_delete_waits_for_artifact_download_to_finish(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    app = create_app(make_settings(tmp_path))
+    download_started = threading.Event()
+    release_download = threading.Event()
+    original_call = JobLockedFileResponse.__call__
+
+    async def slow_file_response(self, scope, receive, send):
+        download_started.set()
+        await asyncio.to_thread(release_download.wait, 5)
+        await original_call(self, scope, receive, send)
+
+    monkeypatch.setattr(JobLockedFileResponse, "__call__", slow_file_response)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        artifact_path = tmp_path / "artifacts" / job_id / "artifacts.zip"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(artifact_path, "w") as archive:
+            archive.writestr("best.pt", b"pt")
+        app.state.db.update_job(
+            job_id,
+            status="complete",
+            progress=100,
+            artifact_path=str(artifact_path),
+        )
+        responses = {}
+
+        def download():
+            responses["download"] = client.get(
+                f"/v1/jobs/{job_id}/artifacts.zip",
+                headers=auth_headers(),
+            )
+
+        def delete():
+            responses["delete"] = client.delete(
+                f"/v1/jobs/{job_id}",
+                headers=auth_headers(),
+            )
+
+        download_thread = threading.Thread(target=download)
+        delete_thread = threading.Thread(target=delete)
+        download_thread.start()
+        assert download_started.wait(timeout=2)
+        delete_thread.start()
+        time.sleep(0.05)
+        assert delete_thread.is_alive()
+        release_download.set()
+        download_thread.join(timeout=5)
+        delete_thread.join(timeout=5)
+
+    assert not download_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert responses["download"].status_code == 200
+    assert responses["delete"].status_code == 204
+
+
+def test_retention_cleanup_waits_for_artifact_download_to_finish(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    app = create_app(make_settings(tmp_path))
+    download_started = threading.Event()
+    release_download = threading.Event()
+    original_call = JobLockedFileResponse.__call__
+
+    async def slow_file_response(self, scope, receive, send):
+        download_started.set()
+        await asyncio.to_thread(release_download.wait, 5)
+        await original_call(self, scope, receive, send)
+
+    monkeypatch.setattr(JobLockedFileResponse, "__call__", slow_file_response)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        artifact_path = tmp_path / "artifacts" / job_id / "artifacts.zip"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(artifact_path, "w") as archive:
+            archive.writestr("best.pt", b"pt")
+        app.state.db.update_job(
+            job_id,
+            status="complete",
+            progress=100,
+            artifact_path=str(artifact_path),
+        )
+        with app.state.db.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET completed_at = 0 WHERE job_id = ?",
+                (job_id,),
+            )
+        responses = {}
+
+        def download():
+            responses["download"] = client.get(
+                f"/v1/jobs/{job_id}/artifacts.zip",
+                headers=auth_headers(),
+            )
+
+        def cleanup():
+            client.portal.call(cleanup_expired_jobs, app)
+
+        download_thread = threading.Thread(target=download)
+        cleanup_thread = threading.Thread(target=cleanup)
+        download_thread.start()
+        assert download_started.wait(timeout=2)
+        cleanup_thread.start()
+        time.sleep(0.05)
+        assert cleanup_thread.is_alive()
+        assert artifact_path.exists()
+        assert app.state.db.get_job(job_id)["artifact_path"] == str(artifact_path)
+        release_download.set()
+        download_thread.join(timeout=5)
+        cleanup_thread.join(timeout=5)
+
+        cleaned = app.state.db.get_job(job_id)
+
+    assert not download_thread.is_alive()
+    assert not cleanup_thread.is_alive()
+    assert responses["download"].status_code == 200
+    assert cleaned["artifact_path"] == ""
+    assert not artifact_path.exists()
 
 
 def test_callback_can_update_progress_by_kernel_ref(tmp_path):

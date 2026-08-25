@@ -28,8 +28,11 @@ def ui_session_max_age_seconds() -> int:
     return max(300, min(value, 30 * 24 * 60 * 60))
 
 
-def ui_cookie_secure() -> bool:
-    return os.environ.get("RELAY_UI_COOKIE_SECURE", "").strip().lower() == "true"
+def ui_cookie_secure(settings: Settings) -> bool:
+    value = os.environ.get("RELAY_UI_COOKIE_SECURE", "").strip().lower()
+    if value:
+        return value not in {"0", "false", "no", "off"}
+    return str(settings.public_origin or "").lower().startswith("https://")
 
 
 def _b64_encode(data: bytes) -> str:
@@ -47,10 +50,20 @@ def _session_secret(settings: Settings, auth_store: AuthStore) -> bytes:
         register_secret(configured)
         return configured.encode("utf-8")
 
+    admin_token = str(getattr(settings, "admin_token", "") or "").strip()
+    if admin_token:
+        register_secret(admin_token)
+        return admin_token.encode("utf-8")
+
     api_token = str(getattr(settings, "api_token", "") or "").strip()
     if api_token:
         register_secret(api_token)
         return api_token.encode("utf-8")
+
+    compatibility_admin_token = auth_store.compatibility_admin_token()
+    if compatibility_admin_token:
+        register_secret(compatibility_admin_token)
+        return compatibility_admin_token.encode("utf-8")
 
     token_values = [token for token, _principal in getattr(auth_store, "_tokens", []) if token]
     if token_values:
@@ -132,17 +145,24 @@ def set_ui_session_cookie(
     response: Response,
     value: str,
     max_age_seconds: int,
+    settings: Settings,
 ) -> None:
     response.set_cookie(
         UI_COOKIE_NAME,
         value,
         max_age=max_age_seconds,
         httponly=True,
-        secure=ui_cookie_secure(),
+        secure=ui_cookie_secure(settings),
         samesite="lax",
         path="/",
     )
 
 
-def delete_ui_session_cookie(response: Response) -> None:
-    response.delete_cookie(UI_COOKIE_NAME, path="/")
+def delete_ui_session_cookie(response: Response, settings: Settings) -> None:
+    response.delete_cookie(
+        UI_COOKIE_NAME,
+        secure=ui_cookie_secure(settings),
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )

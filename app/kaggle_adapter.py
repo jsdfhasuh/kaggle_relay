@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import subprocess
 import threading
@@ -50,6 +51,10 @@ _ENV_LOCK = threading.RLock()
 
 
 class KaggleAdapterError(RuntimeError):
+    pass
+
+
+class KaggleAdapterInterrupted(RuntimeError):
     pass
 
 
@@ -199,10 +204,23 @@ class KaggleAdapter:
         settings: Settings,
         log: Callable[[str], None],
         credentials: KaggleCredentials | None = None,
+        shutdown_event: threading.Event | None = None,
     ):
         self.settings = settings
         self.log = log
         self.credentials = credentials
+        self.shutdown_event = shutdown_event
+
+    def _check_interrupted(self) -> None:
+        if self.shutdown_event and self.shutdown_event.is_set():
+            raise KaggleAdapterInterrupted("relay shutdown interrupted Kaggle polling")
+
+    def _sleep(self, seconds: int | float) -> None:
+        if self.shutdown_event:
+            if self.shutdown_event.wait(max(0, seconds)):
+                self._check_interrupted()
+            return
+        time.sleep(seconds)
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -244,9 +262,10 @@ class KaggleAdapter:
         cwd: Optional[Path] = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess:
+        self._check_interrupted()
         cmd = [self.settings.kaggle_cmd] + args
         self.log("[CMD] " + redact_secrets(" ".join(cmd)))
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
             env=self._env(),
@@ -255,14 +274,53 @@ class KaggleAdapter:
             stderr=subprocess.STDOUT,
             encoding="utf-8",
             errors="replace",
+            start_new_session=os.name == "posix",
         )
-        output = redact_secrets(result.stdout or "")
+        try:
+            while True:
+                try:
+                    stdout, _stderr = process.communicate(
+                        timeout=0.2 if self.shutdown_event else None,
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    self._check_interrupted()
+        except BaseException:
+            stdout = self._stop_process(process)
+            output = redact_secrets(stdout)
+            if output:
+                self.log(output[-4000:])
+            raise
+
+        output = redact_secrets(stdout or "")
         if output:
             self.log(output[-4000:])
-        if check and result.returncode != 0:
-            raise KaggleAdapterError(f"Kaggle command failed: {result.returncode}\n{output}")
-        result.stdout = output
-        return result
+        if check and process.returncode != 0:
+            raise KaggleAdapterError(f"Kaggle command failed: {process.returncode}\n{output}")
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout=output)
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> str:
+        if process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except OSError:
+                pass
+        try:
+            stdout, _stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except OSError:
+                pass
+            stdout, _stderr = process.communicate()
+        return stdout or ""
 
     def account(self) -> dict:
         version = self._run(["--version"], check=False).stdout.strip()
@@ -442,6 +500,7 @@ class KaggleAdapter:
             return False
 
     def upload_dataset(self, dataset_dir: Path, dataset_ref: str, update_message: str) -> None:
+        self._check_interrupted()
         from kaggle.api.kaggle_api_extended import KaggleApi
 
         with self._temporary_kaggle_env():
@@ -493,12 +552,12 @@ class KaggleAdapter:
                             f"retrying for up to {visibility_grace} seconds"
                         )
                         visibility_retry_logged = True
-                    time.sleep(self.settings.dataset_poll_seconds)
+                    self._sleep(self.settings.dataset_poll_seconds)
                     continue
                 raise KaggleAdapterError(f"Dataset status failed:\n{output}")
             if elapsed > 30 * 60:
                 raise TimeoutError(f"Dataset wait timed out:\n{output}")
-            time.sleep(self.settings.dataset_poll_seconds)
+            self._sleep(self.settings.dataset_poll_seconds)
 
     def dataset_status(self, dataset_ref: str) -> str:
         result = self._run(["datasets", "status", dataset_ref], check=False)
@@ -537,7 +596,7 @@ class KaggleAdapter:
                 raise KaggleAdapterError(f"Kernel failed:\n{output}")
             if time.time() - start > self.settings.kernel_max_wait_seconds:
                 raise TimeoutError(f"Kernel wait timed out:\n{output}")
-            time.sleep(self.settings.kernel_poll_seconds)
+            self._sleep(self.settings.kernel_poll_seconds)
 
     def download_output(
         self,

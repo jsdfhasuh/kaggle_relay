@@ -4,10 +4,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.config import MIN_ADMIN_TOKEN_LENGTH
 from app.security import register_secret
 
 
 KAGGLE_ENV_KEYS = ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN", "KAGGLE_CONFIG_DIR")
+MANAGEMENT_PRINCIPAL_ID = "management-key"
 
 
 class AuthConfigError(RuntimeError):
@@ -47,6 +49,7 @@ class RelayPrincipal:
     id: str
     allowed_kaggle_key_ids: frozenset[str] | None
     legacy: bool = False
+    management_admin: bool = False
 
     @property
     def allow_all_keys(self) -> bool:
@@ -66,19 +69,59 @@ class AuthStore:
         relay_tokens: list[tuple[str, str, frozenset[str] | None]],
         kaggle_keys: dict[str, KaggleCredentials],
         legacy: bool = False,
+        admin_token: str = "",
     ):
         self.legacy = legacy
         self._kaggle_keys = dict(kaggle_keys)
+        admin_token = str(admin_token or "").strip()
+        if admin_token and legacy:
+            raise AuthConfigError("RELAY_ADMIN_TOKEN requires RELAY_AUTH_CONFIG")
+        if admin_token and len(admin_token) < MIN_ADMIN_TOKEN_LENGTH:
+            raise AuthConfigError(
+                f"RELAY_ADMIN_TOKEN must be at least {MIN_ADMIN_TOKEN_LENGTH} characters"
+            )
+        configured_tokens_are_admins = not legacy and not admin_token
         self._tokens = [
-            (token, RelayPrincipal(token_id, allowed, legacy=legacy))
+            (
+                token,
+                RelayPrincipal(
+                    token_id,
+                    allowed,
+                    legacy=legacy,
+                    management_admin=configured_tokens_are_admins and allowed is None,
+                ),
+            )
             for token_id, token, allowed in relay_tokens
         ]
+        self.management_token_configured = bool(admin_token)
+        if admin_token:
+            if any(principal.id == MANAGEMENT_PRINCIPAL_ID for _token, principal in self._tokens):
+                raise AuthConfigError(
+                    f"relay token id {MANAGEMENT_PRINCIPAL_ID} is reserved when RELAY_ADMIN_TOKEN is set"
+                )
+            if any(hmac.compare_digest(admin_token, token) for token, _principal in self._tokens):
+                raise AuthConfigError("RELAY_ADMIN_TOKEN must differ from every relay token")
+            register_secret(admin_token)
+            self._tokens.insert(
+                0,
+                (
+                    admin_token,
+                    RelayPrincipal(
+                        MANAGEMENT_PRINCIPAL_ID,
+                        None,
+                        management_admin=True,
+                    ),
+                ),
+            )
 
     @classmethod
     def from_settings(cls, settings: Any) -> "AuthStore":
         auth_config_path = getattr(settings, "auth_config_path", None)
+        admin_token = str(getattr(settings, "admin_token", "") or "").strip()
         if auth_config_path:
-            return cls.from_file(Path(auth_config_path))
+            return cls.from_file(Path(auth_config_path), admin_token=admin_token)
+        if admin_token:
+            raise AuthConfigError("RELAY_ADMIN_TOKEN requires RELAY_AUTH_CONFIG")
         api_token = str(getattr(settings, "api_token", "") or "").strip()
         if not api_token:
             raise AuthConfigError("RELAY_API_TOKEN or RELAY_AUTH_CONFIG is required")
@@ -90,7 +133,7 @@ class AuthStore:
         )
 
     @classmethod
-    def from_file(cls, path: Path) -> "AuthStore":
+    def from_file(cls, path: Path, admin_token: str = "") -> "AuthStore":
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except OSError as exc:
@@ -102,7 +145,11 @@ class AuthStore:
 
         kaggle_keys = cls._parse_kaggle_keys(data.get("kaggle_keys"))
         relay_tokens = cls._parse_relay_tokens(data.get("relay_tokens"), set(kaggle_keys))
-        return cls(relay_tokens=relay_tokens, kaggle_keys=kaggle_keys)
+        return cls(
+            relay_tokens=relay_tokens,
+            kaggle_keys=kaggle_keys,
+            admin_token=admin_token,
+        )
 
     @staticmethod
     def _parse_kaggle_keys(raw: Any) -> dict[str, KaggleCredentials]:
@@ -196,6 +243,12 @@ class AuthStore:
             if hmac.compare_digest(token, expected):
                 return principal
         return None
+
+    def compatibility_admin_token(self) -> str:
+        for token, principal in self._tokens:
+            if principal.management_admin:
+                return token
+        return ""
 
     def allowed_key_ids(self, principal: RelayPrincipal) -> list[str]:
         if self.legacy:

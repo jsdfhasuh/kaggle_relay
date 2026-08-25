@@ -6,8 +6,14 @@ FastAPI relay for routing Training Platform Kaggle traffic through one Linux ser
 
 ```bash
 cp .env.example .env
+# Set RELAY_API_TOKEN, or configure RELAY_AUTH_CONFIG before starting.
 docker compose up --build
 ```
+
+The Compose files publish Relay only on `127.0.0.1:8000`. Access it locally or
+put an HTTPS reverse proxy on the same host in front of that address. The sample
+environment uses `RELAY_UI_COOKIE_SECURE=false` for plain-HTTP local access;
+production HTTPS deployments must set it to `true`.
 
 Live servers should deploy the current checkout with a forced local rebuild:
 
@@ -29,18 +35,55 @@ Only switch after the intended local commits are pushed and the matching
 GitHub Action run succeeds. This Compose file keeps `./relay-data:/data` and
 uses the same Compose project/service as the local build deployment.
 
+Relay runs a single process with an in-process job queue. Set
+`RELAY_WORKER_COUNT` to the number of Kaggle jobs that may execute at the same
+time; the default is `2`. Keep Uvicorn at one process because multiple Uvicorn
+processes would create separate queues without a shared worker coordinator.
+Jobs using different Kaggle datasets can run concurrently. Jobs targeting the
+same Kaggle account and dataset are serialized until the Kernel push completes,
+so one worker cannot replace the dataset version while another worker submits
+its Kernel.
+
 For legacy single-user mode, set `RELAY_API_TOKEN` to a long random value and
 provide Kaggle credentials with `KAGGLE_API_TOKEN`,
 `KAGGLE_USERNAME`/`KAGGLE_KEY`, or by mounting `/root/.kaggle`.
 
 For multi-user/multi-key mode, set `RELAY_AUTH_CONFIG` to a JSON file path. Each
 job is bound to one `kaggle_key_id`; relay tokens can be limited to one key, a
-list of keys, or all keys:
+list of keys, or all keys. Set `RELAY_ADMIN_TOKEN` to a custom value of at
+least 8 characters to create one dedicated management key:
+
+```text
+RELAY_AUTH_CONFIG=/data/auth.json
+RELAY_ADMIN_TOKEN=replace-with-a-long-custom-management-key
+```
+
+The management key is stored only in the environment. It can log into the web
+UI, access all jobs and Kaggle keys, and modify the auth configuration. When it
+is configured, ordinary relay tokens cannot modify auth configuration, even if
+they can access all Kaggle keys. Without `RELAY_ADMIN_TOKEN`, an all-key relay
+token keeps the previous administrator behavior for backward compatibility.
+Eight characters is the enforced minimum, not the recommended production
+length. Use a longer random value. Relay limits failed UI login, Bearer, and
+callback authentication attempts by source; tune `RELAY_AUTH_FAILURE_LIMIT`,
+`RELAY_AUTH_FAILURE_WINDOW_SECONDS`, and `RELAY_AUTH_LOCKOUT_SECONDS` if needed.
+
+Mutating requests authenticated by a UI cookie, including UI login itself, must
+carry a same-origin `Origin` header. HTTPS deployments behind a proxy should set
+`RELAY_PUBLIC_ORIGIN` to the browser-visible origin and keep
+`RELAY_UI_COOKIE_SECURE=true`. If Relay must read `X-Forwarded-For` for per-source
+login limits, list only immediate trusted proxy addresses in
+`RELAY_TRUSTED_PROXY_IPS`; forwarded headers from other peers are ignored. An
+optional `RELAY_UI_SESSION_SECRET` can provide an independent stable
+cookie-signing key; otherwise Relay uses the dedicated management key or a
+compatibility admin key. Plain-HTTP development can explicitly set
+`RELAY_UI_COOKIE_SECURE=false`.
+
+Example auth configuration:
 
 ```json
 {
   "relay_tokens": [
-    {"id": "admin", "token": "admin-token", "allowed_kaggle_key_ids": "*"},
     {"id": "user-a", "token": "user-a-token", "allowed_kaggle_key_ids": ["ka"]}
   ],
   "kaggle_keys": [
@@ -65,7 +108,7 @@ configured username. This creates a tiny probe dataset and then deletes it.
 All `/v1/*` requests require:
 
 ```text
-Authorization: Bearer <RELAY_API_TOKEN>
+Authorization: Bearer <relay token or management key>
 ```
 
 Main endpoints:
