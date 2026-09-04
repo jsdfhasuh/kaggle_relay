@@ -566,6 +566,23 @@ class RelayDb:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_current_dataset_cache(
+        self,
+        dataset_ref: str,
+        kaggle_key_id: str = "",
+    ) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM kaggle_dataset_cache
+                WHERE kaggle_key_id = ? AND dataset_ref = ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (kaggle_key_id, dataset_ref),
+            ).fetchone()
+        return dict(row) if row else None
+
     def upsert_dataset_cache(
         self,
         dataset_ref: str,
@@ -618,6 +635,23 @@ class RelayDb:
                 WHERE kaggle_key_id = ? AND dataset_ref = ? AND payload_hash = ?
                 """,
                 (kaggle_key_id, dataset_ref, payload_hash),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_current_last_dataset_job(
+        self,
+        dataset_ref: str,
+        kaggle_key_id: str = "",
+    ) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM kaggle_last_job
+                WHERE kaggle_key_id = ? AND dataset_ref = ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (kaggle_key_id, dataset_ref),
             ).fetchone()
         return dict(row) if row else None
 

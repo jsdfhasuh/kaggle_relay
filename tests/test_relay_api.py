@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -29,6 +30,7 @@ from app.kaggle_adapter import (
     KaggleAdapter,
     KaggleAdapterError,
     KaggleAdapterInterrupted,
+    DatasetUploadReceipt,
 )
 from app.main import (
     JobLockedFileResponse,
@@ -89,6 +91,15 @@ def build_zip(files: dict[str, bytes]) -> bytes:
                     content = json.dumps(metadata).encode("utf-8")
             archive.writestr(name, content)
     return buf.getvalue()
+
+
+def ready_dataset_status(version_number: int = 1) -> str:
+    return json.dumps(
+        {
+            "status": "ready",
+            "current_version_number": version_number,
+        }
+    )
 
 
 def job_request_body(
@@ -779,7 +790,7 @@ def test_dataset_cache_is_scoped_by_kaggle_key(tmp_path):
             dataset_ref="alice/data",
             payload_hash="payload-1",
             status="ready",
-            dataset_status="ready",
+            dataset_status=ready_dataset_status(),
             source_job_id="previous",
             kaggle_key_id="ka",
         )
@@ -1334,7 +1345,7 @@ def test_create_job_reports_dataset_cache_hit(tmp_path):
             dataset_ref="demo/data",
             payload_hash="payload-1",
             status="ready",
-            dataset_status="ready",
+            dataset_status=ready_dataset_status(),
             source_job_id="previous",
         )
         job_id = create_job(client, dataset_zip, kernel_zip, payload_hash="payload-1")
@@ -1345,6 +1356,118 @@ def test_create_job_reports_dataset_cache_hit(tmp_path):
     assert response.json()["dataset_upload_required"] is False
 
 
+def test_create_job_ignores_legacy_ready_cache_without_dataset_version(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": b'{"code_file":"train.py"}',
+            "train.py": b"print(1)",
+        }
+    )
+    app = create_app(make_settings(tmp_path))
+    with TestClient(app) as client:
+        app.state.db.upsert_dataset_cache(
+            dataset_ref="demo/data",
+            payload_hash="payload-1",
+            status="ready",
+            dataset_status="ready",
+            source_job_id="legacy-job",
+        )
+        job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            payload_hash="payload-1",
+        )
+        response = client.get(f"/v1/jobs/{job_id}", headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json()["dataset_cache_hit"] is False
+    assert response.json()["dataset_upload_required"] is True
+
+
+def test_dataset_cache_only_reuses_latest_payload_for_mutable_dataset(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    app = create_app(make_settings(tmp_path))
+    with TestClient(app) as client:
+        app.state.db.upsert_dataset_cache(
+            dataset_ref="demo/data",
+            payload_hash="payload-old",
+            status="ready",
+            dataset_status=ready_dataset_status(1),
+            source_job_id="old-job",
+        )
+        app.state.db.upsert_dataset_cache(
+            dataset_ref="demo/data",
+            payload_hash="payload-new",
+            status="ready",
+            dataset_status=ready_dataset_status(2),
+            source_job_id="new-job",
+        )
+        old_job = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            payload_hash="payload-old",
+        )
+        new_job = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            payload_hash="payload-new",
+        )
+        old_status = client.get(f"/v1/jobs/{old_job}", headers=auth_headers()).json()
+        new_status = client.get(f"/v1/jobs/{new_job}", headers=auth_headers()).json()
+
+    assert old_status["dataset_cache_hit"] is False
+    assert old_status["dataset_upload_required"] is True
+    assert new_status["dataset_cache_hit"] is True
+    assert new_status["dataset_upload_required"] is False
+
+
+def test_dataset_cache_does_not_revive_old_payload_from_last_job(tmp_path):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": b'{"code_file":"train.py"}',
+            "train.py": b"print(1)",
+        }
+    )
+    app = create_app(make_settings(tmp_path))
+    with TestClient(app) as client:
+        app.state.db.upsert_last_dataset_job(
+            dataset_ref="demo/data",
+            payload_hash="payload-old",
+            dataset_status=ready_dataset_status(1),
+            job_id="old-job",
+        )
+        app.state.db.upsert_dataset_cache(
+            dataset_ref="demo/data",
+            payload_hash="payload-new",
+            status="ready",
+            dataset_status=ready_dataset_status(2),
+            source_job_id="new-job",
+        )
+
+        job_id = create_job(
+            client,
+            dataset_zip,
+            kernel_zip,
+            payload_hash="payload-old",
+        )
+        response = client.get(f"/v1/jobs/{job_id}", headers=auth_headers())
+        revived_cache = app.state.db.get_dataset_cache(
+            "demo/data",
+            "payload-old",
+        )
+
+    assert response.status_code == 200
+    assert response.json()["dataset_cache_hit"] is False
+    assert response.json()["dataset_upload_required"] is True
+    assert revived_cache is None
+
+
 def test_create_job_backfills_cache_from_last_ready_job(tmp_path):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -1353,7 +1476,7 @@ def test_create_job_backfills_cache_from_last_ready_job(tmp_path):
         app.state.db.upsert_last_dataset_job(
             dataset_ref="demo/data",
             payload_hash="payload-1",
-            dataset_status="ready",
+            dataset_status=ready_dataset_status(),
             job_id="previous",
         )
         job_id = create_job(client, dataset_zip, kernel_zip, payload_hash="payload-1")
@@ -1381,7 +1504,7 @@ def test_complete_allows_kernel_only_when_dataset_cache_hit(tmp_path, monkeypatc
             dataset_ref="demo/data",
             payload_hash="payload-1",
             status="ready",
-            dataset_status="ready",
+            dataset_status=ready_dataset_status(),
             source_job_id="previous",
         )
         job_id = create_job(client, dataset_zip, kernel_zip, payload_hash="payload-1")
@@ -1462,7 +1585,7 @@ def test_complete_rewrites_kernel_metadata_when_dataset_is_cached(tmp_path, monk
             dataset_ref="alice/data",
             payload_hash="payload-1",
             status="ready",
-            dataset_status="ready",
+            dataset_status=ready_dataset_status(),
             source_job_id="previous",
             kaggle_key_id="ka",
         )
@@ -1714,7 +1837,14 @@ def test_worker_prefers_structured_patchcore_kernel_failure(tmp_path, monkeypatc
 
 def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
-    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": (
+                b'{"code_file":"train.py","dataset_sources":["demo/data"]}'
+            ),
+            "train.py": b"print(1)",
+        }
+    )
     settings = make_settings(tmp_path)
     monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     app = create_app(settings)
@@ -1724,7 +1854,7 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
             dataset_ref="demo/data",
             payload_hash="payload-1",
             status="ready",
-            dataset_status="ready",
+            dataset_status=ready_dataset_status(7),
             source_job_id="previous",
         )
         job_id = create_job(client, dataset_zip, kernel_zip, payload_hash="payload-1")
@@ -1732,7 +1862,11 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
         complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
         assert complete.status_code == 200
 
-        calls = {"upload_dataset": 0, "wait_dataset": 0}
+        calls = {
+            "upload_dataset": 0,
+            "wait_dataset": 0,
+            "expected_version_number": None,
+        }
 
         class FakeAdapter:
             def __init__(self, _settings, _log, credentials=None):
@@ -1741,9 +1875,12 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
             def upload_dataset(self, *_args, **_kwargs):
                 calls["upload_dataset"] += 1
 
-            def wait_dataset(self, *_args, **_kwargs):
+            def wait_dataset(self, *_args, **kwargs):
                 calls["wait_dataset"] += 1
-                return "ready"
+                calls["expected_version_number"] = kwargs[
+                    "upload_receipt"
+                ].expected_version_number
+                return ready_dataset_status(7)
 
             def push_kernel(self, _kernel_dir):
                 return "pushed"
@@ -1764,10 +1901,101 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
         monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
         process_job(settings, app.state.db, job_id)
         status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+        kernel_metadata = json.loads(
+            (
+                tmp_path
+                / "jobs"
+                / job_id
+                / "extracted"
+                / "kernel"
+                / "kernel-metadata.json"
+            ).read_text(encoding="utf-8")
+        )
 
-    assert calls == {"upload_dataset": 0, "wait_dataset": 0}
+    assert calls == {
+        "upload_dataset": 0,
+        "wait_dataset": 1,
+        "expected_version_number": 7,
+    }
     assert status["status"] == "complete"
-    assert status["dataset_status"] == "ready"
+    assert json.loads(status["dataset_status"])["current_version_number"] == 7
+    assert kernel_metadata["dataset_sources"] == ["demo/data/7"]
+
+
+def test_worker_passes_upload_receipt_to_dataset_wait(tmp_path, monkeypatch):
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip(
+        {
+            "kernel-metadata.json": (
+                b'{"code_file":"train.py","dataset_sources":["demo/data"]}'
+            ),
+            "train.py": b"print(1)",
+        }
+    )
+    settings = make_settings(tmp_path)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    app = create_app(settings)
+    receipt = DatasetUploadReceipt(
+        expected_version_number=2,
+        expected_files=(("model_source/best.pt", 2),),
+    )
+    calls = {"receipt": None, "waited": False, "pushed_after_wait": False}
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            return receipt
+
+        def wait_dataset(self, *_args, **kwargs):
+            calls["receipt"] = kwargs.get("upload_receipt")
+            calls["waited"] = True
+            return '{"status":"ready","current_version_number":2}'
+
+        def push_kernel(self, _kernel_dir):
+            calls["pushed_after_wait"] = calls["waited"]
+            return "pushed"
+
+        def wait_kernel(self, _kernel_ref, _progress_callback):
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+
+    with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip, payload_hash="payload-2")
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
+        complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        assert complete.status_code == 200
+
+        process_job(settings, app.state.db, job_id)
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+        kernel_metadata = json.loads(
+            (
+                tmp_path
+                / "jobs"
+                / job_id
+                / "extracted"
+                / "kernel"
+                / "kernel-metadata.json"
+            ).read_text(encoding="utf-8")
+        )
+
+    assert calls["receipt"] is receipt
+    assert calls["pushed_after_wait"] is True
+    assert status["status"] == "complete"
+    assert kernel_metadata["dataset_sources"] == ["demo/data/2"]
 
 
 def test_workers_serialize_shared_dataset_until_kernel_push(tmp_path, monkeypatch):
@@ -1797,9 +2025,10 @@ def test_workers_serialize_shared_dataset_until_kernel_push(tmp_path, monkeypatc
             with calls_lock:
                 calls["upload_dataset"] += 1
             time.sleep(0.1)
+            return DatasetUploadReceipt(expected_version_number=1)
 
         def wait_dataset(self, *_args, **_kwargs):
-            return "ready"
+            return ready_dataset_status(1)
 
         def push_kernel(self, _kernel_dir):
             with calls_lock:
@@ -2391,17 +2620,17 @@ def test_startup_recovery_pushing_kernel_not_visible_fails_without_push(tmp_path
     assert "restart during kernel push before submission could be verified" in status["error"]
 
 
-def test_startup_recovery_dataset_ready_requeues_without_upload(tmp_path, monkeypatch):
+def test_startup_recovery_waiting_dataset_fails_without_exact_version(
+    tmp_path,
+    monkeypatch,
+):
     app = create_app(make_settings(tmp_path))
     job_id = seed_job(app, "waiting_dataset", progress=35)
     calls = {"process": 0}
 
     class FakeProbeAdapter:
-        def __init__(self, _settings, _log, credentials=None):
-            pass
-
-        def dataset_status(self, _dataset_ref):
-            return "Warning: Looks like you're using an outdated `kaggle` version\nready"
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("restart recovery must not trust generic ready")
 
     def fake_process_job(settings, db, queued_job_id, auth_store=None):
         calls["process"] += 1
@@ -2411,25 +2640,25 @@ def test_startup_recovery_dataset_ready_requeues_without_upload(tmp_path, monkey
     monkeypatch.setattr("app.main.process_job", fake_process_job)
 
     with TestClient(app) as client:
-        status = wait_for_status(client, job_id, {"complete"})
+        status = wait_for_status(client, job_id, {"failed"})
         cache = app.state.db.get_dataset_cache("demo/data", "payload-1")
 
-    assert status["status"] == "complete"
-    assert cache["status"] == "ready"
-    assert cache["dataset_status"].endswith("ready")
-    assert calls == {"process": 1}
+    assert status["status"] == "failed"
+    assert "lost the exact uploaded version" in status["error"]
+    assert cache is None
+    assert calls == {"process": 0}
 
 
-def test_startup_recovery_dataset_not_ready_fails(tmp_path, monkeypatch):
+def test_startup_recovery_uploading_dataset_fails_without_exact_version(
+    tmp_path,
+    monkeypatch,
+):
     app = create_app(make_settings(tmp_path))
     job_id = seed_job(app, "uploading_dataset", progress=20)
 
     class FakeProbeAdapter:
-        def __init__(self, _settings, _log, credentials=None):
-            pass
-
-        def dataset_status(self, _dataset_ref):
-            return "processing"
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("restart recovery must not trust generic ready")
 
     monkeypatch.setattr("app.main.KaggleAdapter", FakeProbeAdapter)
 
@@ -2437,7 +2666,7 @@ def test_startup_recovery_dataset_not_ready_fails(tmp_path, monkeypatch):
         status = wait_for_status(client, job_id, {"failed"})
 
     assert status["status"] == "failed"
-    assert "before dataset was ready" in status["error"]
+    assert "lost the exact uploaded version" in status["error"]
 
 
 def test_startup_recovery_skips_terminal_and_receiving_jobs(tmp_path, monkeypatch):
@@ -3076,3 +3305,174 @@ def test_wait_dataset_accepts_ready_with_kaggle_warning(tmp_path):
     adapter._run = lambda *_args, **_kwargs: Result()
 
     assert adapter.wait_dataset("demo/private-dataset") == Result.stdout
+
+
+def test_upload_dataset_returns_expected_version_and_payload_inventory(
+    tmp_path,
+    monkeypatch,
+):
+    payload_zip = tmp_path / "payload.zip"
+    with zipfile.ZipFile(payload_zip, "w") as archive:
+        archive.writestr("data.yaml", b"data")
+        archive.writestr("model_source/best.pt", b"pt")
+    (tmp_path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    calls = []
+
+    class FakeKaggleApi:
+        def authenticate(self):
+            pass
+
+        def dataset_status(self, _dataset_ref, format=None):
+            if format == "json":
+                return '{"status":"ready","current_version_number":3}'
+            return "ready"
+
+        def dataset_create_version(self, dataset_dir, update_message, **kwargs):
+            calls.append((dataset_dir, update_message, kwargs))
+
+    kaggle_api_module = importlib.import_module(
+        "kaggle.api.kaggle_api_extended"
+    )
+    monkeypatch.setattr(kaggle_api_module, "KaggleApi", FakeKaggleApi)
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+
+    receipt = adapter.upload_dataset(tmp_path, "demo/data", "update files")
+
+    assert receipt == DatasetUploadReceipt(
+        expected_version_number=4,
+        expected_files=(
+            ("data.yaml", 4),
+            ("model_source/best.pt", 2),
+        ),
+    )
+    assert calls[0][0] == str(tmp_path)
+    assert calls[0][1] == "update files"
+
+
+def test_upload_dataset_fails_when_existing_version_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    upload_called = False
+
+    class FakeKaggleApi:
+        def authenticate(self):
+            pass
+
+        def dataset_status(self, _dataset_ref, format=None):
+            if format == "json":
+                raise RuntimeError("version lookup failed")
+            return "ready"
+
+        def dataset_create_version(self, *_args, **_kwargs):
+            nonlocal upload_called
+            upload_called = True
+
+    kaggle_api_module = importlib.import_module(
+        "kaggle.api.kaggle_api_extended"
+    )
+    monkeypatch.setattr(kaggle_api_module, "KaggleApi", FakeKaggleApi)
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+
+    with pytest.raises(KaggleAdapterError, match="Unable to read current Dataset version"):
+        adapter.upload_dataset(tmp_path, "demo/data", "update files")
+
+    assert upload_called is False
+
+
+def test_wait_dataset_retries_until_uploaded_version_files_are_visible(
+    tmp_path,
+    monkeypatch,
+):
+    class Result:
+        returncode = 0
+
+        def __init__(self, version_number):
+            self.stdout = json.dumps(
+                {
+                    "status": "ready",
+                    "current_version_number": version_number,
+                }
+            )
+
+    settings = make_settings(tmp_path)
+    settings.dataset_poll_seconds = 1
+    logs = []
+    adapter = KaggleAdapter(settings, logs.append)
+    status_results = [Result(1), Result(2), Result(2)]
+    remote_inventories = [
+        {"data.yaml": 4},
+        {"data.yaml": 4, "model_source/best.pt": 2},
+    ]
+    status_calls = []
+    inventory_calls = []
+
+    def fake_run(args, **_kwargs):
+        status_calls.append(args)
+        return status_results.pop(0)
+
+    def fake_inventory(dataset_ref, version_number=None):
+        inventory_calls.append((dataset_ref, version_number))
+        return remote_inventories.pop(0)
+
+    monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
+    adapter._run = fake_run
+    adapter._dataset_file_inventory = fake_inventory
+    receipt = DatasetUploadReceipt(
+        expected_version_number=2,
+        expected_files=(
+            ("data.yaml", 4),
+            ("model_source/best.pt", 2),
+        ),
+    )
+
+    result = adapter.wait_dataset(
+        "demo/data",
+        permission_grace_seconds=60,
+        upload_receipt=receipt,
+    )
+
+    assert json.loads(result)["current_version_number"] == 2
+    assert len(status_calls) == 3
+    assert all(call[-2:] == ["--format", "json"] for call in status_calls)
+    assert inventory_calls == [("demo/data", 2), ("demo/data", 2)]
+    assert any("uploaded version is fully visible" in message for message in logs)
+
+
+def test_wait_dataset_does_not_accept_ready_without_version(tmp_path, monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = "ready"
+
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    adapter._run = lambda *_args, **_kwargs: Result()
+    adapter._sleep = lambda _seconds: None
+    timestamps = iter([0.0, 30 * 60 + 1])
+    monkeypatch.setattr(
+        "app.kaggle_adapter.time.time",
+        lambda: next(timestamps),
+    )
+    receipt = DatasetUploadReceipt(expected_version_number=2)
+
+    with pytest.raises(TimeoutError, match="uploaded version became visible"):
+        adapter.wait_dataset("demo/data", upload_receipt=receipt)
+
+
+def test_wait_dataset_rejects_version_that_advanced_past_upload(tmp_path):
+    class Result:
+        returncode = 0
+        stdout = ready_dataset_status(3)
+
+    adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    adapter._run = lambda *_args, **_kwargs: Result()
+    adapter._dataset_file_inventory = lambda *_args, **_kwargs: {
+        "model_source/best.pt": 2,
+    }
+    receipt = DatasetUploadReceipt(
+        expected_version_number=2,
+        expected_files=(("model_source/best.pt", 2),),
+    )
+
+    with pytest.raises(KaggleAdapterError, match="advanced past uploaded version 2 to 3"):
+        adapter.wait_dataset("demo/data", upload_receipt=receipt)

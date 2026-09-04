@@ -11,6 +11,7 @@ import tempfile
 import uuid
 import zipfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -58,12 +59,77 @@ class KaggleAdapterInterrupted(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class DatasetUploadReceipt:
+    expected_version_number: int | None = None
+    expected_files: tuple[tuple[str, int], ...] = ()
+
+
 def kaggle_status_lines(output: str) -> list[str]:
     return [line.strip().lower() for line in (output or "").splitlines() if line.strip()]
 
 
+def parse_kaggle_dataset_status(output: str) -> tuple[str, int | None]:
+    text = str(output or "").strip()
+    json_start = text.find("{")
+    json_end = text.rfind("}")
+    if 0 <= json_start < json_end:
+        try:
+            payload = json.loads(text[json_start:json_end + 1])
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            status = str(payload.get("status") or "").strip().lower()
+            version_raw = payload.get(
+                "current_version_number",
+                payload.get("currentVersionNumber"),
+            )
+            try:
+                version_number = int(version_raw) if version_raw is not None else None
+            except (TypeError, ValueError):
+                version_number = None
+            return status, version_number
+
+    lines = kaggle_status_lines(text)
+    known_status = next(
+        (
+            line
+            for line in reversed(lines)
+            if line in READY_KAGGLE_STATUSES | {"failed", "error", "deleted"}
+        ),
+        "",
+    )
+    return known_status or (lines[-1] if lines else ""), None
+
+
 def is_ready_kaggle_status(output: str) -> bool:
-    return any(line in READY_KAGGLE_STATUSES for line in kaggle_status_lines(output))
+    status, _version_number = parse_kaggle_dataset_status(output)
+    return status in READY_KAGGLE_STATUSES
+
+
+def dataset_upload_inventory(dataset_dir: Path) -> tuple[tuple[str, int], ...]:
+    root = Path(dataset_dir)
+    payload_zip = root / "payload.zip"
+    inventory: dict[str, int] = {}
+
+    if payload_zip.is_file():
+        try:
+            with zipfile.ZipFile(payload_zip) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    name = info.filename.replace("\\", "/").lstrip("/")
+                    if name:
+                        inventory[name] = int(info.file_size)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise KaggleAdapterError(f"invalid dataset payload.zip: {exc}") from exc
+    else:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.name == "dataset-metadata.json":
+                continue
+            inventory[path.relative_to(root).as_posix()] = path.stat().st_size
+
+    return tuple(sorted(inventory.items()))
 
 
 def parse_kaggle_duration(value: str) -> timedelta:
@@ -499,15 +565,101 @@ class KaggleAdapter:
                 return False
             return False
 
-    def upload_dataset(self, dataset_dir: Path, dataset_ref: str, update_message: str) -> None:
+    @staticmethod
+    def _dataset_version_number(api, dataset_ref: str) -> int:
+        try:
+            output = api.dataset_status(dataset_ref, format="json")
+        except Exception as exc:
+            raise KaggleAdapterError(
+                f"Unable to read current Dataset version for {dataset_ref}: {exc}"
+            ) from exc
+        _status, version_number = parse_kaggle_dataset_status(str(output))
+        if version_number is None or version_number <= 0:
+            raise KaggleAdapterError(
+                f"Kaggle did not return a valid current Dataset version for {dataset_ref}"
+            )
+        return version_number
+
+    def _dataset_file_inventory(
+        self,
+        dataset_ref: str,
+        version_number: int | None = None,
+    ) -> dict[str, int]:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+
+        target_ref = (
+            f"{dataset_ref}/{version_number}"
+            if version_number is not None
+            else dataset_ref
+        )
+        inventory: dict[str, int] = {}
+        page_token = None
+        with self._temporary_kaggle_env():
+            api = KaggleApi()
+            api.authenticate()
+            while True:
+                response = api.dataset_list_files(
+                    target_ref,
+                    page_token=page_token,
+                    page_size=200,
+                )
+                if isinstance(response, tuple):
+                    files = response[0] or []
+                    page_token = response[1] if len(response) > 1 else None
+                else:
+                    error = str(
+                        getattr(response, "error_message", "")
+                        or getattr(response, "errorMessage", "")
+                        or ""
+                    ).strip()
+                    if error:
+                        raise KaggleAdapterError(
+                            f"Dataset file listing failed: {error}"
+                        )
+                    files = (
+                        getattr(response, "dataset_files", None)
+                        or getattr(response, "datasetFiles", None)
+                        or []
+                    )
+                    page_token = (
+                        getattr(response, "next_page_token", None)
+                        or getattr(response, "nextPageToken", None)
+                    )
+
+                for item in files:
+                    name = str(getattr(item, "name", "") or "").replace("\\", "/")
+                    if not name:
+                        continue
+                    size = getattr(item, "total_bytes", None)
+                    if size is None:
+                        size = getattr(item, "totalBytes", None)
+                    if size is None:
+                        size = getattr(item, "size", None)
+                    try:
+                        inventory[name] = int(size)
+                    except (TypeError, ValueError):
+                        continue
+
+                if not page_token:
+                    return inventory
+
+    def upload_dataset(
+        self,
+        dataset_dir: Path,
+        dataset_ref: str,
+        update_message: str,
+    ) -> DatasetUploadReceipt:
         self._check_interrupted()
         from kaggle.api.kaggle_api_extended import KaggleApi
 
+        expected_files = dataset_upload_inventory(dataset_dir)
         with self._temporary_kaggle_env():
             api = KaggleApi()
             api.authenticate()
             exists = self.dataset_exists(dataset_ref)
             if exists:
+                current_version_number = self._dataset_version_number(api, dataset_ref)
+                expected_version_number = current_version_number + 1
                 self.log(f"Updating dataset {dataset_ref}")
                 api.dataset_create_version(
                     str(dataset_dir),
@@ -518,6 +670,7 @@ class KaggleAdapter:
                     dir_mode="tar",
                 )
             else:
+                expected_version_number = 1
                 self.log(f"Creating dataset {dataset_ref}")
                 api.dataset_create_new(
                     str(dataset_dir),
@@ -526,20 +679,125 @@ class KaggleAdapter:
                     convert_to_csv=False,
                     dir_mode="tar",
                 )
+        return DatasetUploadReceipt(
+            expected_version_number=expected_version_number,
+            expected_files=expected_files,
+        )
 
-    def wait_dataset(self, dataset_ref: str, permission_grace_seconds: int = 0) -> str:
+    def wait_dataset(
+        self,
+        dataset_ref: str,
+        permission_grace_seconds: int = 0,
+        upload_receipt: DatasetUploadReceipt | None = None,
+    ) -> str:
         start = time.time()
         visibility_retry_logged = False
         visibility_grace = max(0, int(permission_grace_seconds or 0))
+        expected_version_number = getattr(
+            upload_receipt,
+            "expected_version_number",
+            None,
+        )
+        expected_files = dict(getattr(upload_receipt, "expected_files", ()) or ())
+        if upload_receipt is not None and expected_version_number is None:
+            raise KaggleAdapterError(
+                "Dataset upload receipt is missing the expected version number"
+            )
         while True:
-            result = self._run(["datasets", "status", dataset_ref], check=False)
+            status_args = ["datasets", "status", dataset_ref]
+            if expected_version_number is not None:
+                status_args.extend(["--format", "json"])
+            result = self._run(status_args, check=False)
             output = result.stdout.strip() or f"returncode={result.returncode}"
             status_text = output.lower()
-            if result.returncode == 0 and is_ready_kaggle_status(output):
-                return output
+            status, current_version_number = parse_kaggle_dataset_status(output)
+            elapsed = time.time() - start
+            if result.returncode == 0 and status in READY_KAGGLE_STATUSES:
+                if (
+                    expected_version_number is not None
+                    and current_version_number is not None
+                    and current_version_number > expected_version_number
+                ):
+                    raise KaggleAdapterError(
+                        f"Dataset {dataset_ref} advanced past uploaded version "
+                        f"{expected_version_number} to {current_version_number}"
+                    )
+                version_visible = (
+                    expected_version_number is None
+                    or (
+                        current_version_number is not None
+                        and current_version_number == expected_version_number
+                    )
+                )
+                missing_files = []
+                size_mismatches = []
+                inventory_error = ""
+                if version_visible and expected_files:
+                    try:
+                        remote_files = self._dataset_file_inventory(
+                            dataset_ref,
+                            version_number=expected_version_number,
+                        )
+                    except Exception as exc:
+                        inventory_error = redact_secrets(str(exc))
+                        detail = inventory_error.lower()
+                        if any(word in detail for word in ["401", "unauthorized"]):
+                            raise KaggleAdapterError(
+                                f"Dataset file visibility check failed: {inventory_error}"
+                            ) from exc
+                        if any(
+                            word in detail
+                            for word in ["403", "404", "forbidden", "not found"]
+                        ) and (visibility_grace <= 0 or elapsed > visibility_grace):
+                            raise KaggleAdapterError(
+                                f"Dataset file visibility check failed: {inventory_error}"
+                            ) from exc
+                    else:
+                        missing_files = sorted(set(expected_files) - set(remote_files))
+                        size_mismatches = sorted(
+                            name
+                            for name, expected_size in expected_files.items()
+                            if name in remote_files
+                            and remote_files[name] != expected_size
+                        )
+
+                files_visible = (
+                    not expected_files
+                    or (
+                        not inventory_error
+                        and not missing_files
+                        and not size_mismatches
+                    )
+                )
+                if version_visible and files_visible:
+                    return output
+                if not visibility_retry_logged:
+                    details = []
+                    if not version_visible:
+                        details.append(
+                            "expected version "
+                            f"{expected_version_number}, current version "
+                            f"{current_version_number or 'unknown'}"
+                        )
+                    if inventory_error:
+                        details.append(f"file listing unavailable: {inventory_error}")
+                    if missing_files:
+                        details.append(
+                            f"{len(missing_files)} expected files missing "
+                            f"(for example {missing_files[0]})"
+                        )
+                    if size_mismatches:
+                        details.append(
+                            f"{len(size_mismatches)} expected file sizes differ "
+                            f"(for example {size_mismatches[0]})"
+                        )
+                    self.log(
+                        "Dataset reports ready before the uploaded version is fully visible; "
+                        + "; ".join(details)
+                    )
+                    visibility_retry_logged = True
             if result.returncode == 0 and any(word in status_text for word in ["failed", "error", "deleted"]):
                 raise KaggleAdapterError(f"Dataset failed:\n{output}")
-            elapsed = time.time() - start
             if result.returncode != 0 and any(word in status_text for word in ["401", "unauthorized"]):
                 raise KaggleAdapterError(f"Dataset status failed:\n{output}")
             if result.returncode != 0 and any(
@@ -556,7 +814,10 @@ class KaggleAdapter:
                     continue
                 raise KaggleAdapterError(f"Dataset status failed:\n{output}")
             if elapsed > 30 * 60:
-                raise TimeoutError(f"Dataset wait timed out:\n{output}")
+                raise TimeoutError(
+                    "Dataset wait timed out before the uploaded version became visible:\n"
+                    f"{output}"
+                )
             self._sleep(self.settings.dataset_poll_seconds)
 
     def dataset_status(self, dataset_ref: str) -> str:

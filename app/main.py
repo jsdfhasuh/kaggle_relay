@@ -56,7 +56,6 @@ from app.ui_auth import (
 from app.worker import (
     TERMINAL_JOB_STATUSES,
     has_ready_dataset_cache,
-    is_ready_dataset_status,
     process_job,
     resume_kernel_job,
     rewrite_ref_owner,
@@ -974,42 +973,13 @@ def recover_job_after_restart(
         return {"action": "resume_kernel", "job_id": job_id}
 
     if status in {"uploading_dataset", "waiting_dataset"}:
-        append_internal_log(db, job_id, "restart recovery action: probe dataset readiness")
-        adapter = recovery_adapter(settings, db, auth_store, job)
-        try:
-            dataset_status = adapter.dataset_status(job["dataset_ref"])
-        except Exception as exc:
-            fail_recovered_job(
-                db,
-                job_id,
-                f"restart during dataset upload/wait before readiness could be verified; resubmit job: {exc}",
-            )
-            return None
-        if not is_ready_dataset_status(dataset_status):
-            fail_recovered_job(
-                db,
-                job_id,
-                "restart during dataset upload/wait before dataset was ready; resubmit job",
-            )
-            return None
-        db.upsert_dataset_cache(
-            dataset_ref=job["dataset_ref"],
-            payload_hash=job["payload_hash"],
-            status="ready",
-            dataset_status=dataset_status,
-            source_job_id=job_id,
-            kaggle_key_id=job.get("kaggle_key_id", ""),
+        fail_recovered_job(
+            db,
+            job_id,
+            "restart during dataset upload/wait lost the exact uploaded version; "
+            "resubmit job",
         )
-        db.upsert_last_dataset_job(
-            dataset_ref=job["dataset_ref"],
-            payload_hash=job["payload_hash"],
-            dataset_status=dataset_status,
-            job_id=job_id,
-            kaggle_key_id=job.get("kaggle_key_id", ""),
-        )
-        append_internal_log(db, job_id, "restart recovery action: requeue after verified ready dataset")
-        db.update_job(job_id, status="queued", dataset_status=dataset_status, progress=40, error="")
-        return {"action": "process", "job_id": job_id}
+        return None
 
     if status == "assembling":
         append_internal_log(db, job_id, "restart recovery action: resume archive assembly then process")

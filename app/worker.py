@@ -8,9 +8,11 @@ from app.archive import ArchiveError, require_file
 from app.database import RelayDb
 from app.auth_config import AuthStore
 from app.kaggle_adapter import (
+    DatasetUploadReceipt,
     KaggleAdapter,
     KaggleAdapterInterrupted,
     is_ready_kaggle_status,
+    parse_kaggle_dataset_status,
 )
 from app.security import redact_secrets
 
@@ -58,19 +60,44 @@ def is_ready_dataset_status(status: str) -> bool:
     return is_ready_kaggle_status(status)
 
 
-def has_ready_dataset_cache(
+def ready_dataset_version(status: str) -> int | None:
+    status_name, version_number = parse_kaggle_dataset_status(status)
+    if (
+        status_name not in {"ready", "complete", "ok"}
+        or version_number is None
+        or version_number <= 0
+    ):
+        return None
+    return version_number
+
+
+def get_ready_dataset_cache(
     db: RelayDb,
     dataset_ref: str,
     payload_hash: str,
     kaggle_key_id: str = "",
-) -> bool:
+) -> dict | None:
     if not payload_hash:
-        return False
-    cache = db.get_dataset_cache(dataset_ref, payload_hash, kaggle_key_id=kaggle_key_id)
-    if cache and cache["status"] == "ready":
-        return True
-    last_job = db.get_last_dataset_job(dataset_ref, payload_hash, kaggle_key_id=kaggle_key_id)
-    if last_job and is_ready_dataset_status(last_job["dataset_status"]):
+        return None
+    cache = db.get_current_dataset_cache(dataset_ref, kaggle_key_id=kaggle_key_id)
+    if (
+        cache
+        and cache["payload_hash"] == payload_hash
+        and cache["status"] == "ready"
+        and ready_dataset_version(cache["dataset_status"]) is not None
+    ):
+        return cache
+    if cache is not None:
+        return None
+    last_job = db.get_current_last_dataset_job(
+        dataset_ref,
+        kaggle_key_id=kaggle_key_id,
+    )
+    if (
+        last_job
+        and last_job["payload_hash"] == payload_hash
+        and ready_dataset_version(last_job["dataset_status"]) is not None
+    ):
         db.upsert_dataset_cache(
             dataset_ref=dataset_ref,
             payload_hash=payload_hash,
@@ -79,8 +106,26 @@ def has_ready_dataset_cache(
             source_job_id=last_job["job_id"],
             kaggle_key_id=kaggle_key_id,
         )
-        return True
-    return False
+        return db.get_dataset_cache(
+            dataset_ref,
+            payload_hash,
+            kaggle_key_id=kaggle_key_id,
+        )
+    return None
+
+
+def has_ready_dataset_cache(
+    db: RelayDb,
+    dataset_ref: str,
+    payload_hash: str,
+    kaggle_key_id: str = "",
+) -> bool:
+    return get_ready_dataset_cache(
+        db,
+        dataset_ref,
+        payload_hash,
+        kaggle_key_id=kaggle_key_id,
+    ) is not None
 
 
 def read_metadata_json(path: Path, name: str) -> dict:
@@ -107,8 +152,8 @@ def split_kaggle_ref(value: str, name: str) -> tuple[str, str]:
 
 def kaggle_ref_slug(value: str) -> str:
     ref = str(value or "").strip()
-    parts = ref.split("/", 1)
-    if len(parts) != 2:
+    parts = ref.split("/")
+    if len(parts) < 2:
         return ""
     return parts[1].strip()
 
@@ -186,6 +231,20 @@ def rewrite_dataset_sources(metadata: dict, final_dataset_ref: str) -> bool:
     if changed:
         metadata["dataset_sources"] = rewritten
     return changed
+
+
+def pin_kernel_dataset_version(
+    kernel_dir: Path,
+    dataset_ref: str,
+    version_number: int | None,
+) -> None:
+    if version_number is None or version_number <= 0:
+        return
+    metadata_path = require_file(kernel_dir, "kernel-metadata.json")
+    metadata = read_metadata_json(metadata_path, "kernel-metadata.json")
+    versioned_ref = f"{dataset_ref}/{version_number}"
+    if rewrite_dataset_sources(metadata, versioned_ref):
+        write_metadata_json(metadata_path, metadata)
 
 
 def prepare_metadata_ref(
@@ -459,20 +518,37 @@ def process_job(
             adapter.shutdown_event = shutdown_event
         with dataset_submission_lock(job["dataset_ref"], shutdown_event):
             stop_if_cancel_requested()
-            dataset_cache_hit = has_ready_dataset_cache(
+            dataset_cache = get_ready_dataset_cache(
                 db,
                 job["dataset_ref"],
                 job["payload_hash"],
                 kaggle_key_id=kaggle_key_id,
             )
-            if dataset_cache_hit:
+            if dataset_cache:
                 validate_kernel_payload(
                     kernel_dir,
                     job["kernel_ref"],
                     credentials,
                     dataset_ref=job["dataset_ref"],
                 )
-                db.update_job(job_id, dataset_status="ready", progress=40)
+                cached_version_number = ready_dataset_version(
+                    dataset_cache["dataset_status"]
+                )
+                dataset_status = adapter.wait_dataset(
+                    job["dataset_ref"],
+                    permission_grace_seconds=(
+                        settings.dataset_status_permission_grace_seconds
+                    ),
+                    upload_receipt=DatasetUploadReceipt(
+                        expected_version_number=cached_version_number,
+                    ),
+                )
+                pin_kernel_dataset_version(
+                    kernel_dir,
+                    job["dataset_ref"],
+                    cached_version_number,
+                )
+                db.update_job(job_id, dataset_status=dataset_status, progress=40)
                 log(f"Reusing ready dataset cache for {job['dataset_ref']}")
             else:
                 stop_if_cancel_requested()
@@ -484,19 +560,36 @@ def process_job(
                     credentials,
                 )
                 transition_before_submission({"queued"}, "uploading_dataset", 20)
-                adapter.upload_dataset(
+                upload_receipt = adapter.upload_dataset(
                     dataset_dir,
                     job["dataset_ref"],
                     update_message=f"update relay dataset for {job['kernel_ref']}",
                 )
 
                 transition_before_submission({"uploading_dataset"}, "waiting_dataset", 35)
+                wait_dataset_kwargs = {
+                    "permission_grace_seconds": (
+                        settings.dataset_status_permission_grace_seconds
+                    ),
+                }
+                if upload_receipt is not None:
+                    wait_dataset_kwargs["upload_receipt"] = upload_receipt
                 dataset_status = adapter.wait_dataset(
                     job["dataset_ref"],
-                    permission_grace_seconds=settings.dataset_status_permission_grace_seconds,
+                    **wait_dataset_kwargs,
                 )
                 db.update_job(job_id, dataset_status=dataset_status, progress=40)
                 stop_if_cancel_requested()
+                dataset_version_number = ready_dataset_version(dataset_status)
+                if upload_receipt is not None and dataset_version_number is None:
+                    raise KaggleAdapterError(
+                        "Dataset wait completed without a verified version number"
+                    )
+                pin_kernel_dataset_version(
+                    kernel_dir,
+                    job["dataset_ref"],
+                    dataset_version_number,
+                )
                 if is_ready_dataset_status(dataset_status):
                     db.upsert_dataset_cache(
                         dataset_ref=job["dataset_ref"],
