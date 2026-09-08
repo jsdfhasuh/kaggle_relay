@@ -66,7 +66,7 @@ class Settings:
     api_token: str
     storage_dir: Path
     chunk_size: int = DEFAULT_CHUNK_SIZE
-    retention_hours: int = 72
+    retention_hours: int = 168
     dataset_poll_seconds: int = 20
     dataset_status_permission_grace_seconds: int = 300
     kernel_poll_seconds: int = 60
@@ -120,7 +120,7 @@ class Settings:
             api_token=token,
             storage_dir=storage_dir,
             chunk_size=int(os.environ.get("RELAY_CHUNK_SIZE", DEFAULT_CHUNK_SIZE)),
-            retention_hours=int(os.environ.get("RELAY_RETENTION_HOURS", "72")),
+            retention_hours=_read_positive_int("RELAY_RETENTION_HOURS", 168),
             dataset_poll_seconds=int(os.environ.get("RELAY_DATASET_POLL_SECONDS", "20")),
             dataset_status_permission_grace_seconds=int(
                 os.environ.get("RELAY_DATASET_STATUS_PERMISSION_GRACE_SECONDS", "300")

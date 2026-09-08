@@ -4,6 +4,12 @@ FastAPI relay for routing Training Platform Kaggle traffic through one Linux ser
 
 ## Run
 
+Completed job files are retained for 7 days by default (`RELAY_RETENTION_HOURS=168`).
+Job responses include `artifact_expires_at` for available packages and a
+`download_unavailable_code` (`not_ready`, `expired`, `missing`, or `inaccessible`).
+Only retention cleanup evidence identifies an expired package. Extending retention
+does not restore packages already removed. The hourly cleanup waits for active downloads.
+
 ```bash
 cp .env.example .env
 # Set RELAY_API_TOKEN, or configure RELAY_AUTH_CONFIG before starting.

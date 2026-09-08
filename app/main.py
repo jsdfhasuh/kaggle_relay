@@ -214,26 +214,33 @@ def status_filter_for_list(status_values: list[str] | None, active: bool) -> set
     return statuses or None
 
 
-def job_response(db: RelayDb, job_id: str) -> JobResponse:
+def job_response(db: RelayDb, job_id: str, retention_hours: int = 168) -> JobResponse:
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return job_to_response(db, job)
+    return job_to_response(db, job, retention_hours)
 
 
-def artifact_download_metadata(job: dict) -> dict:
+def artifact_download_metadata(job: dict, retention_hours: int = 168) -> dict:
     filename = f"{job['job_id']}-artifacts.zip"
     metadata = {
         "can_download": False,
         "artifact_size": None,
         "artifact_filename": filename,
         "download_unavailable_reason": "",
+        "download_unavailable_code": "",
+        "artifact_expires_at": None,
     }
     if job["status"] not in {"complete", "canceled"}:
         metadata["download_unavailable_reason"] = "job is not complete"
+        metadata["download_unavailable_code"] = "not_ready"
         return metadata
     if not job.get("artifact_path"):
         metadata["download_unavailable_reason"] = "artifact path is missing"
+        metadata["download_unavailable_code"] = "missing"
+        if job.get("kaggle_output") == "expired by relay retention cleanup":
+            metadata["download_unavailable_reason"] = "expired by relay retention cleanup"
+            metadata["download_unavailable_code"] = "expired"
         return metadata
 
     artifact_path = Path(job["artifact_path"])
@@ -241,20 +248,25 @@ def artifact_download_metadata(job: dict) -> dict:
         stat = artifact_path.stat()
     except FileNotFoundError:
         metadata["download_unavailable_reason"] = "artifact file is missing"
+        metadata["download_unavailable_code"] = "missing"
         return metadata
     except OSError:
         metadata["download_unavailable_reason"] = "artifact file is inaccessible"
+        metadata["download_unavailable_code"] = "inaccessible"
         return metadata
     if not artifact_path.is_file():
         metadata["download_unavailable_reason"] = "artifact path is not a file"
+        metadata["download_unavailable_code"] = "missing"
         return metadata
 
     metadata["can_download"] = True
     metadata["artifact_size"] = stat.st_size
+    if job.get("completed_at") is not None:
+        metadata["artifact_expires_at"] = job["completed_at"] + retention_hours * 3600
     return metadata
 
 
-def job_to_response(db: RelayDb, job: dict) -> JobResponse:
+def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobResponse:
     job_id = job["job_id"]
     dataset_cache_hit = has_ready_dataset_cache(
         db,
@@ -268,7 +280,7 @@ def job_to_response(db: RelayDb, job: dict) -> JobResponse:
                 **job,
                 "callback_enabled": bool(job.get("callback_token_sha256")),
                 "cancel_requested": bool(job.get("cancel_requested_at")),
-                **artifact_download_metadata(job),
+                **artifact_download_metadata(job, retention_hours),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
             },
@@ -1455,7 +1467,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "kaggle_key_id": kaggle_key_id,
         }
         db.create_job(values)
-        return job_response(db, job_id)
+        return job_response(db, job_id, settings.retention_hours)
 
     @app.get("/v1/jobs", response_model=list[JobResponse])
     def list_jobs(
@@ -1475,7 +1487,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             statuses=status_filter,
             limit=limit,
         )
-        return [job_to_response(db, job) for job in jobs]
+        return [job_to_response(db, job, settings.retention_hours) for job in jobs]
 
     @app.put(
         "/v1/jobs/{job_id}/archives/{archive_type}/chunks/{index}",
@@ -1559,7 +1571,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
             if job["status"] != "receiving":
-                return job_response(db, job_id)
+                return job_response(db, job_id, settings.retention_hours)
 
             if not db.update_job_if_status(
                 job_id,
@@ -1567,7 +1579,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status="assembling",
                 progress=10,
             ):
-                return job_response(db, job_id)
+                return job_response(db, job_id, settings.retention_hours)
             was_cancelled = False
             try:
                 was_cancelled, operation_error = await run_thread_to_completion(
@@ -1602,7 +1614,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             if queued:
                 await request.app.state.queue.put({"action": "process", "job_id": job_id})
-            response = job_response(db, job_id)
+            response = job_response(db, job_id, settings.retention_hours)
             if was_cancelled:
                 raise asyncio.CancelledError
             return response
@@ -1647,7 +1659,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         limiter.clear(limit_key)
         apply_progress_callback(db, job, payload)
-        return job_response(db, job["job_id"])
+        return job_response(db, job["job_id"], settings.retention_hours)
 
     @app.post("/v1/jobs/{job_id}/progress", response_model=JobResponse)
     def update_job_progress(
@@ -1670,7 +1682,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         limiter.clear(limit_key)
         apply_progress_callback(db, job, payload)
-        return job_response(db, job_id)
+        return job_response(db, job_id, settings.retention_hours)
 
     @app.post("/v1/jobs/{job_id}/cancel", response_model=JobResponse)
     async def cancel_job(
@@ -1683,7 +1695,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
             request_job_cancel(db, job)
-            return job_response(db, job_id)
+            return job_response(db, job_id, settings.retention_hours)
 
     @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
     def get_job(
@@ -1693,7 +1705,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         principal: RelayPrincipal = Depends(require_auth),
     ) -> JobResponse:
         get_authorized_job(db, job_id, principal, auth_store)
-        return job_response(db, job_id)
+        return job_response(db, job_id, settings.retention_hours)
 
     @app.get("/v1/jobs/{job_id}/artifacts.zip")
     async def download_artifacts(
@@ -1707,7 +1719,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await lock.acquire()
         try:
             job = get_authorized_job(db, job_id, principal, auth_store)
-            download = artifact_download_metadata(job)
+            download = artifact_download_metadata(job, settings.retention_hours)
             if not download["can_download"]:
                 status_code = (
                     404

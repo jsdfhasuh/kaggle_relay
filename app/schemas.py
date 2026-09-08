@@ -98,6 +98,8 @@ class JobResponse(BaseModel):
     artifact_size: Optional[int] = None
     artifact_filename: str = ""
     download_unavailable_reason: str = ""
+    download_unavailable_code: str = ""
+    artifact_expires_at: Optional[float] = None
     dataset_cache_hit: bool = False
     dataset_upload_required: bool = True
     accepted_chunks: dict[str, list[int]]
