@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1118,6 +1119,141 @@ def test_kaggle_account_probe_respects_token_key_permissions(tmp_path, monkeypat
     assert admin_missing_key.status_code == 400
 
 
+def test_chunk_bodies_are_received_concurrently(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "receiving")
+
+    async def scenario():
+        all_started = asyncio.Event()
+        started = set()
+
+        async def body(index):
+            started.add(index)
+            if len(started) == 4:
+                all_started.set()
+            yield b"1234"
+            await asyncio.wait_for(all_started.wait(), 3)
+            yield b"5678"
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            responses = await asyncio.gather(*[
+                client.put(
+                    f"/v1/jobs/{job_id}/archives/dataset/chunks/{i}",
+                    headers=auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(), "X-Chunk-Size": "8"}),
+                    content=body(i),
+                ) for i in range(4)
+            ])
+            assert [r.status_code for r in responses] == [200] * 4
+            current = (await client.get(f"/v1/jobs/{job_id}", headers=auth_headers())).json()
+            assert current["accepted_chunks"]["dataset"] == [0, 1, 2, 3]
+            assert current["max_parallel_uploads"] == 4
+            assert current["chunk_size"] == 8
+            assert current["dataset_archive_sha256"] == app.state.db.get_job(job_id)["dataset_archive_sha256"]
+
+    asyncio.run(scenario())
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+@pytest.mark.parametrize("action,chunk_status", [("cancel", 409), ("delete", 409), ("complete", 200)])
+def test_upload_rechecks_state_after_body(tmp_path, action, chunk_status):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "receiving")
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def body():
+            yield b"1234"
+            started.set()
+            await release.wait()
+            yield b"5678"
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            upload = asyncio.create_task(client.put(
+                f"/v1/jobs/{job_id}/archives/dataset/chunks/0",
+                headers=auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(), "X-Chunk-Size": "8"}),
+                content=body(),
+            ))
+            try:
+                await asyncio.wait_for(started.wait(), 3)
+                if action == "delete":
+                    response = await asyncio.wait_for(client.delete(f"/v1/jobs/{job_id}", headers=auth_headers()), 3)
+                else:
+                    response = await asyncio.wait_for(client.post(f"/v1/jobs/{job_id}/{action}", headers=auth_headers()), 3)
+                assert response.status_code == {"complete": 409, "delete": 204, "cancel": 200}[action]
+            finally:
+                release.set()
+            response = await upload
+            assert response.status_code == chunk_status
+
+    asyncio.run(scenario())
+    assert not list(tmp_path.rglob("*.tmp"))
+    if action == "cancel":
+        assert app.state.db.get_job(job_id)["status"] == "canceled"
+        assert not app.state.db.accepted_chunks(job_id)["dataset"]
+    if action == "delete":
+        assert app.state.db.get_job(job_id)["error"] == "deleted"
+        assert not app.state.db.accepted_chunks(job_id)["dataset"]
+
+
+@pytest.mark.parametrize("different", [False, True])
+def test_simultaneous_same_chunk_is_idempotent_or_conflicting(tmp_path, different):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "receiving")
+
+    async def scenario():
+        ready = asyncio.Event()
+        entered = 0
+
+        async def body(data):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                ready.set()
+            yield data[:4]
+            await asyncio.wait_for(ready.wait(), 3)
+            yield data[4:]
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            data = [b"12345678", b"abcdefgh" if different else b"12345678"]
+            responses = await asyncio.gather(*[
+                client.put(
+                    f"/v1/jobs/{job_id}/archives/dataset/chunks/0",
+                    headers=auth_headers({"X-Chunk-Sha256": hashlib.sha256(value).hexdigest(), "X-Chunk-Size": "8"}),
+                    content=body(value),
+                ) for value in data
+            ])
+            assert sorted(r.status_code for r in responses) == ([200, 409] if different else [200, 200])
+            if not different:
+                assert sorted(r.json()["duplicate"] for r in responses) == [False, True]
+
+    asyncio.run(scenario())
+    assert len(app.state.db.chunks_for(job_id, "dataset")) == 1
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_disconnected_upload_leaves_no_accepted_chunk(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    job_id = seed_job(app, "receiving")
+
+    async def scenario():
+        async def body():
+            yield b"1234"
+            raise asyncio.CancelledError()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            with pytest.raises(asyncio.CancelledError):
+                await client.put(
+                    f"/v1/jobs/{job_id}/archives/dataset/chunks/0",
+                    headers=auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(), "X-Chunk-Size": "8"}),
+                    content=body(),
+                )
+
+    asyncio.run(scenario())
+    assert app.state.db.accepted_chunks(job_id)["dataset"] == []
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
 def test_chunk_upload_duplicate_and_bad_sha(tmp_path):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
@@ -1167,7 +1303,8 @@ def test_complete_rejects_zip_path_traversal(tmp_path):
 
 def test_concurrent_complete_assembles_and_queues_once(tmp_path, monkeypatch):
     app = create_app(make_settings(tmp_path))
-    job_id = seed_job(app, "receiving")
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
     calls = 0
     calls_lock = threading.Lock()
     request_barrier = threading.Barrier(3)
@@ -1182,6 +1319,9 @@ def test_concurrent_complete_assembles_and_queues_once(tmp_path, monkeypatch):
     monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
 
     with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
         responses = []
 
         def submit_complete():
@@ -1210,7 +1350,8 @@ def test_concurrent_complete_assembles_and_queues_once(tmp_path, monkeypatch):
 
 def test_failed_complete_is_idempotent_and_redacts_secrets(tmp_path, monkeypatch):
     app = create_app(make_settings(tmp_path))
-    job_id = seed_job(app, "receiving")
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
     calls = 0
 
     def fail_assembly(*_args, **_kwargs):
@@ -1221,6 +1362,9 @@ def test_failed_complete_is_idempotent_and_redacts_secrets(tmp_path, monkeypatch
     monkeypatch.setattr("app.main.assemble_and_validate_job", fail_assembly)
 
     with TestClient(app) as client:
+        job_id = create_job(client, dataset_zip, kernel_zip)
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
         first = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
         second = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
 
@@ -1241,6 +1385,8 @@ def test_chunk_upload_is_rejected_after_complete_submission(tmp_path, monkeypatc
 
     with TestClient(app) as client:
         job_id = create_job(client, dataset_zip, kernel_zip)
+        upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
         complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
         chunk = dataset_zip[:8]
         upload = client.put(
@@ -1526,7 +1672,8 @@ def test_complete_requires_dataset_when_cache_miss(tmp_path):
         upload_all(client, job_id, "kernel", kernel_zip)
         complete = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
 
-    assert complete.status_code == 400
+    assert complete.status_code == 409
+    assert app.state.db.get_job(job_id)["status"] == "receiving"
 
 
 def test_complete_rewrites_metadata_owner_for_selected_kaggle_key(tmp_path, monkeypatch):

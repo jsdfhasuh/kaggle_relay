@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from app.archive import (
     ArchiveError,
     assemble_archive,
+    expected_chunk_count,
     safe_extract_zip,
     validate_chunk_index,
 )
@@ -1515,6 +1516,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except ArchiveError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+            expected_size = min(job["chunk_size"], total_size - index * job["chunk_size"])
+            if x_chunk_size != expected_size:
+                raise HTTPException(status_code=400, detail="invalid declared chunk size")
+            if not re.fullmatch(r"[a-fA-F0-9]{64}", x_chunk_sha256):
+                raise HTTPException(status_code=400, detail="invalid chunk sha256")
+            x_chunk_sha256 = x_chunk_sha256.lower()
+
             existing = db.get_chunk(job_id, archive_type, index)
             chunk_dir = settings.jobs_dir / job_id / "chunks" / archive_type
             chunk_path = chunk_dir / f"{index}.part"
@@ -1532,32 +1540,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             chunk_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = chunk_dir / f"{index}.{uuid.uuid4().hex}.tmp"
-            digest = hashlib.sha256()
-            size = 0
-            try:
-                async with aiofiles.open(tmp_path, "wb") as handle:
-                    async for part in request.stream():
-                        size += len(part)
-                        if size > x_chunk_size:
-                            raise HTTPException(status_code=400, detail="chunk larger than X-Chunk-Size")
-                        digest.update(part)
-                        await handle.write(part)
-                actual_sha = digest.hexdigest()
-                if size != x_chunk_size:
-                    raise HTTPException(status_code=400, detail="chunk size mismatch")
-                if actual_sha.lower() != x_chunk_sha256.lower():
-                    raise HTTPException(status_code=400, detail="chunk sha256 mismatch")
+        # Receiving a body must not hold the job-wide submission lock.
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            async with aiofiles.open(tmp_path, "wb") as handle:
+                async for part in request.stream():
+                    size += len(part)
+                    if size > x_chunk_size:
+                        raise HTTPException(status_code=400, detail="chunk larger than X-Chunk-Size")
+                    digest.update(part)
+                    await handle.write(part)
+            actual_sha = digest.hexdigest()
+            if size != x_chunk_size:
+                raise HTTPException(status_code=400, detail="chunk size mismatch")
+            if actual_sha != x_chunk_sha256:
+                raise HTTPException(status_code=400, detail="chunk sha256 mismatch")
+            async with job_submission_lock(request.app, job_id):
+                job = get_authorized_job(db, job_id, principal, auth_store)
+                if job["status"] != "receiving":
+                    raise HTTPException(status_code=409, detail="job is no longer receiving chunks")
+                existing = db.get_chunk(job_id, archive_type, index)
+                if existing:
+                    if existing["sha256"] != actual_sha or existing["size"] != size:
+                        raise HTTPException(status_code=409, detail="chunk already exists with different checksum")
+                    if chunk_path.is_file():
+                        return ChunkResponse(
+                            job_id=job_id, archive_type=archive_type, index=index,
+                            size=size, sha256=actual_sha, duplicate=True,
+                        )
                 tmp_path.replace(chunk_path)
                 db.add_chunk(job_id, archive_type, index, size, actual_sha)
-            finally:
-                tmp_path.unlink(missing_ok=True)
-            return ChunkResponse(
-                job_id=job_id,
-                archive_type=archive_type,
-                index=index,
-                size=size,
-                sha256=actual_sha,
-            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return ChunkResponse(
+            job_id=job_id, archive_type=archive_type, index=index,
+            size=size, sha256=actual_sha,
+        )
 
     @app.post("/v1/jobs/{job_id}/complete", response_model=JobResponse)
     async def complete_job(
@@ -1572,6 +1591,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             job = get_authorized_job(db, job_id, principal, auth_store)
             if job["status"] != "receiving":
                 return job_response(db, job_id, settings.retention_hours)
+
+            cache_hit = has_ready_dataset_cache(
+                db, job["dataset_ref"], job["payload_hash"],
+                kaggle_key_id=job.get("kaggle_key_id", ""),
+            )
+            for archive_type in (("kernel",) if cache_hit else ("dataset", "kernel")):
+                count = expected_chunk_count(job[f"{archive_type}_size"], job["chunk_size"])
+                rows = db.chunks_for(job_id, archive_type)
+                chunk_dir = settings.jobs_dir / job_id / "chunks" / archive_type
+                if ({row["chunk_index"] for row in rows} != set(range(count))
+                        or any(not (chunk_dir / f"{i}.part").is_file() for i in range(count))):
+                    raise HTTPException(status_code=409, detail="upload incomplete; resume missing chunks")
 
             if not db.update_job_if_status(
                 job_id,

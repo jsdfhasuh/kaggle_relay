@@ -133,6 +133,23 @@ Main endpoints:
 - `GET /v1/jobs/{job_id}/artifacts.zip`
 - `DELETE /v1/jobs/{job_id}`
 
+### Resumable parallel uploads
+
+Job creation/status responses include `chunk_size`, archive sizes and SHA-256
+digests, `accepted_chunks`, and `max_parallel_uploads` (currently 4). Clients
+must preserve the original archives and job ID, query status again after an
+interruption, and send only missing chunks using the job's original chunk size.
+Clients talking to a gateway without `max_parallel_uploads` should use one
+upload connection. Pausing an upload does not cancel the remote job.
+
+Different chunks can be received concurrently. Committing a chunk rechecks
+authorization and job status under the submission lock; duplicate chunks with
+the same size/digest are idempotent and conflicting digests return 409. Only
+complete, verified chunks are recorded. Incomplete uploads return 409 from
+`complete` and remain resumable in `receiving`, rather than becoming failed.
+If a `complete` response is lost, query the original job before taking another
+action; never create a replacement job merely because a request timed out.
+
 When `POST /v1/jobs` omits `kaggle_key_id`, Relay binds the job to the only
 allowed key, or for multi-key tokens first prefers an allowed key whose username
 matches the requested owner and has remaining GPU quota. If that owner has no
