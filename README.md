@@ -102,7 +102,7 @@ back up the SQLite database and confirm the desired retention settings. Existing
 environment variables override these defaults: a deployment with
 `RELAY_WORKER_COUNT=2` stays at two until its configuration is explicitly changed.
 See [the validation and rollout record](docs/concurrency-acceptance-2026-09-16.md)
-for the ten-user test scope and the pending Oracle configuration change.
+for the ten-user test scope and the Oracle rollout configuration.
 
 For legacy single-user mode, set `RELAY_API_TOKEN` to a long random value and
 provide Kaggle credentials with `KAGGLE_API_TOKEN`,

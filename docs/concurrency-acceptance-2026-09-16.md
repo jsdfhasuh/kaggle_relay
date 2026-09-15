@@ -34,15 +34,35 @@ no network, no published ports, no production data or credentials, two CPUs and
 These results establish functional concurrency; they do not measure production
 throughput or prove that ten real Kaggle GPU runs will be accepted simultaneously.
 
-## Pending Oracle rollout
+## Completed Oracle rollout
 
-Production remains at `cd39e44bc69936b33e0d91e91db04f152d1df703` on clean `main`
-under `/docker_volume/kaggle_relay`. Service `kaggle-relay` is managed by the local
-`docker-compose.yml`; container `kaggle_relay-kaggle-relay-1` was not restarted.
-Authenticated `/v1/health` returned HTTP 200 after validation. Root storage is
-174 GiB with approximately 90 GiB available after the authorized 180G expansion.
+The user authorized commit, push and container update. Application source commit
+`9e7966fc43d8bc96e800accd0a76e12a50453afc` was pushed to `origin/main` and deployed
+under `/docker_volume/kaggle_relay` using its existing `docker-compose.yml`.
+Container `kaggle_relay-kaggle-relay-1` started at `2026-09-15T18:27:14.366205416Z`
+(2026-09-16 02:27 China time) with image
+`sha256:406b5ceee4797e6808eb921c1f027589d7d8d3beee38bfaaf011c56fd7296bad`.
+All 14 Python source files in the image matched the deployed checkout.
 
-After explicit deployment authorization:
+Internal and public HTTPS authenticated `/v1/health` returned HTTP 200. Database
+`quick_check` returned `ok`, startup had no error lines, and restart count was 0.
+The effective worker count is 10, assembly workers 2, account concurrency 1 and
+global upload streams 40. Root storage remains 174 GiB with about 90 GiB free.
+
+The consistent database, environment and auth configuration backup is
+`/docker_volume/kaggle_relay-backups/before-concurrency-20260915T182646Z`.
+Files are protected on the host; the directory also records the previous source
+commit and tagged rollback image. No credentials are included in this document.
+All 98 jobs retained their previous status totals: 36 complete, 54 failed,
+5 canceled and 3 receiving. All three receiving jobs received the migration
+grace period. Maintenance recorded 83 cleaned terminal jobs and bounded logs
+to 2,000 per job (114,164 total logs after the first pass).
+
+Desktop upload retry support was pushed in `f38fb30`. Distribution of a rebuilt
+desktop application and ten real Kaggle training runs remain separate from this
+server deployment. No real training was launched as part of the rollout.
+
+Rollout procedure (steps 1–4 and health/configuration checks completed):
 
 1. Commit and push the reviewed Relay source, then verify the remote branch,
    worktree and deployment method again. Preserve all unrelated desktop changes.
@@ -79,4 +99,5 @@ policy. Maintenance truncates each job's historical logs to its newest 2,000
 entries; expired file deletion cannot be undone by rolling back the image.
 Rollback should stop the service, restore the previous image/configuration and
 use the consistent database backup if needed, accounting for jobs created since
-that backup. No production rollout or cleanup was performed during validation.
+that backup. Isolated validation preceded the separately authorized production
+rollout; subsequent changes to this record are documentation only.
