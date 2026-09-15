@@ -20,6 +20,10 @@ The server suite reports two dependency deprecation warnings. The intended local
 Relay requirements was used instead. No desktop GUI or packaged executable
 acceptance was performed.
 
+The first GitHub Actions run exposed a test collection path issue with the
+`pytest` console entry point. `pytest.ini` now explicitly includes the repository
+root in `pythonpath`, matching the successful `python -m pytest` runs above.
+
 The ten-user scenario exercises real API creation, four-way chunk uploads,
 SHA-256 checks and ZIP assembly. Ten mocked long-running training jobs occupy
 all job workers, while an additional upload and assembly still finish with the
