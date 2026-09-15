@@ -5,6 +5,7 @@ import shutil
 import stat
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 
 class ArchiveError(ValueError):
@@ -31,12 +32,20 @@ def validate_chunk_index(index: int, total_size: int, chunk_size: int) -> None:
         raise ArchiveError(f"chunk index {index} out of range 0..{count - 1}")
 
 
+def _copy_file(src, out, space_check: Callable[[int], None] | None = None) -> None:
+    for chunk in iter(lambda: src.read(1024 * 1024), b""):
+        if space_check:
+            space_check(len(chunk))
+        out.write(chunk)
+
+
 def assemble_archive(
     chunks_dir: Path,
     archive_path: Path,
     total_size: int,
     chunk_size: int,
     expected_sha256: str,
+    space_check: Callable[[int], None] | None = None,
 ) -> str:
     count = expected_chunk_count(total_size, chunk_size)
     archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,7 +55,7 @@ def assemble_archive(
             if not chunk_path.exists():
                 raise ArchiveError(f"missing chunk {index}")
             with chunk_path.open("rb") as src:
-                shutil.copyfileobj(src, out, length=1024 * 1024)
+                _copy_file(src, out, space_check)
     actual_size = archive_path.stat().st_size
     if actual_size != total_size:
         raise ArchiveError(f"archive size mismatch: expected {total_size}, got {actual_size}")
@@ -71,7 +80,8 @@ def _safe_member_target(dest_dir: Path, member_name: str) -> Path:
     return target
 
 
-def safe_extract_zip(zip_path: Path, dest_dir: Path, expected_max_size: int) -> None:
+def safe_extract_zip(zip_path: Path, dest_dir: Path, expected_max_size: int,
+                     space_check: Callable[[int], None] | None = None) -> None:
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +104,7 @@ def safe_extract_zip(zip_path: Path, dest_dir: Path, expected_max_size: int) -> 
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(info) as src, target.open("wb") as out:
-                shutil.copyfileobj(src, out, length=1024 * 1024)
+                _copy_file(src, out, space_check)
 
 
 def require_file(root: Path, relative_path: str) -> Path:

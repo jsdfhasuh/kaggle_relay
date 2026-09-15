@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 
 DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024
-DEFAULT_WORKER_COUNT = 2
+DEFAULT_WORKER_COUNT = 10
 MIN_ADMIN_TOKEN_LENGTH = 8
 DEFAULT_AUTH_FAILURE_LIMIT = 10
 DEFAULT_AUTH_FAILURE_WINDOW_SECONDS = 60
@@ -72,6 +72,18 @@ class Settings:
     kernel_poll_seconds: int = 60
     kernel_max_wait_seconds: int = 12 * 60 * 60
     worker_count: int = DEFAULT_WORKER_COUNT
+    assembly_workers: int = 2
+    account_concurrency: int = 1
+    command_timeout_seconds: int = 300
+    transfer_timeout_seconds: int = 7200
+    receiving_retention_hours: int = 168
+    max_logs_per_job: int = 2000
+    max_active_jobs: int = 40
+    max_active_jobs_per_user: int = 4
+    max_archive_bytes: int = 8 * 1024**3
+    min_free_bytes: int = 5 * 1024**3
+    max_parallel_uploads: int = 40
+    upload_idle_seconds: int = 60
     auth_failure_limit: int = DEFAULT_AUTH_FAILURE_LIMIT
     auth_failure_window_seconds: int = DEFAULT_AUTH_FAILURE_WINDOW_SECONDS
     auth_lockout_seconds: int = DEFAULT_AUTH_LOCKOUT_SECONDS
@@ -85,6 +97,17 @@ class Settings:
         if type(self.worker_count) is not int or self.worker_count < 1:
             raise ValueError("worker_count must be a positive integer")
         for name in (
+            "assembly_workers",
+            "account_concurrency",
+            "command_timeout_seconds",
+            "transfer_timeout_seconds",
+            "receiving_retention_hours",
+            "max_logs_per_job",
+            "max_active_jobs",
+            "max_active_jobs_per_user",
+            "max_archive_bytes",
+            "max_parallel_uploads",
+            "upload_idle_seconds",
             "auth_failure_limit",
             "auth_failure_window_seconds",
             "auth_lockout_seconds",
@@ -92,6 +115,8 @@ class Settings:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if type(self.min_free_bytes) is not int or self.min_free_bytes < 0:
+            raise ValueError("min_free_bytes must be a non-negative integer")
         admin_token = str(self.admin_token or "").strip()
         if admin_token and not self.auth_config_path:
             raise ValueError("admin_token requires auth_config_path")
@@ -133,6 +158,18 @@ class Settings:
                 "RELAY_WORKER_COUNT",
                 DEFAULT_WORKER_COUNT,
             ),
+            assembly_workers=_read_positive_int("RELAY_ASSEMBLY_WORKERS", 2),
+            account_concurrency=_read_positive_int("RELAY_ACCOUNT_CONCURRENCY", 1),
+            command_timeout_seconds=_read_positive_int("RELAY_COMMAND_TIMEOUT_SECONDS", 300),
+            transfer_timeout_seconds=_read_positive_int("RELAY_TRANSFER_TIMEOUT_SECONDS", 7200),
+            receiving_retention_hours=_read_positive_int("RELAY_RECEIVING_RETENTION_HOURS", 168),
+            max_logs_per_job=_read_positive_int("RELAY_MAX_LOGS_PER_JOB", 2000),
+            max_active_jobs=_read_positive_int("RELAY_MAX_ACTIVE_JOBS", 40),
+            max_active_jobs_per_user=_read_positive_int("RELAY_MAX_ACTIVE_JOBS_PER_USER", 4),
+            max_archive_bytes=_read_positive_int("RELAY_MAX_ARCHIVE_BYTES", 8 * 1024**3),
+            min_free_bytes=int(os.environ.get("RELAY_MIN_FREE_BYTES", 5 * 1024**3)),
+            max_parallel_uploads=_read_positive_int("RELAY_MAX_PARALLEL_UPLOADS", 40),
+            upload_idle_seconds=_read_positive_int("RELAY_UPLOAD_IDLE_SECONDS", 60),
             auth_failure_limit=_read_positive_int(
                 "RELAY_AUTH_FAILURE_LIMIT",
                 DEFAULT_AUTH_FAILURE_LIMIT,

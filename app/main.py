@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 import weakref
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, get_args
@@ -27,6 +29,8 @@ from app.archive import (
 )
 from app.auth_config import AuthConfigError, AuthSelectionError, AuthStore, RelayPrincipal, bearer_token
 from app.config import Settings
+from app.capacity import CapacityError, StorageBudget
+from app.quota_cache import QuotaCache
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted
 from app.schemas import (
@@ -281,6 +285,10 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
                 **job,
                 "callback_enabled": bool(job.get("callback_token_sha256")),
                 "cancel_requested": bool(job.get("cancel_requested_at")),
+                "upload_expires_at": (
+                    float(job["upload_activity_at"]) + getattr(db, "receiving_retention_hours", 168) * 3600
+                    if job["status"] == "receiving" and job.get("upload_activity_at") else None
+                ),
                 **artifact_download_metadata(job, retention_hours),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
@@ -436,10 +444,18 @@ def quota_key_candidates(
     exhausted: list[str] = []
     unavailable: list[str] = []
 
+    lookups = {}
+    cache = getattr(settings, "_quota_cache", None)
+    if cache:
+        for key_id in key_ids:
+            credentials = auth_store.credentials_for(key_id)
+            adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
+            lookups[key_id] = cache.submit((credentials, settings.kaggle_cmd), adapter.quota)
     for key_id in key_ids:
         try:
             credentials = auth_store.credentials_for(key_id)
-            quota = KaggleAdapter(settings, lambda _message: None, credentials=credentials).quota()
+            quota = (lookups[key_id].result() if cache else
+                     KaggleAdapter(settings, lambda _message: None, credentials=credentials).quota())
             remaining = quota_remaining_hours(quota)
         except Exception as exc:
             unavailable.append(f"{key_id}: {redact_secrets(str(exc))[-300:]}")
@@ -455,12 +471,12 @@ def quota_key_candidates(
     return candidates, exhausted, unavailable
 
 
-def select_kaggle_key_by_quota(
+def select_kaggle_key_candidates(
     settings: Settings,
     auth_store: AuthStore,
     principal: RelayPrincipal,
     preferred_owner: str = "",
-) -> str:
+) -> list[tuple[float, str]]:
     allowed_key_ids = public_allowed_key_ids(auth_store, principal)
     preferred_owner = preferred_owner.strip()
     all_exhausted: list[str] = []
@@ -482,7 +498,7 @@ def select_kaggle_key_by_quota(
         if preferred_key_ids:
             candidates, exhausted, unavailable = quota_key_candidates(settings, auth_store, preferred_key_ids)
             if candidates:
-                return max(candidates)[1]
+                return candidates
             all_exhausted.extend(exhausted)
             all_unavailable.extend(unavailable)
         allowed_key_ids = fallback_key_ids
@@ -492,7 +508,7 @@ def select_kaggle_key_by_quota(
     all_unavailable.extend(unavailable)
 
     if candidates:
-        return max(candidates)[1]
+        return candidates
     if all_exhausted:
         raise HTTPException(
             status_code=409,
@@ -504,26 +520,48 @@ def select_kaggle_key_by_quota(
     raise HTTPException(status_code=503, detail=detail)
 
 
-def resolve_job_kaggle_key_id(
+def resolve_job_kaggle_candidates(
     settings: Settings,
     auth_store: AuthStore,
     principal: RelayPrincipal,
     requested_key_id: str = "",
     dataset_ref: str = "",
     kernel_ref: str = "",
-) -> str:
+) -> list[tuple[float, str]]:
     requested = str(requested_key_id or "").strip()
     if requested:
-        return auth_store.resolve_kaggle_key_id(principal, requested)
+        return [(0, auth_store.resolve_kaggle_key_id(principal, requested))]
     if auth_store.legacy or len(public_allowed_key_ids(auth_store, principal)) <= 1:
-        return auth_store.resolve_kaggle_key_id(principal, requested)
-    return select_kaggle_key_by_quota(
+        return [(0, auth_store.resolve_kaggle_key_id(principal, requested))]
+    return select_kaggle_key_candidates(
         settings,
         auth_store,
         principal,
         preferred_owner=requested_owner_from_refs(dataset_ref, kernel_ref),
     )
 
+
+def resolve_job_kaggle_key_id(settings, auth_store, principal, requested_key_id="", dataset_ref="", kernel_ref="") -> str:
+    return max(resolve_job_kaggle_candidates(settings, auth_store, principal, requested_key_id, dataset_ref, kernel_ref))[1]
+
+
+def account_key(auth_store: AuthStore, key_id: str) -> str:
+    try:
+        credentials = auth_store.credentials_for(key_id)
+    except AuthSelectionError:
+        # The worker reports a removed credential as a job failure, not a scheduler failure.
+        credentials = None
+    username = str(getattr(credentials, "username", "") or "").strip().lower()
+    return f"user:{username}" if username else f"key:{key_id}"
+
+
+def least_loaded_key(db: RelayDb, auth_store: AuthStore, candidates: list[tuple[float, str]]) -> str:
+    loads = {}
+    for job in db.list_jobs_by_status(ACTIVE_JOB_STATUSES):
+        key = account_key(auth_store, job.get("kaggle_key_id", ""))
+        loads[key] = loads.get(key, 0) + 1
+    return min(candidates, key=lambda candidate: (loads.get(account_key(auth_store, candidate[1]), 0),
+                                                 -candidate[0], candidate[1]))[1]
 
 def ref_owner(value: str) -> str:
     ref = str(value or "").strip()
@@ -824,6 +862,11 @@ def assemble_and_validate_job(settings: Settings, db: RelayDb, auth_store: AuthS
         job["payload_hash"],
         kaggle_key_id=job.get("kaggle_key_id", ""),
     )
+
+    budget = getattr(settings, "_storage_budget", None)
+    inputs_size = job["kernel_size"] + (0 if dataset_cache_hit else job["dataset_size"])
+    if budget:
+        budget.reserve(job_id, inputs_size * 2)
     if not dataset_cache_hit:
         dataset_zip = archives_dir / "dataset.zip"
         assemble_archive(
@@ -832,16 +875,34 @@ def assemble_and_validate_job(settings: Settings, db: RelayDb, auth_store: AuthS
             job["dataset_size"],
             job["chunk_size"],
             job["dataset_archive_sha256"],
+            space_check=budget.check_free if budget else None,
         )
-        safe_extract_zip(dataset_zip, extracted_dir / "dataset", job["dataset_size"])
+        if budget:
+            budget.consume(job_id, job["dataset_size"])
     assemble_archive(
         job_dir / "chunks" / "kernel",
         kernel_zip,
         job["kernel_size"],
         job["chunk_size"],
         job["kernel_archive_sha256"],
+        space_check=budget.check_free if budget else None,
     )
-    safe_extract_zip(kernel_zip, extracted_dir / "kernel", job["kernel_size"])
+    inputs = [("kernel", kernel_zip)]
+    if not dataset_cache_hit:
+        inputs.append(("dataset", dataset_zip))
+    if budget:
+        sizes = []
+        for kind, path in inputs:
+            with zipfile.ZipFile(path) as archive:
+                sizes.append(sum(((info.file_size + 4095) // 4096 + 1) * 4096 for info in archive.infolist()))
+        budget.reserve(job_id, sum(sizes))
+    for kind, path in inputs:
+        if budget:
+            budget.check_free()
+        safe_extract_zip(path, extracted_dir / kind, job[f"{kind}_size"],
+                         space_check=budget.check_free if budget else None)
+    if budget:
+        budget.consume(job_id, sum(sizes))
     if dataset_cache_hit:
         validate_kernel_payload(
             extracted_dir / "kernel",
@@ -1010,6 +1071,7 @@ def recover_job_after_restart(
 async def recover_incomplete_jobs(app: FastAPI) -> None:
     jobs = app.state.db.list_jobs_by_status(RUNNING_JOB_STATUSES)
     LOGGER.info("startup recovery scan found %s incomplete job(s)", len(jobs))
+    items = []
     for job in jobs:
         item = await asyncio.to_thread(
             recover_job_after_restart,
@@ -1024,7 +1086,9 @@ async def recover_incomplete_jobs(app: FastAPI) -> None:
                 item["job_id"],
                 recovery_item_description(item),
             )
-            await app.state.queue.put(item)
+            items.append(item)
+    for item in sorted(items, key=lambda item: item.get("action") != "resume_kernel"):
+        await app.state.queue.put(item)
 
 
 def normalize_queue_item(item) -> dict:
@@ -1041,6 +1105,19 @@ def job_submission_lock(app: FastAPI, job_id: str) -> asyncio.Lock:
     return lock
 
 
+async def upload_body(request: Request, idle_seconds: int):
+    stream = request.stream().__aiter__()
+    while True:
+        try:
+            async with asyncio.timeout(idle_seconds):
+                part = await anext(stream)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as exc:
+            raise HTTPException(status_code=408, detail="upload body timed out; retry this chunk") from exc
+        yield part
+
+
 def mark_worker_exception(db: RelayDb, job_id: str, exc: Exception) -> None:
     message = redact_secrets(str(exc))
     db.append_log(job_id, f"worker action failed: {message}")
@@ -1053,8 +1130,10 @@ async def run_thread_to_completion(
     app: FastAPI,
     operation,
     *args,
+    executor=None,
 ) -> tuple[bool, BaseException | None]:
-    thread_task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    executor = executor or getattr(app.state, "maintenance_executor", None)
+    thread_task = asyncio.get_running_loop().run_in_executor(executor, operation, *args)
     app.state.worker_thread_tasks.add(thread_task)
     was_cancelled = False
     try:
@@ -1101,6 +1180,7 @@ async def run_worker_item(app: FastAPI, item: dict) -> None:
         app,
         operation,
         *args,
+        executor=app.state.worker_executor,
     )
     if operation_error is not None:
         if was_cancelled and isinstance(operation_error, KaggleAdapterInterrupted):
@@ -1143,7 +1223,17 @@ async def worker_loop(app: FastAPI, worker_index: int = 0) -> None:
             LOGGER.warning("skipping duplicate queued item for active job %s", job_id)
             app.state.queue.task_done()
             continue
+        account = account_key(app.state.auth_store, job.get("kaggle_key_id", ""))
+        active = app.state.active_accounts.get(account, 0)
+        # Recovered remote runs already consume Kaggle slots and must all be monitored.
+        if item.get("action") != "resume_kernel" and active >= app.state.settings.account_concurrency:
+            app.state.account_pending.setdefault(account, {})[job_id] = item
+            app.state.db.update_job(job_id, queue_reason="waiting for an available Kaggle account slot")
+            app.state.queue.task_done()
+            continue
         app.state.active_job_ids.add(job_id)
+        app.state.active_accounts[account] = active + 1
+        app.state.db.update_job(job_id, queue_reason="")
         try:
             await run_worker_item(app, item)
         except asyncio.CancelledError:
@@ -1158,16 +1248,28 @@ async def worker_loop(app: FastAPI, worker_index: int = 0) -> None:
             mark_worker_exception(app.state.db, job_id, exc)
         finally:
             app.state.active_job_ids.discard(job_id)
+            app.state.active_accounts[account] -= 1
+            for waiting in app.state.account_pending.pop(account, {}).values():
+                app.state.queue.put_nowait(waiting)
             app.state.queue.task_done()
 
 
 def cleanup_expired_job(settings: Settings, db: RelayDb, job_id: str) -> None:
-    shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
-    shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
+    job = db.get_job(job_id)
+    if not job or job.get("cleaned_at") is not None:
+        return
+    for path in (settings.jobs_dir / job_id, settings.artifacts_dir / job_id):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
     db.update_job(
         job_id,
         artifact_path="",
         kaggle_output="expired by relay retention cleanup",
+        cleaned_at=time.time(),
+        cleanup_due_at=None,
+        reserved_bytes=0,
     )
     db.append_log(job_id, "expired by relay retention cleanup")
 
@@ -1176,8 +1278,21 @@ async def cleanup_expired_jobs(app: FastAPI) -> None:
     settings = app.state.settings
     db = app.state.db
     cutoff = time.time() - settings.retention_hours * 60 * 60
-    for job_id in db.completed_before(cutoff):
+    receiving_cutoff = time.time() - settings.receiving_retention_hours * 3600
+    stale = set(db.stale_receiving(receiving_cutoff))
+    for job_id in dict.fromkeys(db.completed_before(cutoff) + sorted(stale)):
         async with job_submission_lock(app, job_id):
+            if job_id in app.state.active_uploads or job_id in app.state.active_job_ids:
+                continue
+            job = db.get_job(job_id)
+            if not job or job.get("cleaned_at") is not None:
+                continue
+            if job_id in stale:
+                if job["status"] != "receiving" or job["upload_activity_at"] >= receiving_cutoff:
+                    continue
+                if not db.update_job_if_status(job_id, {"receiving"}, status="failed", error="upload expired after inactivity",
+                                               cleanup_due_at=time.time()):
+                    continue
             was_cancelled, operation_error = await run_thread_to_completion(
                 app,
                 cleanup_expired_job,
@@ -1192,14 +1307,23 @@ async def cleanup_expired_jobs(app: FastAPI) -> None:
                     redact_secrets(str(operation_error)),
                 )
                 raise asyncio.CancelledError
-            raise operation_error
+            LOGGER.error("retention cleanup failed for job %s: %s", job_id, redact_secrets(str(operation_error)))
+            continue
         if was_cancelled:
             raise asyncio.CancelledError
 
 
 async def cleanup_loop(app: FastAPI) -> None:
     while True:
-        await cleanup_expired_jobs(app)
+        try:
+            await cleanup_expired_jobs(app)
+            was_cancelled, error = await run_thread_to_completion(app, app.state.db.trim_logs)
+            if was_cancelled:
+                raise asyncio.CancelledError
+            if error:
+                raise error
+        except Exception as exc:
+            LOGGER.error("retention cleanup failed: %s", redact_secrets(str(exc)))
         await asyncio.sleep(60 * 60)
 
 
@@ -1230,10 +1354,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await app.state.cleanup_task
             except asyncio.CancelledError:
                 pass
+            app.state.worker_executor.shutdown(wait=True)
+            app.state.maintenance_executor.shutdown(wait=True)
+            settings._quota_cache.shutdown()
 
     app = FastAPI(title="Kaggle Relay", version=VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.db = RelayDb(settings.db_path)
+    app.state.db.max_logs_per_job = settings.max_logs_per_job
+    app.state.db.receiving_retention_hours = settings.receiving_retention_hours
+    app.state.storage_budget = StorageBudget(settings, app.state.db)
+    settings._storage_budget = app.state.storage_budget
+    settings._quota_cache = QuotaCache()
     app.state.auth_store = AuthStore.from_settings(settings)
     app.state.auth_failure_limiter = AuthFailureLimiter(
         settings.auth_failure_limit,
@@ -1244,6 +1376,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.worker_tasks = []
     app.state.worker_task = None
     app.state.worker_thread_tasks = set()
+    app.state.worker_executor = ThreadPoolExecutor(max_workers=settings.worker_count, thread_name_prefix="relay-job")
+    app.state.maintenance_executor = ThreadPoolExecutor(max_workers=settings.assembly_workers, thread_name_prefix="relay-files")
+    app.state.assembly_slots = asyncio.Semaphore(settings.assembly_workers)
+    app.state.active_accounts = {}
+    app.state.account_pending = {}
+    app.state.active_uploads = {}
+    app.state.user_uploads = {}
+    app.state.upload_count = 0
     app.state.active_job_ids = set()
     app.state.shutdown_event = threading.Event()
     settings._shutdown_event = app.state.shutdown_event
@@ -1434,13 +1574,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/jobs", response_model=JobResponse)
     def create_job(
         payload: CreateJobRequest,
+        request: Request,
         settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> JobResponse:
         try:
-            kaggle_key_id = resolve_job_kaggle_key_id(
+            candidates = resolve_job_kaggle_candidates(
                 settings,
                 auth_store,
                 principal,
@@ -1450,24 +1591,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except AuthSelectionError as exc:
             raise selection_error(exc) from exc
-        credentials = auth_store.credentials_for(kaggle_key_id)
-        dataset_ref, kernel_ref = final_job_refs(
-            payload.dataset_ref,
-            payload.kernel_ref,
-            str(getattr(credentials, "username", "") or ""),
-        )
-        job_id = uuid.uuid4().hex
-        (settings.jobs_dir / job_id / "chunks" / "dataset").mkdir(parents=True, exist_ok=True)
-        (settings.jobs_dir / job_id / "chunks" / "kernel").mkdir(parents=True, exist_ok=True)
-        values = {
-            **payload.model_dump(),
-            "dataset_ref": dataset_ref,
-            "kernel_ref": kernel_ref,
-            "job_id": job_id,
-            "relay_token_id": principal.id,
-            "kaggle_key_id": kaggle_key_id,
-        }
-        db.create_job(values)
+        if max(payload.dataset_size, payload.kernel_size) > settings.max_archive_bytes or payload.chunk_size > settings.chunk_size:
+            raise HTTPException(status_code=413, detail="archive or chunk exceeds the configured size limit")
+        if max(expected_chunk_count(size, payload.chunk_size) for size in (payload.dataset_size, payload.kernel_size)) > 65536:
+            raise HTTPException(status_code=413, detail="archive has too many chunks; use a larger chunk size")
+        budget = request.app.state.storage_budget
+        with budget.lock:
+            kaggle_key_id = least_loaded_key(db, auth_store, candidates)
+            credentials = auth_store.credentials_for(kaggle_key_id)
+            dataset_ref, kernel_ref = final_job_refs(
+                payload.dataset_ref, payload.kernel_ref,
+                str(getattr(credentials, "username", "") or ""),
+            )
+            reserved_bytes = 3 * (payload.dataset_size + payload.kernel_size)
+            try:
+                budget.check_admission(principal.id, reserved_bytes)
+            except CapacityError as exc:
+                raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"}) from exc
+            job_id = uuid.uuid4().hex
+            (settings.jobs_dir / job_id / "chunks" / "dataset").mkdir(parents=True, exist_ok=True)
+            (settings.jobs_dir / job_id / "chunks" / "kernel").mkdir(parents=True, exist_ok=True)
+            values = {
+                **payload.model_dump(), "dataset_ref": dataset_ref, "kernel_ref": kernel_ref,
+                "job_id": job_id, "relay_token_id": principal.id, "kaggle_key_id": kaggle_key_id,
+                "reserved_bytes": reserved_bytes,
+            }
+            db.create_job(values)
         return job_response(db, job_id, settings.retention_hours)
 
     @app.get("/v1/jobs", response_model=list[JobResponse])
@@ -1528,6 +1677,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             chunk_path = chunk_dir / f"{index}.part"
             if existing:
                 if existing["sha256"] == x_chunk_sha256 and existing["size"] == x_chunk_size and chunk_path.exists():
+                    db.touch_upload(job_id)
                     return ChunkResponse(
                         job_id=job_id,
                         archive_type=archive_type,
@@ -1540,12 +1690,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             chunk_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = chunk_dir / f"{index}.{uuid.uuid4().hex}.tmp"
+            state = request.app.state
+            if state.upload_count >= settings.max_parallel_uploads or state.user_uploads.get(principal.id, 0) >= 4:
+                raise HTTPException(status_code=429, detail="upload slots are busy; retry this chunk", headers={"Retry-After": "1"})
+            try:
+                state.storage_budget.check_free(x_chunk_size)
+            except CapacityError as exc:
+                raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"}) from exc
+            db.touch_upload(job_id)
+            state.upload_count += 1
+            state.user_uploads[principal.id] = state.user_uploads.get(principal.id, 0) + 1
+            state.active_uploads[job_id] = state.active_uploads.get(job_id, 0) + 1
         # Receiving a body must not hold the job-wide submission lock.
         digest = hashlib.sha256()
         size = 0
+        last_space_check = time.monotonic()
         try:
             async with aiofiles.open(tmp_path, "wb") as handle:
-                async for part in request.stream():
+                async for part in upload_body(request, settings.upload_idle_seconds):
+                    if time.monotonic() - last_space_check >= 1:
+                        try:
+                            state.storage_budget.check_free(len(part))
+                        except CapacityError as exc:
+                            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"}) from exc
+                        last_space_check = time.monotonic()
                     size += len(part)
                     if size > x_chunk_size:
                         raise HTTPException(status_code=400, detail="chunk larger than X-Chunk-Size")
@@ -1572,7 +1740,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 tmp_path.replace(chunk_path)
                 db.add_chunk(job_id, archive_type, index, size, actual_sha)
         finally:
-            tmp_path.unlink(missing_ok=True)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            finally:
+                state.upload_count -= 1
+                state.user_uploads[principal.id] -= 1
+                if not state.user_uploads[principal.id]:
+                    state.user_uploads.pop(principal.id)
+                state.active_uploads[job_id] -= 1
+                if not state.active_uploads[job_id]:
+                    state.active_uploads.pop(job_id)
         return ChunkResponse(
             job_id=job_id, archive_type=archive_type, index=index,
             size=size, sha256=actual_sha,
@@ -1612,17 +1789,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ):
                 return job_response(db, job_id, settings.retention_hours)
             was_cancelled = False
+            operation_started = False
             try:
-                was_cancelled, operation_error = await run_thread_to_completion(
-                    request.app,
-                    assemble_and_validate_job,
-                    settings,
-                    db,
-                    auth_store,
-                    job,
-                )
+                async with request.app.state.assembly_slots:
+                    operation_started = True
+                    was_cancelled, operation_error = await run_thread_to_completion(
+                        request.app, assemble_and_validate_job, settings, db, auth_store, job,
+                    )
                 if operation_error is not None:
                     raise operation_error
+            except asyncio.CancelledError:
+                if not operation_started:
+                    db.update_job_if_status(job_id, {"assembling"}, status="receiving")
+                raise
+            except CapacityError as exc:
+                db.update_job_if_status(job_id, {"assembling"}, status="receiving", error=str(exc))
+                if was_cancelled:
+                    raise asyncio.CancelledError from exc
+                raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"}) from exc
             except Exception as exc:
                 db.update_job_if_status(
                     job_id,
@@ -1642,6 +1826,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"assembling"},
                 status="queued",
                 progress=15,
+                queue_reason="waiting for an available worker",
+                error="",
             )
             if queued:
                 await request.app.state.queue.put({"action": "process", "job_id": job_id})

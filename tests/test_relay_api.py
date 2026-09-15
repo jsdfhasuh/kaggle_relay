@@ -2860,7 +2860,9 @@ def test_worker_loop_marks_failed_and_continues_after_exception(tmp_path, monkey
 
 
 def test_worker_loop_runs_jobs_concurrently_when_configured(tmp_path, monkeypatch):
-    app = create_app(make_settings(tmp_path, worker_count=2))
+    settings = make_settings(tmp_path, worker_count=2)
+    settings.account_concurrency = 2
+    app = create_app(settings)
     first_id = seed_job(app, "queued", progress=15, job_id="firstparalleljob000000000000000")
     second_id = seed_job(app, "queued", progress=15, job_id="secondparalleljob00000000000000")
     state_lock = threading.Lock()
@@ -3482,6 +3484,7 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
     )
     monkeypatch.setattr(kaggle_api_module, "KaggleApi", FakeKaggleApi)
     adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    adapter._sdk_in_process = True  # Unit-test SDK behavior; process isolation has separate coverage.
 
     receipt = adapter.upload_dataset(tmp_path, "demo/data", "update files")
 
@@ -3521,6 +3524,7 @@ def test_upload_dataset_fails_when_existing_version_is_unavailable(
     )
     monkeypatch.setattr(kaggle_api_module, "KaggleApi", FakeKaggleApi)
     adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
+    adapter._sdk_in_process = True  # Unit-test SDK behavior; process isolation has separate coverage.
 
     with pytest.raises(KaggleAdapterError, match="Unable to read current Dataset version"):
         adapter.upload_dataset(tmp_path, "demo/data", "update files")

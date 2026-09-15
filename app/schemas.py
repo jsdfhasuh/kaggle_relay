@@ -75,6 +75,8 @@ class JobResponse(BaseModel):
     dataset_ref: str
     kernel_ref: str
     status: JobStatus
+    queue_reason: str = ""
+    upload_expires_at: Optional[float] = None
     progress: float
     dataset_status: str = ""
     kernel_status: str = ""

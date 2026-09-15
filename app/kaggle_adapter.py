@@ -5,6 +5,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tempfile
@@ -19,7 +20,7 @@ from typing import Callable, Optional
 from app.archive import require_file
 from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
-from app.security import redact_secrets
+from app.security import redact_secrets, register_secret
 
 
 YOLO_ARTIFACT_FILE_PATTERN = (
@@ -276,6 +277,7 @@ class KaggleAdapter:
         self.log = log
         self.credentials = credentials
         self.shutdown_event = shutdown_event
+        self._sdk_in_process = False
 
     def _check_interrupted(self) -> None:
         if self.shutdown_event and self.shutdown_event.is_set():
@@ -328,48 +330,103 @@ class KaggleAdapter:
         cwd: Optional[Path] = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess:
-        self._check_interrupted()
         cmd = [self.settings.kaggle_cmd] + args
         self.log("[CMD] " + redact_secrets(" ".join(cmd)))
+        transfer = len(args) > 1 and args[0] == "kernels" and args[1] in {"push", "output"}
+        return self._run_command(
+            cmd, cwd=cwd, check=check,
+            timeout=self.settings.transfer_timeout_seconds if transfer else self.settings.command_timeout_seconds,
+            check_space=transfer,
+        )
+
+    def _run_command(self, cmd, *, cwd=None, check=True, timeout=None, input_text=None, check_space=False):
+        self._check_interrupted()
+        env = self._env()
+        budget = getattr(self.settings, "_storage_budget", None) if check_space else None
+        if budget:
+            budget.check_free()
+        for name in ("KAGGLE_KEY", "KAGGLE_API_TOKEN"):
+            register_secret(env.get(name, ""))
+        # Explicit credentials must not fall back to another account's cached login.
+        with tempfile.TemporaryDirectory(prefix="relay-kaggle-config-") as config_dir:
+            if self.credentials and not self.credentials.config_dir:
+                env["KAGGLE_CONFIG_DIR"] = config_dir
+            return self._communicate(cmd, env, cwd, check, timeout, input_text, budget)
+
+    def _communicate(self, cmd, env, cwd, check, timeout, input_text, budget=None):
+        sdk_result = input_text is not None
+        process_group = os.name == "posix" and not self._sdk_in_process
         process = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
-            env=self._env(),
+            env=env,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding="utf-8",
             errors="replace",
-            start_new_session=os.name == "posix",
+            start_new_session=process_group,
         )
+        deadline = time.monotonic() + (timeout or self.settings.command_timeout_seconds)
         try:
             while True:
                 try:
                     stdout, _stderr = process.communicate(
-                        timeout=0.2 if self.shutdown_event else None,
+                        input=input_text,
+                        timeout=0.2,
                     )
                     break
                 except subprocess.TimeoutExpired:
+                    input_text = None
                     self._check_interrupted()
+                    if budget:
+                        budget.check_free()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Kaggle operation exceeded its configured timeout")
         except BaseException:
-            stdout = self._stop_process(process)
+            stdout = self._stop_process(process, process_group=process_group)
             output = redact_secrets(stdout)
             if output:
                 self.log(output[-4000:])
             raise
 
         output = redact_secrets(stdout or "")
-        if output:
-            self.log(output[-4000:])
+        log_output = "\n".join(line for line in output.splitlines() if not line.startswith("RELAY_SDK_RESULT="))
+        if log_output:
+            self.log(log_output[-4000:])
         if check and process.returncode != 0:
             raise KaggleAdapterError(f"Kaggle command failed: {process.returncode}\n{output}")
-        return subprocess.CompletedProcess(cmd, process.returncode, stdout=output)
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout=(stdout if sdk_result else output))
+
+    def _sdk_call(self, operation: str, **arguments):
+        payload = {
+            "operation": operation,
+            "arguments": arguments,
+            "storage_dir": str(self.settings.storage_dir),
+            "kaggle_cmd": self.settings.kaggle_cmd,
+            "command_timeout_seconds": self.settings.command_timeout_seconds,
+            "transfer_timeout_seconds": self.settings.transfer_timeout_seconds,
+        }
+        result = self._run_command(
+            [sys.executable, "-m", "app.kaggle_sdk"],
+            cwd=Path(__file__).resolve().parent.parent,
+            timeout=(self.settings.transfer_timeout_seconds if operation in {"upload_dataset", "probe_username_write_access"}
+                     else self.settings.command_timeout_seconds),
+            input_text=json.dumps(payload),
+            check_space=operation in {"upload_dataset", "probe_username_write_access"},
+        )
+        for line in reversed(result.stdout.splitlines()):
+            if line.startswith("RELAY_SDK_RESULT="):
+                return json.loads(line.removeprefix("RELAY_SDK_RESULT="))
+        raise KaggleAdapterError("Kaggle SDK process did not return a result")
 
     @staticmethod
-    def _stop_process(process: subprocess.Popen) -> str:
-        if process.poll() is None:
+    def _stop_process(process: subprocess.Popen, *, process_group: bool = False) -> str:
+        # Remember group ownership: the leader may exit while descendants keep pipes open.
+        if process_group or process.poll() is None:
             try:
-                if os.name == "posix":
+                if process_group:
                     os.killpg(process.pid, signal.SIGTERM)
                 else:
                     process.terminate()
@@ -379,7 +436,7 @@ class KaggleAdapter:
             stdout, _stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             try:
-                if os.name == "posix":
+                if process_group:
                     os.killpg(process.pid, signal.SIGKILL)
                 else:
                     process.kill()
@@ -409,6 +466,8 @@ class KaggleAdapter:
         }
 
     def quota(self) -> dict:
+        if not self._sdk_in_process:
+            return self._sdk_call("quota")
         patch_kaggle_duration_parser()
         try:
             with self._temporary_kaggle_env():
@@ -443,6 +502,8 @@ class KaggleAdapter:
         }
 
     def probe_username_write_access(self) -> dict:
+        if not self._sdk_in_process:
+            return self._sdk_call("probe_username_write_access")
         env = self._env()
         username = env.get("KAGGLE_USERNAME", "").strip()
         if not username:
@@ -550,6 +611,8 @@ class KaggleAdapter:
         }
 
     def dataset_exists(self, dataset_ref: str) -> bool:
+        if not self._sdk_in_process:
+            return self._sdk_call("dataset_exists", dataset_ref=dataset_ref)
         try:
             from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -585,6 +648,8 @@ class KaggleAdapter:
         dataset_ref: str,
         version_number: int | None = None,
     ) -> dict[str, int]:
+        if not self._sdk_in_process:
+            return self._sdk_call("_dataset_file_inventory", dataset_ref=dataset_ref, version_number=version_number)
         from kaggle.api.kaggle_api_extended import KaggleApi
 
         target_ref = (
@@ -649,6 +714,13 @@ class KaggleAdapter:
         dataset_ref: str,
         update_message: str,
     ) -> DatasetUploadReceipt:
+        if not self._sdk_in_process:
+            result = self._sdk_call("upload_dataset", dataset_dir=str(dataset_dir), dataset_ref=dataset_ref,
+                                    update_message=update_message)
+            return DatasetUploadReceipt(
+                expected_version_number=result["expected_version_number"],
+                expected_files=tuple(tuple(item) for item in result["expected_files"]),
+            )
         self._check_interrupted()
         from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -903,4 +975,7 @@ class KaggleAdapter:
         with zipfile.ZipFile(artifact_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(output_dir.rglob("*")):
                 if path.is_file():
+                    budget = getattr(self.settings, "_storage_budget", None)
+                    if budget:
+                        budget.check_free(path.stat().st_size)
                     archive.write(path, path.relative_to(output_dir).as_posix())

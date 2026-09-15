@@ -13,6 +13,7 @@ class RelayDb:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_logs_per_job = 2000
         self.init()
 
     def connect(self) -> sqlite3.Connection:
@@ -118,6 +119,19 @@ class RelayDb:
             self._ensure_column(conn, "jobs", "kaggle_key_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "cancel_requested_at", "REAL")
             self._ensure_column(conn, "jobs", "cancel_reason", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "upload_activity_at", "REAL")
+            self._ensure_column(conn, "jobs", "cleaned_at", "REAL")
+            self._ensure_column(conn, "jobs", "cleanup_due_at", "REAL")
+            self._ensure_column(conn, "jobs", "reserved_bytes", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "jobs", "queue_reason", "TEXT NOT NULL DEFAULT ''")
+            # Existing paused uploads receive a full lease when this schema is first installed.
+            conn.execute("UPDATE jobs SET upload_activity_at = ? WHERE upload_activity_at IS NULL", (now_ts(),))
+            conn.execute("""UPDATE jobs SET reserved_bytes=MAX(0, 3*(dataset_size+kernel_size)-
+                         COALESCE((SELECT SUM(size) FROM chunks WHERE chunks.job_id=jobs.job_id), 0))
+                         WHERE status='receiving' AND reserved_bytes=0""")
+            conn.execute("CREATE INDEX IF NOT EXISTS logs_job_id_id ON logs(job_id, id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS jobs_retention ON jobs(cleaned_at, completed_at)")
             self._ensure_cache_key_dimension(conn, "kaggle_dataset_cache")
             self._ensure_cache_key_dimension(conn, "kaggle_last_job")
 
@@ -235,6 +249,8 @@ class RelayDb:
             "created_at": stamp,
             "updated_at": stamp,
             "completed_at": None,
+            "upload_activity_at": stamp,
+            "reserved_bytes": values.get("reserved_bytes", 0),
         }
         with self.connect() as conn:
             conn.execute(
@@ -250,7 +266,7 @@ class RelayDb:
                     callback_token_sha256,
                     relay_token_id, kaggle_key_id, artifact_path,
                     cancel_requested_at, cancel_reason,
-                    created_at, updated_at, completed_at
+                    created_at, updated_at, completed_at, upload_activity_at, reserved_bytes
                 ) VALUES (
                     :job_id, :dataset_ref, :kernel_ref,
                     :dataset_archive_sha256, :kernel_archive_sha256,
@@ -262,7 +278,7 @@ class RelayDb:
                     :callback_token_sha256,
                     :relay_token_id, :kaggle_key_id, :artifact_path,
                     :cancel_requested_at, :cancel_reason,
-                    :created_at, :updated_at, :completed_at
+                    :created_at, :updated_at, :completed_at, :upload_activity_at, :reserved_bytes
                 )
                 """,
                 payload,
@@ -389,6 +405,7 @@ class RelayDb:
         values["updated_at"] = now_ts()
         if values.get("status") in {"complete", "failed", "canceled"}:
             values.setdefault("completed_at", now_ts())
+            values.update(reserved_bytes=0, queue_reason="")
         assignments = ", ".join(f"{key} = :{key}" for key in values)
         payload = {"job_id": job_id, **values}
         with self.connect() as conn:
@@ -408,6 +425,7 @@ class RelayDb:
         values["updated_at"] = now_ts()
         if values.get("status") in {"complete", "failed", "canceled"}:
             values.setdefault("completed_at", now_ts())
+            values.update(reserved_bytes=0, queue_reason="")
         assignments = ", ".join(f"{key} = :{key}" for key in values)
         status_placeholders = ", ".join(
             f":expected_status_{index}"
@@ -448,6 +466,7 @@ class RelayDb:
         stamp = now_ts()
         values["updated_at"] = stamp
         values["completed_at"] = stamp
+        values.update(reserved_bytes=0, queue_reason="")
         assignments = ", ".join(f"{key} = :{key}" for key in values)
         payload = {
             "job_id": job_id,
@@ -485,6 +504,10 @@ class RelayDb:
         sha256: str,
     ) -> None:
         with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT size FROM chunks WHERE job_id=? AND archive_type=? AND chunk_index=?",
+                (job_id, archive_type, chunk_index),
+            ).fetchone()
             conn.execute(
                 """
                 INSERT OR REPLACE INTO chunks (
@@ -493,6 +516,28 @@ class RelayDb:
                 """,
                 (job_id, archive_type, chunk_index, size, sha256, now_ts()),
             )
+            conn.execute(
+                """UPDATE jobs SET upload_activity_at=?, updated_at=?,
+                   reserved_bytes=MAX(0, reserved_bytes-?) WHERE job_id=?""",
+                (now_ts(), now_ts(), max(0, size - (previous["size"] if previous else 0)), job_id),
+            )
+
+    def touch_upload(self, job_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE jobs SET upload_activity_at=? WHERE job_id=? AND status='receiving'",
+                         (now_ts(), job_id))
+
+    def total_reserved_bytes(self, excluding_job_id: str = "") -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(reserved_bytes), 0) FROM jobs WHERE job_id<>?",
+                               (excluding_job_id,)).fetchone()
+        return int(row[0])
+
+    def stale_receiving(self, cutoff: float) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT job_id FROM jobs WHERE status='receiving' AND upload_activity_at<?",
+                                (cutoff,)).fetchall()
+        return [row[0] for row in rows]
 
     def get_chunk(
         self,
@@ -534,6 +579,19 @@ class RelayDb:
                 "INSERT INTO logs (job_id, created_at, message) VALUES (?, ?, ?)",
                 (job_id, now_ts(), message),
             )
+            self._trim_job_logs(conn, job_id)
+
+    def _trim_job_logs(self, conn: sqlite3.Connection, job_id: str) -> None:
+        conn.execute(
+            """DELETE FROM logs WHERE job_id=? AND id < (
+               SELECT id FROM logs WHERE job_id=? ORDER BY id DESC LIMIT 1 OFFSET ?)""",
+            (job_id, job_id, self.max_logs_per_job - 1),
+        )
+
+    def trim_logs(self) -> None:
+        with self.connect() as conn:
+            for row in conn.execute("SELECT DISTINCT job_id FROM logs").fetchall():
+                self._trim_job_logs(conn, row[0])
 
     def recent_logs(self, job_id: str, limit: int = 30) -> list[str]:
         with self.connect() as conn:
@@ -686,7 +744,8 @@ class RelayDb:
             rows = conn.execute(
                 """
                 SELECT job_id FROM jobs
-                WHERE completed_at IS NOT NULL AND completed_at < ?
+                WHERE completed_at IS NOT NULL AND (completed_at < ? OR cleanup_due_at IS NOT NULL)
+                  AND cleaned_at IS NULL
                 """,
                 (cutoff,),
             ).fetchall()

@@ -43,12 +43,66 @@ uses the same Compose project/service as the local build deployment.
 
 Relay runs a single process with an in-process job queue. Set
 `RELAY_WORKER_COUNT` to the number of Kaggle jobs that may execute at the same
-time; the default is `2`. Keep Uvicorn at one process because multiple Uvicorn
+time; the default is `10`. Keep Uvicorn at one process because multiple Uvicorn
 processes would create separate queues without a shared worker coordinator.
 Jobs using different Kaggle datasets can run concurrently. Jobs targeting the
 same Kaggle account and dataset are serialized until the Kernel push completes,
 so one worker cannot replace the dataset version while another worker submits
 its Kernel.
+
+Training waits use a dedicated executor; archive assembly uses a separate pool
+(`RELAY_ASSEMBLY_WORKERS=2`), leaving the default executor available for upload
+file I/O. SDK requests execute in isolated subprocesses with explicit credential
+environments. General commands time out after 300 seconds and transfers after
+7200 seconds; shutdown terminates in-flight child processes. No SDK network call
+holds the server's environment lock.
+
+`RELAY_ACCOUNT_CONCURRENCY=1` limits running jobs per Kaggle username, including
+aliases with different key IDs. Jobs waiting for the same account leave workers
+available for other accounts. Recovered remote runs are monitored even if their
+count already exceeds the new limit. Account selection balances receiving,
+queued and running jobs across eligible accounts, then considers remaining GPU
+hours. Existing owner preference and key permissions still apply. Quota lookups
+are coalesced per credential for 30 seconds. Remote Kaggle limits and runs started
+outside this Relay are not reservations managed by this scheduler.
+
+The default limits are 40 active jobs globally, 4 per Relay token, 8 GiB per
+archive, and 40 incoming chunk streams globally (4 per token). A chunk must not
+exceed `RELAY_CHUNK_SIZE`, and an archive must not exceed 65,536 chunks. Each
+person should have a separate token. Busy upload slots return HTTP 429; resource
+admission failures return HTTP 503 with `Retry-After`. Clients must retain the
+same job and retry/resume its missing chunks, not create a replacement job after
+an uncertain submission response.
+
+Input storage reservations are persisted in SQLite. Creation initially reserves
+three times the declared input size for chunks, merged archives and estimated
+extraction; assembly revises this using ZIP member sizes and filesystem overhead
+before extraction. Materialized data is counted by the filesystem, while future
+writes remain reserved. `RELAY_MIN_FREE_BYTES` defaults to 5 GiB. Insufficient
+assembly space leaves the task `receiving` with confirmed chunks intact. Training
+outputs, SDK temporary files and other services also consume disk, so this input
+budget does not replace disk monitoring and capacity planning.
+Archive copies check free space between 1 MiB blocks; transfer subprocesses are
+stopped if free space falls below the reserve. These checks are not a filesystem
+quota and concurrent external writes can still exhaust the disk.
+
+Incomplete uploads have their own inactivity lease
+(`RELAY_RECEIVING_RETENTION_HOURS=168`). Accepted or retried chunks renew it;
+active body streams are excluded from expiry, with a 60-second idle-body timeout.
+Ordinary status polling does not renew the lease. Existing jobs receive a full
+lease during the schema upgrade. `upload_expires_at` and `queue_reason` are
+additive response fields. Manual pause/resume remains available within the lease.
+Expired uploads become failed and their partial files are removed. Terminal
+results retain the independent `RELAY_RETENTION_HOURS` policy.
+
+Cleanup records completion once and retries filesystem failures; each job keeps
+at most `RELAY_MAX_LOGS_PER_JOB=2000` recent logs, including historical jobs after
+the next maintenance pass. Logs have an index for per-job reads. Before upgrading,
+back up the SQLite database and confirm the desired retention settings. Existing
+environment variables override these defaults: a deployment with
+`RELAY_WORKER_COUNT=2` stays at two until its configuration is explicitly changed.
+See [the validation and rollout record](docs/concurrency-acceptance-2026-09-16.md)
+for the ten-user test scope and the pending Oracle configuration change.
 
 For legacy single-user mode, set `RELAY_API_TOKEN` to a long random value and
 provide Kaggle credentials with `KAGGLE_API_TOKEN`,
