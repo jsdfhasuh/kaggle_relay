@@ -29,7 +29,7 @@ YOLO_ARTIFACT_FILE_PATTERN = (
     r"PR_curve\.png|F1_curve\.png|P_curve\.png|R_curve\.png)$"
 )
 PATCHCORE_ARTIFACT_FILE_PATTERN = (
-    r"^(model\.ckpt|threshold\.json|"
+    r"^(model\.ckpt|deployment_model\.pt|pt_export\.json|threshold\.json|"
     r"anomaly_metrics\.json|environment\.json|heatmap_sample\.png|"
     r"overlay_sample\.png|training_artifacts\.json)$"
 )

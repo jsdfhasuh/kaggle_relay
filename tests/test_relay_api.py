@@ -532,7 +532,8 @@ def test_relay_db_backfills_existing_patchcore_artifact_contract(tmp_path):
     assert migrated["artifact_contract"] == "patchcore"
 
 
-def test_patchcore_artifact_download_and_packaging_contract(tmp_path):
+@pytest.mark.parametrize("dual_export", [False, True])
+def test_patchcore_artifact_download_and_packaging_contract(tmp_path, dual_export):
     adapter = KaggleAdapter(make_settings(tmp_path), lambda _message: None)
     calls = []
     adapter._run = lambda args, check=False: (
@@ -553,6 +554,10 @@ def test_patchcore_artifact_download_and_packaging_contract(tmp_path):
     assert "threshold\\.json" in pattern
     assert re.fullmatch(pattern, "model.ckpt")
     assert re.fullmatch(pattern, "threshold.json")
+    assert re.fullmatch(pattern, "deployment_model.pt")
+    assert re.fullmatch(pattern, "pt_export.json")
+    assert not re.fullmatch(pattern, "artifacts/deployment_model.pt")
+    assert not re.fullmatch(pattern, "unrelated.pt")
     assert not re.fullmatch(pattern, "artifacts/model.ckpt")
     assert not re.fullmatch(
         pattern,
@@ -566,6 +571,8 @@ def test_patchcore_artifact_download_and_packaging_contract(tmp_path):
         "environment.json": b"{}",
         "training_artifacts.json": b"{}",
     }
+    if dual_export:
+        required.update({"deployment_model.pt": b"fixture-only", "pt_export.json": b"{}"})
     for name, content in required.items():
         (output_dir / name).write_bytes(content)
     artifact_zip = tmp_path / "artifacts.zip"
