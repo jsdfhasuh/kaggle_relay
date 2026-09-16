@@ -66,6 +66,43 @@ hours. Existing owner preference and key permissions still apply. Quota lookups
 are coalesced per credential for 30 seconds. Remote Kaggle limits and runs started
 outside this Relay are not reservations managed by this scheduler.
 
+### Dynamic account scheduling
+
+New clients can send `scheduling_mode: "dynamic"` when creating a job without
+an explicit `kaggle_key_id`. Relay accepts and verifies both input archives,
+then keeps the job in a shared queue until an authorized account is idle and
+has GPU quota. The original owner is not preferred over an idle account.
+Busy or temporarily unavailable accounts leave the job queued; completions
+wake the scheduler immediately, with a 15-second periodic retry for quota and
+configuration changes. Slow quota requests do not block other idle accounts.
+
+The create response includes `assignment_state: "pending"` and an immutable
+`eligible_accounts` map of key IDs to usernames. The initial key and owner are
+provisional. Dispatch intersects that snapshot with the token's current rights,
+atomically claims an account, rewrites only the owners of the dataset/kernel
+references, and persists `assignment_state: "bound"` before submission. The
+job ID, input archive digests, slugs and frozen RunPlan identity stay unchanged.
+The account is never changed again; queued jobs and committed bindings survive
+restart. Revoked permissions or a changed account username cannot expand the
+original account pool. No Kaggle credentials are returned in these fields.
+Progress callbacks keep an internal alias for the script's original kernel
+reference, with the same per-job callback token verification after assignment.
+
+Dynamic jobs always upload the dataset ZIP to Relay so any selected account can
+receive it; the worker can still reuse a verified cache on the selected account.
+One Kaggle username has one slot by default even with multiple credential IDs.
+"Idle" refers to Relay-managed queued/running work, including input transfer
+and output collection; jobs started separately in the Kaggle website are not
+counted. Account permissions remain unchanged by enabling dynamic scheduling.
+
+Older clients/jobs retain `fixed` scheduling and immutable create-time bindings.
+An explicit key or legacy single-account authentication also stays fixed. Updated
+desktop clients request dynamic scheduling and verify the one permitted binding
+transition against the original eligible accounts, archive hashes, slugs and
+frozen identity. They then persist the actual references for observation,
+resumption, artifact downloads and direct recovery. Distribute the updated
+desktop client to enable this protocol; old clients are not silently reassigned.
+
 The default limits are 40 active jobs globally, 4 per Relay token, 8 GiB per
 archive, and 40 incoming chunk streams globally (4 per token). A chunk must not
 exceed `RELAY_CHUNK_SIZE`, and an archive must not exceed 65,536 chunks. Each

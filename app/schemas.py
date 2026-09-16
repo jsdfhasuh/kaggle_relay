@@ -21,6 +21,7 @@ JobStatus = Literal[
 
 class CreateJobRequest(BaseModel):
     kaggle_key_id: str = ""
+    scheduling_mode: Literal["fixed", "dynamic"] = "fixed"
     dataset_ref: str
     kernel_ref: str
     dataset_archive_sha256: str = Field(min_length=64, max_length=64)
@@ -72,6 +73,9 @@ class CreateJobRequest(BaseModel):
 class JobResponse(BaseModel):
     job_id: str
     kaggle_key_id: str = ""
+    scheduling_mode: Literal["fixed", "dynamic"] = "fixed"
+    assignment_state: Literal["pending", "bound"] = "bound"
+    eligible_accounts: dict[str, str] = Field(default_factory=dict)
     dataset_ref: str
     kernel_ref: str
     status: JobStatus

@@ -124,6 +124,10 @@ class RelayDb:
             self._ensure_column(conn, "jobs", "cleanup_due_at", "REAL")
             self._ensure_column(conn, "jobs", "reserved_bytes", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "jobs", "queue_reason", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "scheduling_mode", "TEXT NOT NULL DEFAULT 'fixed'")
+            self._ensure_column(conn, "jobs", "assignment_state", "TEXT NOT NULL DEFAULT 'bound'")
+            self._ensure_column(conn, "jobs", "eligible_accounts", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "jobs", "callback_kernel_ref", "TEXT NOT NULL DEFAULT ''")
             # Existing paused uploads receive a full lease when this schema is first installed.
             conn.execute("UPDATE jobs SET upload_activity_at = ? WHERE upload_activity_at IS NULL", (now_ts(),))
             conn.execute("""UPDATE jobs SET reserved_bytes=MAX(0, 3*(dataset_size+kernel_size)-
@@ -251,6 +255,10 @@ class RelayDb:
             "completed_at": None,
             "upload_activity_at": stamp,
             "reserved_bytes": values.get("reserved_bytes", 0),
+            "scheduling_mode": values.get("scheduling_mode", "fixed"),
+            "assignment_state": values.get("assignment_state", "bound"),
+            "eligible_accounts": values.get("eligible_accounts", "{}"),
+            "callback_kernel_ref": values.get("callback_kernel_ref", ""),
         }
         with self.connect() as conn:
             conn.execute(
@@ -266,7 +274,8 @@ class RelayDb:
                     callback_token_sha256,
                     relay_token_id, kaggle_key_id, artifact_path,
                     cancel_requested_at, cancel_reason,
-                    created_at, updated_at, completed_at, upload_activity_at, reserved_bytes
+                    created_at, updated_at, completed_at, upload_activity_at, reserved_bytes,
+                    scheduling_mode, assignment_state, eligible_accounts, callback_kernel_ref
                 ) VALUES (
                     :job_id, :dataset_ref, :kernel_ref,
                     :dataset_archive_sha256, :kernel_archive_sha256,
@@ -278,7 +287,8 @@ class RelayDb:
                     :callback_token_sha256,
                     :relay_token_id, :kaggle_key_id, :artifact_path,
                     :cancel_requested_at, :cancel_reason,
-                    :created_at, :updated_at, :completed_at, :upload_activity_at, :reserved_bytes
+                    :created_at, :updated_at, :completed_at, :upload_activity_at, :reserved_bytes,
+                    :scheduling_mode, :assignment_state, :eligible_accounts, :callback_kernel_ref
                 )
                 """,
                 payload,
@@ -305,7 +315,13 @@ class RelayDb:
                 if not kaggle_key_ids:
                     return []
                 placeholders = ", ".join("?" for _ in kaggle_key_ids)
-                conditions.append(f"kaggle_key_id IN ({placeholders})")
+                conditions.append(
+                    f"(kaggle_key_id IN ({placeholders}) OR "
+                    f"(scheduling_mode='dynamic' AND assignment_state='pending' AND "
+                    f"EXISTS (SELECT 1 FROM json_each(jobs.eligible_accounts) AS account "
+                    f"WHERE account.key IN ({placeholders}))))"
+                )
+                params.extend(sorted(kaggle_key_ids))
                 params.extend(sorted(kaggle_key_ids))
             if relay_token_id is not None:
                 if include_unowned:
@@ -355,10 +371,12 @@ class RelayDb:
         relay_token_id: Optional[str] = None,
         include_unowned: bool = False,
         limit: int = 30,
+        include_callback_alias: bool = False,
     ) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            conditions = ["kernel_ref = ?"]
-            params: list[Any] = [kernel_ref]
+            conditions = ["(kernel_ref = ? OR (scheduling_mode='dynamic' AND callback_kernel_ref = ?))"
+                          if include_callback_alias else "kernel_ref = ?"]
+            params: list[Any] = [kernel_ref, kernel_ref] if include_callback_alias else [kernel_ref]
             if kaggle_key_ids is not None:
                 if not kaggle_key_ids:
                     return []

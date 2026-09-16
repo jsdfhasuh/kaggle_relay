@@ -31,6 +31,7 @@ from app.auth_config import AuthConfigError, AuthSelectionError, AuthStore, Rela
 from app.config import Settings
 from app.capacity import CapacityError, StorageBudget
 from app.quota_cache import QuotaCache
+from app.scheduler import awaiting_assignment, eligible_accounts, scheduler_loop
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted
 from app.schemas import (
@@ -170,7 +171,10 @@ def selection_error(exc: AuthSelectionError) -> HTTPException:
 
 
 def can_access_job(job: dict, principal: RelayPrincipal, auth_store: AuthStore) -> bool:
-    if not auth_store.can_access_key(principal, job.get("kaggle_key_id", "")):
+    key_access = auth_store.can_access_key(principal, job.get("kaggle_key_id", ""))
+    if awaiting_assignment(job):
+        key_access = any(auth_store.can_access_key(principal, key) for key in eligible_accounts(job))
+    if not key_access:
         return False
 
     job_owner = str(job.get("relay_token_id") or "").strip()
@@ -279,10 +283,13 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
         job["payload_hash"],
         kaggle_key_id=job.get("kaggle_key_id", ""),
     )
+    if awaiting_assignment(job):
+        dataset_cache_hit = False
     return JobResponse(
         **RelayDb.to_response(
             {
                 **job,
+                "eligible_accounts": eligible_accounts(job),
                 "callback_enabled": bool(job.get("callback_token_sha256")),
                 "cancel_requested": bool(job.get("cancel_requested_at")),
                 "upload_expires_at": (
@@ -788,6 +795,10 @@ def callback_log_message(data: dict) -> str:
 
 
 def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest) -> None:
+    if job.get("scheduling_mode") == "dynamic" and (
+        awaiting_assignment(job) or job["status"] in {"receiving", "assembling", "queued"}
+    ):
+        raise HTTPException(status_code=409, detail="job has not been submitted to Kaggle")
     data = payload.model_dump()
     clean_message = redact_secrets(callback_log_message(data))[-8000:]
     if clean_message:
@@ -854,7 +865,7 @@ def assemble_and_validate_job(settings: Settings, db: RelayDb, auth_store: AuthS
     job_dir = settings.jobs_dir / job_id
     archives_dir = job_dir / "archives"
     extracted_dir = job_dir / "extracted"
-    credentials = auth_store.credentials_for(job.get("kaggle_key_id", ""))
+    credentials = None if awaiting_assignment(job) else auth_store.credentials_for(job.get("kaggle_key_id", ""))
     kernel_zip = archives_dir / "kernel.zip"
     dataset_cache_hit = has_ready_dataset_cache(
         db,
@@ -862,6 +873,8 @@ def assemble_and_validate_job(settings: Settings, db: RelayDb, auth_store: AuthS
         job["payload_hash"],
         kaggle_key_id=job.get("kaggle_key_id", ""),
     )
+    if awaiting_assignment(job):
+        dataset_cache_hit = False
 
     budget = getattr(settings, "_storage_budget", None)
     inputs_size = job["kernel_size"] + (0 if dataset_cache_hit else job["dataset_size"])
@@ -1088,7 +1101,8 @@ async def recover_incomplete_jobs(app: FastAPI) -> None:
             )
             items.append(item)
     for item in sorted(items, key=lambda item: item.get("action") != "resume_kernel"):
-        await app.state.queue.put(item)
+        if not awaiting_assignment(app.state.db.get_job(item["job_id"])):
+            await app.state.queue.put(item)
 
 
 def normalize_queue_item(item) -> dict:
@@ -1223,6 +1237,10 @@ async def worker_loop(app: FastAPI, worker_index: int = 0) -> None:
             LOGGER.warning("skipping duplicate queued item for active job %s", job_id)
             app.state.queue.task_done()
             continue
+        if awaiting_assignment(job):
+            app.state.scheduler_event.set()
+            app.state.queue.task_done()
+            continue
         account = account_key(app.state.auth_store, job.get("kaggle_key_id", ""))
         active = app.state.active_accounts.get(account, 0)
         # Recovered remote runs already consume Kaggle slots and must all be monitored.
@@ -1251,6 +1269,7 @@ async def worker_loop(app: FastAPI, worker_index: int = 0) -> None:
             app.state.active_accounts[account] -= 1
             for waiting in app.state.account_pending.pop(account, {}).values():
                 app.state.queue.put_nowait(waiting)
+            app.state.scheduler_event.set()
             app.state.queue.task_done()
 
 
@@ -1342,10 +1361,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
         app.state.worker_task = app.state.worker_tasks[0]
         app.state.cleanup_task = asyncio.create_task(cleanup_loop(app))
+        app.state.scheduler_task = asyncio.create_task(scheduler_loop(app))
         try:
             yield
         finally:
             app.state.shutdown_event.set()
+            app.state.scheduler_task.cancel()
+            await asyncio.gather(app.state.scheduler_task, return_exceptions=True)
             for worker_task in app.state.worker_tasks:
                 worker_task.cancel()
             app.state.cleanup_task.cancel()
@@ -1381,6 +1403,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.assembly_slots = asyncio.Semaphore(settings.assembly_workers)
     app.state.active_accounts = {}
     app.state.account_pending = {}
+    app.state.scheduler_event = asyncio.Event()
     app.state.active_uploads = {}
     app.state.user_uploads = {}
     app.state.upload_count = 0
@@ -1580,15 +1603,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> JobResponse:
+        dynamic = payload.scheduling_mode == "dynamic" and not payload.kaggle_key_id and not auth_store.legacy
+        accounts = {}
         try:
-            candidates = resolve_job_kaggle_candidates(
-                settings,
-                auth_store,
-                principal,
-                payload.kaggle_key_id,
-                payload.dataset_ref,
-                payload.kernel_ref,
-            )
+            if dynamic:
+                requested_owner_from_refs(payload.dataset_ref, payload.kernel_ref)
+                accounts = {key: auth_store.credentials_for(key).username
+                            for key in auth_store.allowed_key_ids(principal)
+                            if auth_store.credentials_for(key).username}
+                if not accounts:
+                    raise HTTPException(status_code=409, detail="dynamic scheduling requires an allowed account with a username")
+                candidates = [(0, key) for key in accounts]
+            else:
+                candidates = resolve_job_kaggle_candidates(
+                    settings, auth_store, principal, payload.kaggle_key_id,
+                    payload.dataset_ref, payload.kernel_ref,
+                )
         except AuthSelectionError as exc:
             raise selection_error(exc) from exc
         if max(payload.dataset_size, payload.kernel_size) > settings.max_archive_bytes or payload.chunk_size > settings.chunk_size:
@@ -1615,6 +1645,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 **payload.model_dump(), "dataset_ref": dataset_ref, "kernel_ref": kernel_ref,
                 "job_id": job_id, "relay_token_id": principal.id, "kaggle_key_id": kaggle_key_id,
                 "reserved_bytes": reserved_bytes,
+                "scheduling_mode": "dynamic" if dynamic else "fixed",
+                "assignment_state": "pending" if dynamic else "bound",
+                "eligible_accounts": json.dumps(accounts),
+                "callback_kernel_ref": payload.kernel_ref if dynamic else "",
             }
             db.create_job(values)
         return job_response(db, job_id, settings.retention_hours)
@@ -1773,6 +1807,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 db, job["dataset_ref"], job["payload_hash"],
                 kaggle_key_id=job.get("kaggle_key_id", ""),
             )
+            if awaiting_assignment(job):
+                cache_hit = False
             for archive_type in (("kernel",) if cache_hit else ("dataset", "kernel")):
                 count = expected_chunk_count(job[f"{archive_type}_size"], job["chunk_size"])
                 rows = db.chunks_for(job_id, archive_type)
@@ -1826,11 +1862,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"assembling"},
                 status="queued",
                 progress=15,
-                queue_reason="waiting for an available worker",
+                queue_reason=("waiting for an idle authorized account with GPU quota"
+                              if awaiting_assignment(job) else "waiting for an available worker"),
                 error="",
             )
             if queued:
-                await request.app.state.queue.put({"action": "process", "job_id": job_id})
+                if awaiting_assignment(job):
+                    request.app.state.scheduler_event.set()
+                else:
+                    await request.app.state.queue.put({"action": "process", "job_id": job_id})
             response = job_response(db, job_id, settings.retention_hours)
             if was_cancelled:
                 raise asyncio.CancelledError
@@ -1862,6 +1902,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             kaggle_key_ids=key_filter,
             relay_token_id=owner_filter,
             limit=50,
+            include_callback_alias=True,
         )
         if not candidates:
             raise HTTPException(status_code=404, detail="job not found")
