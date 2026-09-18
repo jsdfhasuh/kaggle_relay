@@ -77,21 +77,39 @@ Local results on 2026-09-18 using the desktop `training_platform` interpreter:
 - Final rerun of client negotiation plus cross-repository transport: 19 passed.
   The test used the actual `artifacts/` output prefix and server download filter.
 
-No live Kaggle training, server deployment, container restart or packaged EXE
-acceptance was performed.
+No live Kaggle training or packaged EXE acceptance was performed. The initially
+local-only change was subsequently deployed with explicit authorization below.
 
 ## Rollout Status
 
-Not deployed. A read-only production health check on 2026-09-18 returned
-`status=ok`, `version=0.1.0`, without `artifact_contracts`. That deployment
-must not accept DINO v3 submissions from the updated client.
+Deployed with explicit authorization on 2026-09-18 at 00:44:59 UTC
+(08:44:59 Asia/Shanghai). The prior health response did not advertise the new
+contract; the post-deployment authenticated production response includes
+`patchcore_dinov2_v3`. Unauthenticated health remains HTTP 401.
 
-Deployment/restart requires explicit authorization. Before rollout: commit and
-push the tested change, inspect `/docker_volume/kaggle_relay` branch/worktree,
-container identity and deployment configuration, check active jobs and back up
-the database. Preserve local changes and use the existing Compose deployment.
-After rollout, verify authenticated health capabilities, running source hashes
-and a temporary artifact fixture; do not submit training as a health check.
+- Runtime commit: `fd59c5e924f4cc5e6c5cab1068dece7226f55b3f`, pushed to `main`
+  and `codex/dinov2-artifacts-v3`.
+- Verified deployment path `/docker_volume/kaggle_relay`, clean `main`, existing
+  `docker-compose.yml` local-build service `kaggle-relay`. Built before restart,
+  then used `docker compose up -d --no-build --force-recreate kaggle-relay`.
+- Container: `kaggle_relay-kaggle-relay-1`, running, restart count 0, no startup
+  error lines. All five changed application module hashes match the checkout.
+- Image: `sha256:851a70f50cba4cfaf73b68830781b0a588f54a346718bdfd5e35647658532c32`.
+- Database backup: `/data/backups/relay-pre-dino-v3-20260918T004458Z.db`;
+  integrity check OK. All 112 jobs preserved: 40 complete, 60 failed, 5 canceled,
+  7 stale receiving records. No queued/running task or recent upload at restart.
+- Preserved limits: workers=10, assembly_workers=2, account_concurrency=2,
+  max_active_jobs=40, max_parallel_uploads=40. Existing `/data` bind mount and
+  production environment/auth files were not changed.
+- Full suite inside an isolated container using the deployed image: 202 passed,
+  2 warnings. Tests had no network and no production data mount. This includes
+  the exact output filter, ZIP packaging, missing/corrupt artifact rejection and
+  API download behavior; no real Kaggle task was submitted.
+- The old image reference was unavailable, so rollback image
+  `kaggle-relay:pre-dino-v3-20260918` was reconstructed using the previous
+  application source (`4e2347607e10678cccf08161def931a834acc42c`) and the
+  preserved dependency layers. Its installed package versions exactly match
+  the original running container.
 
 Do not roll back to an older database initializer while v3 jobs are present:
 older code rewrites unknown contract values to the legacy PatchCore contract.
