@@ -106,6 +106,8 @@ class JobResponse(BaseModel):
     download_unavailable_reason: str = ""
     download_unavailable_code: str = ""
     artifact_expires_at: Optional[float] = None
+    can_download_dataset: bool = False
+    dataset_download_unavailable_code: str = ""
     dataset_cache_hit: bool = False
     dataset_upload_required: bool = True
     accepted_chunks: dict[str, list[int]]

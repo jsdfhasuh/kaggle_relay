@@ -443,6 +443,10 @@
       min-width: 92px;
     }
 
+    .artifact-state + .artifact-state {
+      margin-top: 10px;
+    }
+
     .detail-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -721,7 +725,7 @@
                   <th>Kaggle Key</th>
                   <th>Dataset / Kernel</th>
                   <th>Cache</th>
-                  <th class="artifact-cell">产物</th>
+                  <th class="artifact-cell">文件下载</th>
                   <th class="actions-cell">操作</th>
                 </tr>
               </thead>
@@ -1017,6 +1021,22 @@
     }
 
     function renderArtifact(job) {
+      const reasons = {
+        not_ready: "提交包尚未接收完成",
+        expired: "提交包已过期清理",
+        missing: "未保留提交包（可能复用了云端数据）",
+        invalid: "提交包校验失败",
+        inaccessible: "提交包暂时无法访问"
+      };
+      const dataset = job.can_download_dataset
+        ? `<a class="download-button" href="/v1/jobs/${encodeURIComponent(job.job_id)}/dataset.zip" download>下载提交包</a>
+           <span class="muted small">${escapeHtml(fmtBytes(job.dataset_size))} · 含上传的图片、标注</span>`
+        : `<button class="ghost download-button" type="button" disabled>下载提交包</button>
+           <span class="muted small">${escapeHtml(reasons[job.dataset_download_unavailable_code] || "提交包不可用")}</span>`;
+      return `${renderResultArtifact(job)}<div class="artifact-state">${dataset}</div>`;
+    }
+
+    function renderResultArtifact(job) {
       const jobId = escapeHtml(job.job_id);
       if (job.can_download) {
         const downloading = downloadingJobs.has(job.job_id);

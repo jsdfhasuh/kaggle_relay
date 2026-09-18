@@ -222,9 +222,25 @@ Main endpoints:
 - `POST /v1/jobs/{job_id}/progress`
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/artifacts.zip`
+- `GET /v1/jobs/{job_id}/dataset.zip`
 - `DELETE /v1/jobs/{job_id}`
 
 ### Resumable parallel uploads
+
+The job list has a separate **下载提交包** (download submitted dataset) link.
+It downloads the original `dataset.zip`, including `dataset-metadata.json` and
+`payload.zip`; uploaded images and annotations remain inside `payload.zip`.
+This is distinct from the training results ZIP and is not a full annotation
+project backup. The browser streams the download without buffering it in JavaScript.
+The endpoint uses the same job authorization as status/results, checks the
+original SHA-256, and holds the job lock through transfer so deletion and retention
+cleanup wait. It works before training completes, once assembly has finished.
+Job responses expose `can_download_dataset` and `dataset_download_unavailable_code`
+(`not_ready`, `expired`, `missing`, `invalid`, or `inaccessible`). The endpoint returns
+409 for incomplete/invalid archives, 410 after retention cleanup, 404 for missing
+archives, and 503 for inaccessible files. A job reusing a Kaggle dataset may have
+no local input archive; Relay does not retrieve another job's dataset automatically.
+Submitted packages follow the existing job retention policy (7 days by default).
 
 Job creation/status responses include `chunk_size`, archive sizes and SHA-256
 digests, `accepted_chunks`, and `max_parallel_uploads` (currently 4). Clients

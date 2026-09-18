@@ -25,6 +25,7 @@ from app.archive import (
     assemble_archive,
     expected_chunk_count,
     safe_extract_zip,
+    sha256_file,
     validate_chunk_index,
 )
 from app.auth_config import AuthConfigError, AuthSelectionError, AuthStore, RelayPrincipal, bearer_token
@@ -275,6 +276,27 @@ def artifact_download_metadata(job: dict, retention_hours: int = 168) -> dict:
     return metadata
 
 
+def dataset_download_metadata(job: dict, jobs_dir: Path) -> dict:
+    code = ""
+    if job.get("cleaned_at") is not None:
+        code = "expired"
+    elif job["status"] in {"receiving", "assembling"}:
+        code = "not_ready"
+    else:
+        path = jobs_dir / job["job_id"] / "archives" / "dataset.zip"
+        try:
+            if not path.is_file():
+                code = "missing"
+            elif path.stat().st_size != job["dataset_size"]:
+                code = "invalid"
+        except OSError:
+            code = "inaccessible"
+    return {
+        "can_download_dataset": not code,
+        "dataset_download_unavailable_code": code,
+    }
+
+
 def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobResponse:
     job_id = job["job_id"]
     dataset_cache_hit = has_ready_dataset_cache(
@@ -297,6 +319,7 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
                     if job["status"] == "receiving" and job.get("upload_activity_at") else None
                 ),
                 **artifact_download_metadata(job, retention_hours),
+                **dataset_download_metadata(job, db.path.parent / "jobs"),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
             },
@@ -1964,6 +1987,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> JobResponse:
         get_authorized_job(db, job_id, principal, auth_store)
         return job_response(db, job_id, settings.retention_hours)
+
+    @app.get("/v1/jobs/{job_id}/dataset.zip")
+    async def download_dataset(
+        job_id: str,
+        request: Request,
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> FileResponse:
+        get_authorized_job(db, job_id, principal, auth_store)
+        lock = job_submission_lock(request.app, job_id)
+        await lock.acquire()
+        try:
+            job = get_authorized_job(db, job_id, principal, auth_store)
+            download = dataset_download_metadata(job, settings.jobs_dir)
+            code = download["dataset_download_unavailable_code"]
+            if code:
+                raise HTTPException(
+                    status_code={"expired": 410, "missing": 404, "inaccessible": 503}.get(code, 409),
+                    detail=f"dataset archive unavailable: {code}",
+                )
+            path = settings.jobs_dir / job_id / "archives" / "dataset.zip"
+            # Failed assembly can leave a full-size archive with the wrong digest.
+            try:
+                digest = await asyncio.to_thread(sha256_file, path)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="dataset archive unavailable: missing") from exc
+            except OSError as exc:
+                raise HTTPException(status_code=503, detail="dataset archive unavailable: inaccessible") from exc
+            if not hmac.compare_digest(digest, job["dataset_archive_sha256"]):
+                raise HTTPException(status_code=409, detail="dataset archive unavailable: invalid")
+            return JobLockedFileResponse(
+                path,
+                job_lock=lock,
+                media_type="application/zip",
+                filename=f"{job_id}-dataset.zip",
+            )
+        except BaseException:
+            lock.release()
+            raise
 
     @app.get("/v1/jobs/{job_id}/artifacts.zip")
     async def download_artifacts(
