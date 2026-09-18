@@ -27,11 +27,11 @@ def eligible_accounts(job: dict) -> dict[str, str]:
     return json.loads(job.get("eligible_accounts") or "{}")
 
 
-def current_accounts(job: dict, auth_store: AuthStore) -> dict[str, str]:
+def current_accounts(job: dict, auth_store: AuthStore, *, include_disabled: bool = False) -> dict[str, str]:
     principal = next((p for _, p in auth_store._tokens if p.id == job.get("relay_token_id")), None)
     if principal is None:
         return {}
-    allowed = set(auth_store.allowed_key_ids(principal))
+    allowed = set(auth_store.allowed_key_ids(principal, include_disabled=include_disabled))
     return {
         key: username for key, username in eligible_accounts(job).items()
         if key in allowed and auth_store.credentials_for(key).username.lower() == username.lower()
@@ -88,6 +88,10 @@ async def schedule_pending_jobs(app: FastAPI) -> None:
                 continue
             allowed = current_accounts(current, app.state.auth_store)
             if not allowed:
+                if current_accounts(current, app.state.auth_store, include_disabled=True):
+                    db.update_job_if_status(current["job_id"], {"queued"},
+                                            queue_reason="waiting for an enabled authorized account")
+                    continue
                 db.update_job_if_status(current["job_id"], {"queued"}, status="failed",
                                         error="no originally allowed Kaggle account remains authorized")
                 continue

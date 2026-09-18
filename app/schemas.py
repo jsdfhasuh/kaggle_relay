@@ -163,10 +163,12 @@ class CreateKaggleKeyRequest(BaseModel):
 
 
 class UpdateKaggleKeyRequest(BaseModel):
-    username: str = ""
+    username: str | None = None
     key: str = ""
     api_token: str = ""
     config_dir: str = ""
+    enabled: bool | None = None
+    disabled_reason: str | None = Field(default=None, max_length=512)
 
 
 class CreateRelayTokenRequest(BaseModel):

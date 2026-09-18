@@ -1463,17 +1463,20 @@
             <div class="muted">
               <div class="summary-title">
                 <strong>${escapeHtml(key.id || "legacy")}</strong>
+                <span class="pill neutral">${key.enabled === false ? "已禁用" : "可调度"}</span>
                 ${data.can_manage_auth && key.id ? `<button class="light" type="button" data-edit-kaggle-key="${escapeHtml(key.id)}">编辑</button>` : ""}
+                ${data.can_manage_auth && key.id ? `<button class="light" type="button" data-toggle-kaggle-key="${escapeHtml(key.id)}">${key.enabled === false ? "启用" : "禁用"}</button>` : ""}
               </div>
               username：${escapeHtml(key.username || "-")}<br />
               source：${escapeHtml(key.credential_source || "-")}
+              ${key.disabled_reason ? `<br />禁用原因：${escapeHtml(key.disabled_reason)}` : ""}
             </div>
           `).join("") || '<div class="muted">无</div>'}
         </div>
       `;
 
       const select = qs("accountKeySelect");
-      select.innerHTML = kaggleKeys.map((key) => {
+      select.innerHTML = kaggleKeys.filter((key) => key.enabled !== false).map((key) => {
         const label = `${key.id || "legacy"}${key.username ? " (" + key.username + ")" : ""}`;
         return `<option value="${escapeHtml(key.id || "")}">${escapeHtml(label)}</option>`;
       }).join("");
@@ -1748,6 +1751,24 @@
       qs("kaggleKeyForm").scrollIntoView({block: "nearest"});
     }
 
+    async function toggleKaggleKey(keyId, button) {
+      const key = findKaggleKey(keyId);
+      if (!key) return;
+      button.disabled = true;
+      try {
+        const data = await api(`/v1/auth/kaggle-keys/${encodeURIComponent(keyId)}`, {
+          method: "PATCH",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: key.enabled === false})
+        });
+        renderAuthConfig(data);
+      } catch (error) {
+        formMessage("kaggleKeyMessage", error.message || String(error), true);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     function selectedAllowedKeys() {
       return Array.from(qs("newRelayAllowedKeys").selectedOptions).map((option) => option.value);
     }
@@ -1925,6 +1946,11 @@
         return;
       }
       const editKaggleButton = event.target.closest("[data-edit-kaggle-key]");
+      const toggleKaggleButton = event.target.closest("[data-toggle-kaggle-key]");
+      if (toggleKaggleButton) {
+        toggleKaggleKey(toggleKaggleButton.dataset.toggleKaggleKey, toggleKaggleButton).catch(console.error);
+        return;
+      }
       if (editKaggleButton) {
         startEditKaggleKey(editKaggleButton.dataset.editKaggleKey || "");
       }

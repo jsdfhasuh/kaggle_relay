@@ -589,7 +589,7 @@ def test_admin_can_update_existing_kaggle_key_without_reentering_secret(tmp_path
     assert saved_key["key"] == "bob-key"
     assert new_user_config.status_code == 200
     assert new_user_config.json()["kaggle_keys"] == [
-        {"id": "kb", "username": "bob_slug", "credential_source": "username_key"}
+        {"id": "kb", "username": "bob_slug", "credential_source": "username_key", "enabled": True, "disabled_reason": ""}
     ]
 
 

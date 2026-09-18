@@ -30,6 +30,8 @@ class KaggleCredentials:
     key: str = field(default="", repr=False)
     api_token: str = field(default="", repr=False)
     config_dir: str = ""
+    enabled: bool = True
+    disabled_reason: str = ""
 
     def apply_to_env(self, env: dict[str, str]) -> None:
         for name in KAGGLE_ENV_KEYS:
@@ -175,12 +177,16 @@ class AuthStore:
                 raise AuthConfigError("each kaggle key requires an id")
             if key_id in result:
                 raise AuthConfigError(f"duplicate kaggle key id: {key_id}")
+            if not isinstance(item.get("enabled", True), bool):
+                raise AuthConfigError(f"kaggle key {key_id} enabled must be a boolean")
             credentials = KaggleCredentials(
                 id=key_id,
                 username=str(item.get("username", "") or "").strip(),
                 key=str(item.get("key", "") or "").strip(),
                 api_token=str(item.get("api_token", "") or "").strip(),
                 config_dir=str(item.get("config_dir", "") or "").strip(),
+                enabled=item.get("enabled", True),
+                disabled_reason=str(item.get("disabled_reason", "") or "").strip(),
             )
             if not (
                 (credentials.username and credentials.key)
@@ -261,12 +267,12 @@ class AuthStore:
                 return token
         return ""
 
-    def allowed_key_ids(self, principal: RelayPrincipal) -> list[str]:
+    def allowed_key_ids(self, principal: RelayPrincipal, *, include_disabled: bool = False) -> list[str]:
         if self.legacy:
             return [""]
-        if principal.allowed_kaggle_key_ids is None:
-            return sorted(self._kaggle_keys)
-        return sorted(principal.allowed_kaggle_key_ids)
+        allowed = self._kaggle_keys if principal.allowed_kaggle_key_ids is None else principal.allowed_kaggle_key_ids
+        return sorted(key for key in allowed if key in self._kaggle_keys
+                      and (include_disabled or self._kaggle_keys[key].enabled))
 
     def resolve_kaggle_key_id(self, principal: RelayPrincipal, requested: str | None) -> str:
         requested_key_id = str(requested or "").strip()
@@ -280,9 +286,13 @@ class AuthStore:
                 raise AuthSelectionError("unknown kaggle_key_id", 400)
             if not principal.allows_key(requested_key_id):
                 raise AuthSelectionError("kaggle_key_id is not allowed for this token", 403)
+            if not self._kaggle_keys[requested_key_id].enabled:
+                raise AuthSelectionError("kaggle_key_id is disabled", 409)
             return requested_key_id
 
         allowed = self.allowed_key_ids(principal)
+        if not allowed:
+            raise AuthSelectionError("no enabled kaggle key is available for this token", 409)
         if len(allowed) == 1:
             return allowed[0]
         raise AuthSelectionError("kaggle_key_id is required for this token", 400)

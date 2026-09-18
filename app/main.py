@@ -340,7 +340,7 @@ def public_allowed_key_ids(auth_store: AuthStore, principal: RelayPrincipal) -> 
 def public_kaggle_keys(auth_store: AuthStore, principal: RelayPrincipal) -> list[dict]:
     if not principal.can_view_keys:
         return []
-    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
+    allowed_key_ids = auth_store.allowed_key_ids(principal, include_disabled=True)
     if auth_store.legacy:
         return [{"id": "", "username": "", "credential_source": "environment"}]
 
@@ -363,6 +363,8 @@ def public_kaggle_keys(auth_store: AuthStore, principal: RelayPrincipal) -> list
                 "id": credentials.id,
                 "username": credentials.username,
                 "credential_source": credential_source,
+                "enabled": credentials.enabled,
+                "disabled_reason": credentials.disabled_reason,
             }
         )
     return summaries
@@ -739,7 +741,7 @@ def update_kaggle_key_config(
     key_id = key_id.strip()
     if not key_id:
         raise HTTPException(status_code=400, detail="kaggle key id is required")
-    username = validate_kaggle_username(payload.username)
+    username = validate_kaggle_username(payload.username) if payload.username is not None else None
     key = payload.key.strip()
     api_token = payload.api_token.strip()
     config_dir = payload.config_dir.strip()
@@ -759,7 +761,16 @@ def update_kaggle_key_config(
             raise HTTPException(status_code=404, detail="kaggle key id not found")
 
         existing["id"] = key_id
-        existing["username"] = username
+        if username is not None:
+            existing["username"] = username
+        if payload.enabled is not None:
+            existing["enabled"] = payload.enabled
+            if payload.enabled:
+                existing.pop("disabled_reason", None)
+            else:
+                existing["disabled_reason"] = payload.disabled_reason or "disabled by administrator"
+        elif payload.disabled_reason is not None and not existing.get("enabled", True):
+            existing["disabled_reason"] = payload.disabled_reason
         if key or api_token or config_dir:
             for field in ("key", "api_token", "config_dir"):
                 existing.pop(field, None)
@@ -1646,8 +1657,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = update_kaggle_key_config(settings, principal, kaggle_key_id, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock:
+            new_store = update_kaggle_key_config(settings, principal, kaggle_key_id, payload)
+            request.app.state.auth_store = new_store
+        request.app.state.scheduler_event.set()
         return auth_config_summary(new_store, principal)
 
     @app.post("/v1/auth/relay-tokens")
