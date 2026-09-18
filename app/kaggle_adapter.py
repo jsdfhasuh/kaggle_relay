@@ -282,6 +282,7 @@ class KaggleAdapter:
         self.credentials = credentials
         self.shutdown_event = shutdown_event
         self._sdk_in_process = False
+        self.dataset_cancel_check: Callable[[], None] | None = None
 
     def _check_interrupted(self) -> None:
         if self.shutdown_event and self.shutdown_event.is_set():
@@ -781,6 +782,8 @@ class KaggleAdapter:
             )
         while True:
             status_args = ["datasets", "status", dataset_ref]
+            if self.dataset_cancel_check is not None:
+                self.dataset_cancel_check()
             if expected_version_number is not None:
                 status_args.extend(["--format", "json"])
             result = self._run(status_args, check=False)

@@ -2417,6 +2417,42 @@ def test_worker_does_not_resurrect_cancel_during_upload_transition(tmp_path, mon
     assert job["cancel_requested_at"] is not None
 
 
+def test_worker_cancels_during_dataset_polling_without_kernel_push(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    job_id = seed_job(app, "queued", progress=15)
+    dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
+    kernel_dir = settings.jobs_dir / job_id / "extracted" / "kernel"
+    dataset_dir.mkdir(parents=True)
+    kernel_dir.mkdir(parents=True)
+    (dataset_dir / "dataset-metadata.json").write_text(json.dumps({"id": "demo/data"}))
+    (kernel_dir / "kernel-metadata.json").write_text(json.dumps({"id": "demo/kernel", "code_file": "train.py"}))
+    (kernel_dir / "train.py").write_text("print(1)\n")
+    calls = {"poll": 0, "push": 0}
+
+    class PollingAdapter(KaggleAdapter):
+        def upload_dataset(self, *_args, **_kwargs):
+            return None
+
+        def _run(self, *_args, **_kwargs):
+            calls["poll"] += 1
+            assert calls["poll"] == 1, "Cancellation must stop further remote polling"
+            app.state.db.update_job(job_id, status="cancel_requested",
+                                    cancel_requested_at=time.time(), cancel_reason="cancel requested")
+            return SimpleNamespace(returncode=0, stdout="processing")
+
+        def _sleep(self, _seconds):
+            pass
+
+        def push_kernel(self, *_args):
+            calls["push"] += 1
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", PollingAdapter)
+    process_job(settings, app.state.db, job_id)
+    assert app.state.db.get_job(job_id)["status"] == "canceled"
+    assert calls == {"poll": 1, "push": 0}
+
+
 def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})

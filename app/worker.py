@@ -518,6 +518,7 @@ def process_job(
     try:
         credentials = auth_store.credentials_for(kaggle_key_id) if auth_store else None
         adapter = KaggleAdapter(settings, log, credentials=credentials)
+        adapter.dataset_cancel_check = stop_if_cancel_requested
         shutdown_event = getattr(settings, "_shutdown_event", None)
         if shutdown_event is not None:
             adapter.shutdown_event = shutdown_event
