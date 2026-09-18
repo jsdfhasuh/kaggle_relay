@@ -13,6 +13,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import httpx
@@ -200,7 +201,7 @@ def seed_job(
 ):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip({"kernel-metadata.json": b'{"code_file":"train.py"}', "train.py": b"print(1)"})
-    job_id = job_id or hashlib.sha256(f"{status}-{time.time()}".encode("utf-8")).hexdigest()[:32]
+    job_id = job_id or uuid4().hex
     values = {
         **job_request_body(
             dataset_zip,
@@ -1161,7 +1162,7 @@ def test_chunk_bodies_are_received_concurrently(tmp_path):
     assert not list(tmp_path.rglob("*.tmp"))
 
 
-@pytest.mark.parametrize("action,chunk_status", [("cancel", 409), ("delete", 409), ("complete", 200)])
+@pytest.mark.parametrize("action,chunk_status", [("cancel", 409), ("delete", 200), ("complete", 200)])
 def test_upload_rechecks_state_after_body(tmp_path, action, chunk_status):
     app = create_app(make_settings(tmp_path))
     job_id = seed_job(app, "receiving")
@@ -1187,7 +1188,7 @@ def test_upload_rechecks_state_after_body(tmp_path, action, chunk_status):
                     response = await asyncio.wait_for(client.delete(f"/v1/jobs/{job_id}", headers=auth_headers()), 3)
                 else:
                     response = await asyncio.wait_for(client.post(f"/v1/jobs/{job_id}/{action}", headers=auth_headers()), 3)
-                assert response.status_code == {"complete": 409, "delete": 204, "cancel": 200}[action]
+                assert response.status_code == {"complete": 409, "delete": 409, "cancel": 200}[action]
             finally:
                 release.set()
             response = await upload
@@ -1199,8 +1200,8 @@ def test_upload_rechecks_state_after_body(tmp_path, action, chunk_status):
         assert app.state.db.get_job(job_id)["status"] == "canceled"
         assert not app.state.db.accepted_chunks(job_id)["dataset"]
     if action == "delete":
-        assert app.state.db.get_job(job_id)["error"] == "deleted"
-        assert not app.state.db.accepted_chunks(job_id)["dataset"]
+        assert app.state.db.get_job(job_id)["status"] == "receiving"
+        assert app.state.db.accepted_chunks(job_id)["dataset"] == [0]
 
 
 @pytest.mark.parametrize("different", [False, True])
@@ -3237,8 +3238,7 @@ def test_delete_rejects_active_job_and_allows_terminal_job(tmp_path):
 
     assert active_delete.status_code == 409
     assert terminal_delete.status_code == 204
-    assert saved["status"] == "failed"
-    assert saved["error"] == "deleted"
+    assert saved is None
     assert not (tmp_path / "jobs" / job_id).exists()
 
 

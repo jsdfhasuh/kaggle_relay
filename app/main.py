@@ -413,7 +413,16 @@ def kaggle_account_status(
     kaggle_key_id: str = "",
 ) -> dict:
     try:
-        resolved_key_id = resolve_job_kaggle_key_id(settings, auth_store, principal, kaggle_key_id)
+        allowed = public_allowed_key_ids(auth_store, principal)
+        if not kaggle_key_id.strip() and not auth_store.legacy and len(allowed) > 1:
+            # Account discovery is not job admission. Dynamic clients need an
+            # owner for provisional refs even when the whole pool must wait.
+            named = [key for key in allowed if auth_store.credentials_for(key).username]
+            choices = named or allowed
+            candidates, _exhausted, _unavailable = quota_key_candidates(settings, auth_store, choices)
+            resolved_key_id = max(candidates)[1] if candidates else choices[0]
+        else:
+            resolved_key_id = auth_store.resolve_kaggle_key_id(principal, kaggle_key_id)
         credentials = auth_store.credentials_for(resolved_key_id)
     except AuthSelectionError as exc:
         raise selection_error(exc) from exc
@@ -1296,6 +1305,23 @@ async def worker_loop(app: FastAPI, worker_index: int = 0) -> None:
             app.state.queue.task_done()
 
 
+def delete_job_files_and_record(settings: Settings, db: RelayDb, job_id: str) -> None:
+    paths = []
+    for root in (settings.jobs_dir, settings.artifacts_dir):
+        path = root / job_id
+        if path.resolve().parent != root.resolve() or path.is_symlink():
+            raise OSError("job directory is outside its storage root")
+        paths.append(path)
+    for path in paths:
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            if path.exists():
+                raise
+    # Keep the record on cleanup failure so the user can retry.
+    db.delete_job_record(job_id)
+
+
 def cleanup_expired_job(settings: Settings, db: RelayDb, job_id: str) -> None:
     job = db.get_job(job_id)
     if not job or job.get("cleaned_at") is not None:
@@ -1676,11 +1702,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.create_job(values)
         return job_response(db, job_id, settings.retention_hours)
 
+    @app.get("/v1/jobs/summary", response_model=dict[str, int])
+    def job_summary(
+        db: RelayDb = Depends(get_db),
+        auth_store: AuthStore = Depends(get_auth_store),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict[str, int]:
+        key_filter = None if principal.allow_all_keys else set(auth_store.allowed_key_ids(principal))
+        owner_filter = None if auth_store.legacy or principal.allow_all_keys else principal.id
+        counts = db.job_status_counts(key_filter, owner_filter)
+        return {
+            "total": sum(counts.values()),
+            "in_progress": sum(counts.get(status, 0) for status in ACTIVE_JOB_STATUSES - {"queued"}),
+            **{status: counts.get(status, 0) for status in ("queued", "failed", "complete", "canceled")},
+        }
+
     @app.get("/v1/jobs", response_model=list[JobResponse])
     def list_jobs(
         limit: int = Query(default=50, ge=1, le=200),
         active: bool = Query(default=False),
         status: list[str] | None = Query(default=None),
+        q: str = Query(default="", max_length=200),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
@@ -1693,6 +1735,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             relay_token_id=owner_filter,
             statuses=status_filter,
             limit=limit,
+            search=q,
         )
         return [job_to_response(db, job, settings.retention_hours) for job in jobs]
 
@@ -2081,16 +2124,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             if job_id in request.app.state.active_job_ids:
                 raise HTTPException(status_code=409, detail="job worker is still active")
-            if not db.update_job_if_status(
-                job_id,
-                {job["status"]},
-                status="failed",
-                error="deleted",
-                artifact_path="",
-            ):
-                raise HTTPException(status_code=409, detail="job status changed; retry deletion")
-            shutil.rmtree(settings.jobs_dir / job_id, ignore_errors=True)
-            shutil.rmtree(settings.artifacts_dir / job_id, ignore_errors=True)
+            if job_id in request.app.state.active_uploads:
+                raise HTTPException(status_code=409, detail="job upload is still active")
+            was_cancelled, error = await run_thread_to_completion(
+                request.app, delete_job_files_and_record, settings, db, job_id,
+            )
+            if error is not None:
+                LOGGER.error("job deletion failed for %s: %s", job_id, redact_secrets(str(error)))
+            if was_cancelled:
+                raise asyncio.CancelledError
+            if error is not None:
+                raise HTTPException(status_code=503, detail="job cleanup failed; retry deletion")
             return Response(status_code=204)
 
     return app

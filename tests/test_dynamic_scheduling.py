@@ -4,6 +4,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from test_concurrency import pool_settings, until
@@ -33,6 +35,59 @@ def enable_quota(monkeypatch, hours=None):
     monkeypatch.setattr("app.kaggle_adapter.KaggleAdapter.quota", lambda adapter: {
         "available": True, "accelerators": [{"resource": "GPU", "remaining_hours": hours[adapter.credentials.id]}],
     })
+
+
+@pytest.mark.parametrize("quota_state", ["exhausted", "unavailable"])
+def test_account_preflight_allows_upload_and_wait_until_quota_recovers(tmp_path, monkeypatch, quota_state):
+    app = create_app(pool_settings(tmp_path, count=2, shared=True))
+    hours = {"key0": 0, "key1": 0}
+
+    def quota(adapter):
+        if quota_state == "unavailable" and not any(hours.values()):
+            raise RuntimeError("quota service unavailable")
+        return {"available": True, "accelerators": [
+            {"resource": "GPU", "remaining_hours": hours[adapter.credentials.id]},
+        ]}
+
+    monkeypatch.setattr("app.kaggle_adapter.KaggleAdapter.quota", quota)
+    monkeypatch.setattr("app.kaggle_adapter.KaggleAdapter.account", lambda adapter: {
+        "username": adapter.credentials.username, "authenticated": True,
+    })
+    client = TestClient(app)
+    headers = auth_headers(token="fake-relay-token-0")
+    account = client.get("/v1/kaggle/account", headers=headers)
+    assert account.status_code == 200
+    assert account.json()["username"] == "user0"
+    assert account.json()["authenticated"]
+    if quota_state == "exhausted":
+        assert account.json()["quota"]["accelerators"][0]["remaining_hours"] == 0
+    else:
+        assert account.json()["quota"]["available"] is False
+
+    dataset = build_zip({"dataset-metadata.json": b'{"id":"user0/data"}', "data.bin": b"data"})
+    kernel = build_zip({"kernel-metadata.json": b'{"id":"user0/kernel","code_file":"train.py","dataset_sources":["user0/data"]}',
+                        "train.py": b"print(1)"})
+    payload = job_request_body(dataset, kernel, dataset_ref="user0/data", kernel_ref="user0/kernel")
+    # Fixed submissions must still fail instead of selecting an exhausted key.
+    assert client.post("/v1/jobs", headers=headers, json=payload).status_code == (
+        409 if quota_state == "exhausted" else 503
+    )
+    payload["scheduling_mode"] = "dynamic"
+    response = client.post("/v1/jobs", headers=headers, json=payload)
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    for kind, content in (("dataset", dataset), ("kernel", kernel)):
+        upload_all(client, job_id, kind, content, token="fake-relay-token-0")
+    assert client.post(f"/v1/jobs/{job_id}/complete", headers=headers).status_code == 200
+    asyncio.run(schedule_pending_jobs(app))
+    assert app.state.db.get_job(job_id)["assignment_state"] == "pending"
+    assert app.state.queue.empty()
+    hours["key1"] = 20
+    app.state.settings._quota_cache.ttl_seconds = 0
+    asyncio.run(schedule_pending_jobs(app))
+    job = app.state.db.get_job(job_id)
+    assert job["assignment_state"] == "bound" and job["kaggle_key_id"] == "key1"
+    assert client.get(f"/v1/jobs/{job_id}", headers=auth_headers(token="fake-relay-token-1")).status_code == 404
 
 
 def test_upload_then_dispatch_to_idle_account_preserves_frozen_identity(tmp_path, monkeypatch):

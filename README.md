@@ -333,6 +333,57 @@ progress callback response, save useful outputs under `/kaggle/working`, and
 exit cleanly. Relay then downloads available artifacts and marks the job
 `canceled`.
 
+## Shared account pool for ordinary users
+
+Give each user a separate Relay token with an explicit list of the current
+`allowed_kaggle_key_ids`. Listing every current key lets those users share the
+dynamic scheduling pool while retaining access only to their own jobs. New keys
+need an explicit grant; submitted jobs keep their original eligible-account
+snapshot. Do not use `"*"` for this setup: wildcard tokens can access other users'
+jobs. Kaggle credentials stay on the server.
+
+`GET /v1/kaggle/account` discovers an authorized account and reports its actual
+authentication/quota status. With multiple keys it prefers a configured username
+and positive quota, but still returns account information when every account is
+exhausted or quota lookup is unavailable. This allows existing dynamic clients to
+upload and queue their jobs until quota becomes available. This account is only
+provisional: the scheduler makes the final binding after upload. Fixed job
+submission retains its existing quota checks.
+
+## Managing task history
+
+The runtime page supports status filters and server-side search across job IDs,
+dataset/kernel names, Kaggle key IDs and error messages. Filters apply before
+the display limit (20–200). The four overview cards count all jobs visible to
+the current user: in progress (excluding the Relay queue), queued, failed and
+complete. `GET /v1/jobs/summary` returns these counts plus total and canceled
+counts, using the same owner/key permissions as the list, without its limit
+or search filters. Clicking a card clears the search and filters the list;
+clicking it again restores all statuses. The list's own count describes only
+the loaded rows. Failed and canceled tasks show a Delete button with a
+confirmation explaining the scope. Completed tasks retain their downloads.
+
+`GET /v1/jobs` accepts `q`, `status` and `active` filters. Authorized callers can
+use `DELETE /v1/jobs/{job_id}` for terminal jobs or idle receiving jobs. It
+permanently removes the Relay record, logs, chunks, submitted archives and
+result files. Kaggle datasets/Notebooks and reusable remote dataset cache
+entries are preserved. Running jobs, active workers and in-flight uploads
+return 409; deletion waits for current downloads. File cleanup failures return
+503 and retain the record for retry. The same owner/key permissions as reading
+the job apply to deletion.
+
+Training bars use valid epoch/epochs or PatchCore phase reports from
+`kernel_status`. The Relay envelope progress (for example 60 while waiting
+for Kaggle) is shown only in details and labeled as workflow progress, not
+training completion. Without a valid report the page explicitly shows that
+training progress is unknown. Terminal and output-download states take
+precedence over older training reports. Known errors receive conservative
+summaries and suggestions; full original errors remain in details, and
+unrecognized errors are shown verbatim.
+
+Presentation logic tests run through pytest when Node.js is available, or
+directly with `node --test tests/test_runtime_ui.cjs`.
+
 ## Reverse Proxy
 
 Use HTTPS, allow large request bodies, and set upload/proxy timeouts to at least

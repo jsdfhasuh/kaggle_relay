@@ -247,6 +247,17 @@
       word-break: break-word;
     }
 
+    .runtime-meta { display: flex; gap: 12px; flex-wrap: wrap; justify-content: space-between;
+      padding: 10px 14px; border-bottom: 1px solid var(--border); }
+    button.status-card { display: grid; text-align: left; justify-content: stretch; gap: 4px;
+      color: var(--ink); background: var(--surface); border: 1px solid var(--border); padding: 14px; }
+    button.status-card:hover { background: #f0f7ff; }
+    button.status-card[aria-pressed="true"] { border-color: var(--primary); background: #eff6ff;
+      box-shadow: inset 0 0 0 1px var(--primary); }
+    .status-card strong { font-size: 28px; line-height: 1.2; }
+    .status-card[data-status-filter="failed"] strong { color: var(--danger); }
+    .status-card[data-status-filter="complete"] strong { color: var(--success); }
+
     .latest-job-value {
       font-size: 13px;
       overflow-wrap: anywhere;
@@ -280,6 +291,20 @@
       font-size: 12px;
       font-weight: 700;
     }
+
+    .toolbar .search-field { flex: 1; min-width: 240px; }
+    .list-summary { padding: 10px 14px; background: var(--surface-soft); }
+    .jobs-table { min-width: 960px; table-layout: fixed; }
+    .jobs-table .task-cell { width: 30%; }
+    .jobs-table .status-cell { width: 24%; }
+    .job-note { margin-top: 6px; overflow-wrap: anywhere; display: -webkit-box;
+      -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .job-error { color: var(--danger); }
+    button.danger { color: var(--danger); background: #fff1f0; border-color: #f3b4af; }
+    button.danger:hover:not(:disabled) { background: #fee4e2; }
+    .jobs-table .progress { margin-top: 6px; }
+    .progress.failed > div { background: var(--danger); }
+    .progress.canceled > div { background: var(--muted); }
 
     .table-wrap {
       max-height: calc(100vh - 292px);
@@ -680,29 +705,44 @@
             <span id="lastRefreshText" class="muted">刷新：-</span>
           </div>
 
-          <div class="status-strip">
-            <div class="metric">
-              <div class="metric-label">服务状态</div>
-              <div id="healthText" class="metric-value">加载中...</div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">任务数量</div>
-              <div id="jobCountText" class="metric-value">-</div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">最新任务</div>
-              <div id="latestJobText" class="metric-value mono latest-job-value">-</div>
-              <div class="muted small">按创建时间倒序</div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">当前账号</div>
-              <div id="principalMetric" class="metric-value">-</div>
-            </div>
+          <div class="runtime-meta muted">
+            <span id="healthText">加载中...</span>
+            <span>当前账号：<strong id="principalMetric">-</strong></span>
           </div>
+          <div class="status-strip" aria-label="全部可见任务概览">
+            <button class="status-card" type="button" data-status-filter="in_progress" aria-pressed="false">
+              <span>进行中</span><strong id="inProgressCount">—</strong><span class="muted small">处理中的任务，不含排队</span>
+            </button>
+            <button class="status-card" type="button" data-status-filter="queued" aria-pressed="false">
+              <span>排队中</span><strong id="queuedCount">—</strong><span class="muted small">等待 Relay 调度</span>
+            </button>
+            <button class="status-card" type="button" data-status-filter="failed" aria-pressed="false">
+              <span>失败</span><strong id="failedCount">—</strong><span class="muted small">查看原因与日志</span>
+            </button>
+            <button class="status-card" type="button" data-status-filter="complete" aria-pressed="false">
+              <span>已完成</span><strong id="completeCount">—</strong><span class="muted small">查看和下载训练结果</span>
+            </button>
+          </div>
+          <div id="jobOverviewScope" class="list-summary muted" role="status">统计当前账号可见的全部任务，不受列表筛选和显示数量影响。</div>
 
           <div class="toolbar">
             <label>
-              数量
+              任务状态
+              <select id="statusSelect">
+                <option value="all">全部任务</option>
+                <option value="in_progress">进行中（不含排队）</option>
+                <option value="queued">排队中</option>
+                <option value="failed">失败</option>
+                <option value="complete">已完成</option>
+                <option value="canceled">已取消</option>
+              </select>
+            </label>
+            <label class="search-field">
+              搜索任务
+              <input id="jobSearch" type="search" maxlength="200" placeholder="任务 ID、数据集、训练名称、账号或失败原因" />
+            </label>
+            <label>
+              最多显示
               <select id="limitSelect">
                 <option value="20">20</option>
                 <option value="50" selected>50</option>
@@ -713,24 +753,22 @@
             <button id="refreshButton" type="button">刷新</button>
             <button class="light" id="autoRefreshButton" type="button">自动刷新：开</button>
           </div>
+          <div id="jobListSummary" class="list-summary muted" role="status" aria-live="polite">加载中...</div>
 
           <div class="table-wrap">
-            <table>
+            <table class="jobs-table">
               <thead>
                 <tr>
-                  <th class="job-id-cell">Job</th>
+                  <th class="task-cell">训练任务 / 数据集</th>
                   <th class="time-cell">创建时间</th>
-                  <th>状态</th>
-                  <th class="progress-cell">进度</th>
-                  <th>Kaggle Key</th>
-                  <th>Dataset / Kernel</th>
-                  <th>Cache</th>
+                  <th class="status-cell">状态 / 进度 / 原因</th>
+                  <th>账号 / 缓存</th>
                   <th class="artifact-cell">文件下载</th>
                   <th class="actions-cell">操作</th>
                 </tr>
               </thead>
               <tbody id="jobsBody">
-                <tr><td colspan="9" class="muted">加载中...</td></tr>
+                <tr><td colspan="6" class="muted">加载中...</td></tr>
               </tbody>
             </table>
           </div>
@@ -747,13 +785,13 @@
               <div id="detailSummary" class="detail-grid"></div>
               <div id="detailError" class="detail-block" hidden></div>
               <div class="detail-block">
-                <h3>Recent Logs</h3>
+                <h3>最近日志</h3>
                 <ul id="detailLogs" class="log-list"></ul>
               </div>
-              <div class="detail-block">
-                <h3>Raw JSON</h3>
+              <details class="detail-block">
+                <summary>完整任务数据（JSON）</summary>
                 <pre id="jobDetail"></pre>
-              </div>
+              </details>
             </div>
           </div>
         </section>
@@ -888,6 +926,9 @@
     let activePage = "runtime";
     let editingKaggleKeyId = "";
     const downloadingJobs = new Set();
+    const deletingJobs = new Set();
+    let jobsRequestVersion = 0;
+    let searchTimer = null;
     const kaggleUsernamePattern = /^[A-Za-z0-9_-]+$/;
 
     function qs(id) {
@@ -973,9 +1014,9 @@
         uploading_dataset: "上传数据集",
         waiting_dataset: "等待数据集",
         pushing_kernel: "提交 Kernel",
-        waiting_kernel: "等待 Kernel",
+        waiting_kernel: "等待 Kaggle 状态",
         cancel_requested: "停止中",
-        downloading_output: "下载输出",
+        downloading_output: "下载训练结果",
         complete: "完成",
         canceled: "已取消",
         failed: "失败"
@@ -983,15 +1024,16 @@
       return labels[status] || status || "-";
     }
 
-    function statusPill(status) {
+    function statusPill(status, label = statusLabel(status)) {
       const value = String(status || "");
-      if (value === "complete") return `<span class="pill ok">${statusLabel(value)}</span>`;
-      if (value === "canceled") return `<span class="pill neutral">${statusLabel(value)}</span>`;
-      if (value === "failed") return `<span class="pill bad">${statusLabel(value)}</span>`;
+      const text = escapeHtml(label);
+      if (value === "complete") return `<span class="pill ok">${text}</span>`;
+      if (value === "canceled") return `<span class="pill neutral">${text}</span>`;
+      if (value === "failed") return `<span class="pill bad">${text}</span>`;
       if (["queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel", "cancel_requested", "downloading_output", "assembling", "receiving"].includes(value)) {
-        return `<span class="pill warn">${statusLabel(value)}</span>`;
+        return `<span class="pill warn">${text}</span>`;
       }
-      return `<span class="pill neutral">${escapeHtml(statusLabel(value))}</span>`;
+      return `<span class="pill neutral">${text}</span>`;
     }
 
     function cachePill(job) {
@@ -1031,9 +1073,12 @@
       const dataset = job.can_download_dataset
         ? `<a class="download-button" href="/v1/jobs/${encodeURIComponent(job.job_id)}/dataset.zip" download>下载提交包</a>
            <span class="muted small">${escapeHtml(fmtBytes(job.dataset_size))} · 含上传的图片、标注</span>`
-        : `<button class="ghost download-button" type="button" disabled>下载提交包</button>
-           <span class="muted small">${escapeHtml(reasons[job.dataset_download_unavailable_code] || "提交包不可用")}</span>`;
+        : `<span class="muted small" title="${escapeHtml(reasons[job.dataset_download_unavailable_code] || "提交包不可用")}">提交包：${escapeHtml({not_ready: "未就绪", expired: "已过期", missing: "未保留", invalid: "校验失败", inaccessible: "暂不可用"}[job.dataset_download_unavailable_code] || "不可用")}</span>`;
       return `${renderResultArtifact(job)}<div class="artifact-state">${dataset}</div>`;
+    }
+
+    function canDeleteJob(job) {
+      return ["failed", "canceled"].includes(job.status);
     }
 
     function renderResultArtifact(job) {
@@ -1043,7 +1088,7 @@
         return `
           <div class="artifact-state">
             <button class="download-button" type="button" data-job-download="${jobId}" ${downloading ? "disabled" : ""}>
-              ${downloading ? "下载中..." : "下载 ZIP"}
+              ${downloading ? "下载中..." : "下载训练结果"}
             </button>
             <span class="muted small">${escapeHtml(fmtBytes(job.artifact_size))}</span>
           </div>
@@ -1051,24 +1096,94 @@
       }
       return `
         <div class="artifact-state">
-          <button class="ghost download-button" type="button" disabled>下载 ZIP</button>
+          <span class="muted small">训练结果不可下载</span>
           <span class="muted small">${escapeHtml(downloadReason(job))}</span>
         </div>
       `;
     }
 
+    function trainingReport(job) {
+      let payload = job.kernel_status;
+      if (typeof payload === "string") {
+        try { payload = JSON.parse(payload); } catch (_) { return null; }
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+      const percent = value => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
+      const integer = value => Number.isSafeInteger(value) && value >= 0;
+      if (payload.phase) {
+        if (payload.backend !== "patchcore" || typeof payload.phase_label !== "string" || !payload.phase_label.trim()
+            || !percent(payload.phase_progress) || !integer(payload.phase_index) || payload.phase_index < 1
+            || !integer(payload.phase_count) || payload.phase_count < payload.phase_index
+            || !integer(payload.phase_current) || !integer(payload.phase_total)
+            || (payload.phase_total > 0 && payload.phase_current > payload.phase_total)) return null;
+        return {stage: "Kaggle 执行中", text: `阶段 ${payload.phase_index}/${payload.phase_count}：${payload.phase_label}`,
+          percent: payload.phase_progress, scope: "该阶段最近回报进度"};
+      }
+      if (integer(payload.epoch) && integer(payload.epochs) && payload.epochs > 0 && payload.epoch <= payload.epochs) {
+        return {stage: payload.epoch === payload.epochs ? "等待 Kaggle 收尾" : "训练中",
+          text: `已回报 ${payload.epoch} / ${payload.epochs} 轮`, percent: payload.epoch / payload.epochs * 100,
+          scope: "训练轮次进度 · 最近回报"};
+      }
+      if (payload.epoch != null || payload.epochs != null) return null;
+      if (percent(payload.remote_progress)) {
+        return {stage: "Kaggle 执行中", text: "已收到执行进度回报", percent: payload.remote_progress,
+          scope: "Kaggle 回报进度，非训练轮次"};
+      }
+      return null;
+    }
+
+    function jobProgress(job) {
+      const report = trainingReport(job);
+      const result = {stage: statusLabel(job.status), text: "", percent: null, scope: ""};
+      if (["failed", "canceled", "complete", "cancel_requested", "downloading_output"].includes(job.status)) {
+        if (report) result.text = `上次回报：${report.text}`;
+        else if (job.status === "downloading_output") result.text = "正在接收和校验训练结果";
+        return result;
+      }
+      if (job.status !== "waiting_kernel") {
+        result.text = {receiving: "接收训练提交包", assembling: "组装并校验提交包", queued: "等待调度或账号资源",
+          uploading_dataset: "上传数据集至 Kaggle", waiting_dataset: "等待 Kaggle 数据集就绪", pushing_kernel: "提交训练程序至 Kaggle"}[job.status] || "";
+        return result;
+      }
+      if (report) return report;
+      const remote = String(job.kernel_status || "").trim().toLowerCase();
+      if (/^(?:kernelworkerstatus\.)?running$/.test(remote)) result.stage = "Kaggle 执行中";
+      else if (/^(?:kernelworkerstatus\.)?(queued|pending)$/.test(remote)) result.stage = "等待 Kaggle 启动";
+      else if (/^(?:kernelworkerstatus\.)?(complete|completed|succeeded)$/.test(remote)) result.stage = "等待接收训练结果";
+      result.text = "尚无有效训练回报，训练进度未知";
+      return result;
+    }
+
+    function failureSummary(job) {
+      const raw = String(job.error || "").trim();
+      if (job.status !== "failed") return {title: raw, suggestion: "", recognized: false};
+      const rules = [
+        [/CUDA out of memory|torch\.cuda\.OutOfMemoryError|CUDA error: out of memory/i, "GPU 显存不足", "尝试减小 batch size 或输入尺寸。"],
+        [/(?:GPU|accelerator)[^\n]*(?:quota|hours)[^\n]*(?:exhausted|exceeded|insufficient)|(?:exceeded|exhausted)[^\n]*(?:GPU|accelerator)[^\n]*quota/i,
+          "GPU 配额不足", "等待额度恢复，或使用有额度的授权账号。"],
+        [/dataset upload failed|failed to upload (?:the )?dataset|上传数据集失败|数据集上传失败/i, "数据集上传失败", "检查数据集文件、网络连接和 Kaggle 账号权限。"],
+        [/No space left on device|not enough (?:free )?disk space|磁盘空间不足/i, "磁盘空间不足", "根据原始错误确认是 Relay 还是 Kaggle 空间不足。"],
+        [/\b401\s+(?:Client Error|Unauthorized)|\b403\s+(?:Client Error|Forbidden)|authentication failed|permission denied/i,
+          "认证或权限检查失败", "检查原始错误中的服务、凭据及文件访问权限。"],
+        [/Kernel wait timed out/i, "等待 Kaggle 状态超时", "先检查 Kaggle 上的任务状态，再决定是否重试。"],
+        [/Dataset wait timed out/i, "等待数据集就绪超时", "检查 Kaggle 数据集处理状态。"],
+      ];
+      const match = rules.find(([pattern]) => pattern.test(raw));
+      return match ? {title: match[1], suggestion: match[2], recognized: true}
+        : {title: raw || "未提供失败原因，请查看日志", suggestion: "", recognized: false};
+    }
+
     function renderProgress(job) {
-      const progress = clampProgress(job.progress);
-      return `
-        <div>${Math.round(progress)}%</div>
-        <div class="progress"><div style="width:${progress}%"></div></div>
-      `;
+      const progress = jobProgress(job);
+      return `${progress.text ? `<div class="job-note small">${escapeHtml(progress.text)}</div>` : ""}
+        ${progress.percent === null ? "" : `<div class="muted small">${escapeHtml(progress.scope)} · ${Math.round(progress.percent)}%</div>
+          <div class="progress" role="progressbar" aria-label="${escapeHtml(progress.scope)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.percent}"><div style="width:${progress.percent}%"></div></div>`}`;
     }
 
     function renderJobs(jobs) {
       const tbody = qs("jobsBody");
       if (!jobs.length) {
-        tbody.innerHTML = `<tr><td colspan="9" class="muted">暂无任务。</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" class="muted">没有符合当前筛选条件的任务。可切换状态或清空搜索。</td></tr>`;
         return;
       }
 
@@ -1078,29 +1193,31 @@
         const selectedBadge = job.job_id === selectedJobId ? '<span class="pill neutral">详情</span>' : "";
         return `
           <tr class="${index === 0 ? "latest-row" : ""}">
-            <td class="job-id-cell">
+            <td class="task-cell">
               <div class="job-id-stack">
-                <div class="mono strong wrap" title="${jobId}">${jobId}</div>
+                <div class="strong wrap" title="${escapeHtml(job.kernel_ref)}">${escapeHtml(job.kernel_ref?.split('/').pop() || "尚未分配训练名称")}</div>
+                <div class="muted small wrap">数据集：${escapeHtml(job.dataset_ref)}</div>
+                <div class="mono muted small" title="${jobId}">ID: ${escapeHtml(shortId(job.job_id))}</div>
                 <div class="job-id-meta">${latestBadge}${selectedBadge}</div>
               </div>
             </td>
             <td class="time-cell">${escapeHtml(fmtTimestamp(job.created_at))}</td>
-            <td>
-              ${statusPill(job.status)}
-              <div class="muted small mono">${escapeHtml(job.status || "-")}</div>
+            <td class="status-cell">
+              ${statusPill(job.status, jobProgress(job).stage)}
+              ${renderProgress(job)}
+              ${job.error || job.status === "failed" ? `<div class="job-note job-error small" title="${escapeHtml(job.error)}">${escapeHtml(failureSummary(job).title)}</div>` : ""}
+              ${job.queue_reason ? `<div class="job-note muted small" title="${escapeHtml(job.queue_reason)}">${escapeHtml(job.queue_reason)}</div>` : ""}
             </td>
-            <td class="progress-cell">${renderProgress(job)}</td>
-            <td class="mono">${escapeHtml(job.kaggle_key_id || "legacy")}</td>
             <td class="wrap">
-              <div><span class="strong">Dataset:</span> ${escapeHtml(job.dataset_ref)}</div>
-              <div><span class="strong">Kernel:</span> ${escapeHtml(job.kernel_ref)}</div>
+              <div class="mono">${escapeHtml(job.kaggle_key_id || "legacy")}</div>
+              <div class="job-note">${cachePill(job)}</div>
             </td>
-            <td>${cachePill(job)}</td>
             <td class="artifact-cell">${renderArtifact(job)}</td>
             <td class="actions-cell">
               <div class="action-row">
                 <button class="light" type="button" data-job-detail="${jobId}">详情</button>
-                <button class="light" type="button" data-job-cancel="${jobId}" ${canCancelJob(job) ? "" : "disabled"}>停止</button>
+                ${canCancelJob(job) ? `<button class="light" type="button" data-job-cancel="${jobId}">停止</button>` : ""}
+                ${canDeleteJob(job) ? `<button class="danger" type="button" data-job-delete="${jobId}" ${deletingJobs.has(job.job_id) ? "disabled" : ""}>${deletingJobs.has(job.job_id) ? "删除中..." : "删除"}</button>` : ""}
               </div>
             </td>
           </tr>
@@ -1151,13 +1268,45 @@
         `<span class="pill ok">${escapeHtml(data.status)}</span> <span class="muted small">版本 ${escapeHtml(data.version)} / ${escapeHtml(fmtBytes(data.free_bytes))} 可用</span>`;
     }
 
-    async function loadJobs() {
+    function jobListParams() {
       const limit = Number(qs("limitSelect").value || 50);
-      const jobs = await api(`/v1/jobs?limit=${limit}`);
+      const params = new URLSearchParams({limit: String(limit)});
+      const status = qs("statusSelect").value;
+      if (status === "in_progress") {
+        params.set("status", "receiving,assembling,uploading_dataset,waiting_dataset,pushing_kernel,waiting_kernel,cancel_requested,downloading_output");
+      }
+      else if (status !== "all") params.set("status", status);
+      const search = qs("jobSearch").value.trim();
+      if (search) params.set("q", search);
+      return params;
+    }
+
+    async function loadJobOverview(version) {
+      const fields = {in_progress: "inProgressCount", queued: "queuedCount", failed: "failedCount", complete: "completeCount"};
+      try {
+        const counts = await api("/v1/jobs/summary");
+        if (version !== jobsRequestVersion) return;
+        for (const [key, id] of Object.entries(fields)) qs(id).textContent = String(counts[key]);
+        qs("jobOverviewScope").textContent = `当前账号可见任务共 ${counts.total} 条，其中已取消 ${counts.canceled} 条。卡片统计全部可见任务，不受搜索和显示数量影响；点击卡片查看对应任务，再次点击恢复全部。`;
+      } catch (error) {
+        if (version !== jobsRequestVersion) return;
+        for (const id of Object.values(fields)) qs(id).textContent = "—";
+        qs("jobOverviewScope").textContent = "任务统计暂时无法加载，请刷新重试。";
+      }
+    }
+
+    async function loadJobs() {
+      const version = ++jobsRequestVersion;
+      const params = jobListParams();
+      const limit = Number(params.get("limit"));
+      document.querySelectorAll("[data-status-filter]").forEach(button => {
+        button.setAttribute("aria-pressed", String(button.dataset.statusFilter === qs("statusSelect").value));
+      });
+      const [jobs] = await Promise.all([api(`/v1/jobs?${params}`), loadJobOverview(version)]);
+      if (version !== jobsRequestVersion) return;
       jobsCache = jobs;
-      qs("jobCountText").textContent = String(jobs.length);
+      qs("jobListSummary").textContent = `当前筛选已加载 ${jobs.length} 条，按创建时间倒序。${jobs.length === limit ? "已达到显示上限，可缩小筛选范围或增加数量。" : ""}失败和已取消任务可删除；完整信息请查看详情。`;
       qs("lastRefreshText").textContent = `刷新：${new Date().toLocaleTimeString()}`;
-      qs("latestJobText").textContent = jobs[0]?.job_id || "-";
       const latestJobId = jobs[0]?.job_id || "";
       const selectedExists = selectedJobId && jobs.some((job) => job.job_id === selectedJobId);
       if (latestJobId && (!selectedJobPinned || !selectedExists)) {
@@ -1169,7 +1318,7 @@
       }
       renderJobs(jobs);
       if (selectedJobId) {
-        await loadJobDetail(selectedJobId, {silent: true});
+        await loadJobDetail(selectedJobId, {silent: true, listVersion: version});
       } else {
         qs("selectedJobText").textContent = "未选择任务";
         qs("detailEmpty").hidden = false;
@@ -1193,11 +1342,12 @@
       qs("detailSummary").innerHTML = `
         <div class="metric">
           <div class="metric-label">状态</div>
-          <div class="metric-value">${statusPill(data.status)}</div>
+          <div class="metric-value">${statusPill(data.status, jobProgress(data).stage)}</div>
         </div>
         <div class="metric">
-          <div class="metric-label">进度</div>
-          <div class="metric-value">${Math.round(clampProgress(data.progress))}%</div>
+          <div class="metric-label">阶段与训练回报</div>
+          <div>${renderProgress(data)}</div>
+          <div class="muted small">Relay 流程进度：${Math.round(clampProgress(data.progress))}%（非训练完成比例）</div>
         </div>
         <div class="metric">
           <div class="metric-label">产物</div>
@@ -1225,7 +1375,9 @@
         errorBox.hidden = false;
         errorBox.innerHTML = `
           ${cancelText ? `<h3>取消</h3><pre>${escapeHtml(cancelText)}</pre>` : ""}
-          ${data.error ? `<h3>错误</h3><pre>${escapeHtml(data.error)}</pre>` : ""}
+          ${data.error ? `<h3>${escapeHtml(failureSummary(data).recognized ? failureSummary(data).title : "原始错误")}</h3>
+            ${failureSummary(data).suggestion ? `<p>${escapeHtml(failureSummary(data).suggestion)}</p>` : ""}
+            <pre>${escapeHtml(data.error)}</pre>` : ""}
         `;
       } else {
         errorBox.hidden = true;
@@ -1241,7 +1393,9 @@
 
     async function loadJobDetail(jobId, options = {}) {
       if (options.userSelected) selectedJobPinned = true;
+      const listVersion = options.listVersion ?? jobsRequestVersion;
       const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}`);
+      if (listVersion !== jobsRequestVersion || deletingJobs.has(jobId)) return;
       renderDetail(data);
       if (!options.silent) {
         qs("detailContent").scrollIntoView({block: "nearest"});
@@ -1444,7 +1598,7 @@
       else downloadingJobs.delete(jobId);
       document.querySelectorAll(`[data-job-download="${jobId}"]`).forEach((button) => {
         button.disabled = isDownloading;
-        button.textContent = isDownloading ? "下载中..." : "下载 ZIP";
+        button.textContent = isDownloading ? "下载中..." : "下载训练结果";
       });
     }
 
@@ -1483,6 +1637,33 @@
       } finally {
         setDownloadButtons(jobId, false);
       }
+    }
+
+    async function deleteJob(jobId) {
+      const job = jobsCache.find(item => item.job_id === jobId);
+      if (!job || !canDeleteJob(job) || deletingJobs.has(jobId)) return;
+      if (!confirm(`删除${statusLabel(job.status)}任务？\n${job.kernel_ref}\nID: ${jobId}\n\n将永久删除 Relay 中的任务记录、日志、提交包及训练结果，无法恢复。Kaggle 上的数据集和 Notebook 保留。`)) return;
+      deletingJobs.add(jobId);
+      ++jobsRequestVersion;
+      renderJobs(jobsCache);
+      try {
+        await api(`/v1/jobs/${encodeURIComponent(jobId)}`, {method: "DELETE"});
+        ++jobsRequestVersion;
+        jobsCache = jobsCache.filter(item => item.job_id !== jobId);
+        if (selectedJobId === jobId) {
+          selectedJobId = "";
+          selectedJobPinned = false;
+          qs("selectedJobText").textContent = "未选择任务";
+          qs("detailEmpty").hidden = false;
+          qs("detailContent").hidden = true;
+        }
+      } catch (error) {
+        alert(`删除失败：${error.message || String(error)}\n若任务仍在收尾或上传，请稍后重试。`);
+      } finally {
+        deletingJobs.delete(jobId);
+        renderJobs(jobsCache);
+      }
+      await loadJobs();
     }
 
     async function cancelJob(jobId, button) {
@@ -1673,6 +1854,14 @@
     }
 
     document.addEventListener("click", (event) => {
+      const statusCard = event.target.closest("[data-status-filter]");
+      if (statusCard) {
+        qs("statusSelect").value = qs("statusSelect").value === statusCard.dataset.statusFilter ? "all" : statusCard.dataset.statusFilter;
+        qs("jobSearch").value = "";
+        clearTimeout(searchTimer);
+        loadJobs().catch(console.error);
+        return;
+      }
       const detailButton = event.target.closest("[data-job-detail]");
       if (detailButton) {
         loadJobDetail(detailButton.dataset.jobDetail, {userSelected: true}).catch(console.error);
@@ -1686,6 +1875,11 @@
       const cancelButton = event.target.closest("[data-job-cancel]");
       if (cancelButton && !cancelButton.disabled) {
         cancelJob(cancelButton.dataset.jobCancel, cancelButton).catch(console.error);
+        return;
+      }
+      const deleteButton = event.target.closest("[data-job-delete]");
+      if (deleteButton && !deleteButton.disabled) {
+        deleteJob(deleteButton.dataset.jobDelete).catch(console.error);
         return;
       }
       const probeButton = event.target.closest("[data-account-probe]");
@@ -1715,6 +1909,12 @@
     qs("autoRefreshButton").addEventListener("click", toggleAutoRefresh);
     qs("accountButton").addEventListener("click", () => checkKaggleAccount().catch(console.error));
     qs("limitSelect").addEventListener("change", () => loadJobs().catch(console.error));
+    qs("statusSelect").addEventListener("change", () => loadJobs().catch(console.error));
+    qs("jobSearch").addEventListener("input", () => {
+      ++jobsRequestVersion;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => loadJobs().catch(console.error), 300);
+    });
     qs("kaggleKeyForm").addEventListener("submit", (event) => saveKaggleKey(event).catch(console.error));
     qs("cancelKaggleEditButton").addEventListener("click", () => {
       resetKaggleKeyForm();

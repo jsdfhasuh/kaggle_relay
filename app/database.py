@@ -299,21 +299,18 @@ class RelayDb:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    def list_jobs(
-        self,
-        kaggle_key_ids: Optional[set[str]] = None,
-        relay_token_id: Optional[str] = None,
-        statuses: Optional[set[str]] = None,
+    @staticmethod
+    def _job_visibility_conditions(
+        kaggle_key_ids: Optional[set[str]],
+        relay_token_id: Optional[str],
         include_unowned: bool = False,
-        limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 200))
-        with self.connect() as conn:
-            conditions = []
-            params: list[Any] = []
-            if kaggle_key_ids is not None:
-                if not kaggle_key_ids:
-                    return []
+    ) -> tuple[list[str], list[Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if kaggle_key_ids is not None:
+            if not kaggle_key_ids:
+                conditions.append("0")
+            else:
                 placeholders = ", ".join("?" for _ in kaggle_key_ids)
                 conditions.append(
                     f"(kaggle_key_id IN ({placeholders}) OR "
@@ -323,12 +320,46 @@ class RelayDb:
                 )
                 params.extend(sorted(kaggle_key_ids))
                 params.extend(sorted(kaggle_key_ids))
-            if relay_token_id is not None:
-                if include_unowned:
-                    conditions.append("(relay_token_id = ? OR relay_token_id = '')")
-                else:
-                    conditions.append("relay_token_id = ?")
-                params.append(relay_token_id)
+        if relay_token_id is not None:
+            conditions.append(
+                "(relay_token_id = ? OR relay_token_id = '')" if include_unowned else "relay_token_id = ?"
+            )
+            params.append(relay_token_id)
+        return conditions, params
+
+    def job_status_counts(
+        self,
+        kaggle_key_ids: Optional[set[str]] = None,
+        relay_token_id: Optional[str] = None,
+    ) -> dict[str, int]:
+        conditions, params = self._job_visibility_conditions(kaggle_key_ids, relay_token_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT status, COUNT(*) AS count FROM jobs {where} GROUP BY status", params,
+            ).fetchall()
+        return {row["status"]: row["count"] for row in rows}
+
+    def list_jobs(
+        self,
+        kaggle_key_ids: Optional[set[str]] = None,
+        relay_token_id: Optional[str] = None,
+        statuses: Optional[set[str]] = None,
+        include_unowned: bool = False,
+        limit: int = 50,
+        search: str = "",
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        with self.connect() as conn:
+            conditions, params = self._job_visibility_conditions(
+                kaggle_key_ids, relay_token_id, include_unowned,
+            )
+            if search.strip():
+                conditions.append("(" + " OR ".join(
+                    f"instr(lower({field}), lower(?)) > 0"
+                    for field in ("job_id", "dataset_ref", "kernel_ref", "kaggle_key_id", "error")
+                ) + ")")
+                params.extend([search.strip()] * 5)
             if statuses is not None:
                 if not statuses:
                     return []
@@ -347,6 +378,15 @@ class RelayDb:
                 (*params, safe_limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def delete_job_record(self, job_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM logs WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM kaggle_last_job WHERE job_id = ?", (job_id,))
+            # The remote dataset is still reusable; only detach its provenance.
+            conn.execute("UPDATE kaggle_dataset_cache SET source_job_id = '' WHERE source_job_id = ?", (job_id,))
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 
     def get_latest_job_by_kernel_ref(
         self,
