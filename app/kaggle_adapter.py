@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.archive import require_file
+from app.dinov2_artifacts import (ARTIFACT_CONTRACT as DINO_CONTRACT, ARTIFACT_SUBDIR as DINO_SUBDIR,
+                                DOWNLOAD_PATTERN as DINO_PATTERN)
+from app.dinov2_artifacts import package_artifacts as package_dinov2_artifacts
 from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
@@ -34,6 +37,7 @@ PATCHCORE_ARTIFACT_FILE_PATTERN = (
     r"overlay_sample\.png|training_artifacts\.json)$"
 )
 ARTIFACT_FILE_PATTERNS = {
+    DINO_CONTRACT: DINO_PATTERN,
     "yolo": YOLO_ARTIFACT_FILE_PATTERN,
     "patchcore": PATCHCORE_ARTIFACT_FILE_PATTERN,
 }
@@ -963,7 +967,13 @@ class KaggleAdapter:
         output_dir: Path,
         artifact_zip: Path,
         artifact_contract: str = "yolo",
+        *,
+        expected_identity: dict | None = None,
     ) -> None:
+        if artifact_contract == DINO_CONTRACT:
+            package_dinov2_artifacts(output_dir / DINO_SUBDIR, artifact_zip, expected_identity=expected_identity,
+                                    storage_budget=getattr(self.settings, "_storage_budget", None))
+            return
         required_files = REQUIRED_ARTIFACT_FILES.get(artifact_contract)
         if required_files is None:
             raise KaggleAdapterError(

@@ -112,7 +112,7 @@ class RelayDb:
                     THEN 'patchcore'
                     ELSE 'yolo'
                 END
-                WHERE artifact_contract NOT IN ('yolo', 'patchcore')
+                WHERE artifact_contract NOT IN ('yolo', 'patchcore', 'patchcore_dinov2_v3')
                 """
             )
             self._ensure_column(conn, "jobs", "relay_token_id", "TEXT NOT NULL DEFAULT ''")

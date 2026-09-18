@@ -256,13 +256,24 @@ create, get, and list responses. Clients must stop before archive upload if any
 returned identity value is missing or differs from the frozen request. Legacy
 YOLO requests that omit all four fields remain supported.
 
-Clients also send `artifact_contract` as `yolo` or `patchcore`. Relay persists
+Clients also send `artifact_contract` as `yolo`, `patchcore`, or
+`patchcore_dinov2_v3`. Relay persists
 and returns it, then uses it for both Kaggle output filtering and required-file
 validation. PatchCore jobs require `model.ckpt`, `threshold.json`,
 `anomaly_metrics.json`, `environment.json`, and `training_artifacts.json`;
 YOLO jobs continue to require `best.pt`. For pre-contract jobs, Relay derives
 `patchcore` only when all four frozen identity fields are present, otherwise it
 uses `yolo`.
+
+DINO v3 clients first check the authenticated `/v1/health` response
+`artifact_contracts` list. They explicitly request `patchcore_dinov2_v3` and
+send all four frozen identity fields. This contract downloads only the
+14 canonical files in `artifacts/`, including `com_dinov2_small.pt`, its
+verification records and the training checkpoint. Relay verifies the manifest
+format/status, exact inventory, sizes, SHA-256 hashes and job identity before
+atomically publishing the ZIP. It never loads PT/CKPT files or imports the
+training runtime. The desktop still performs full frozen-contract validation.
+See [DINO v3 transport](docs/dinov2-v3-artifacts.md) for compatibility and rollout.
 
 ## Kernel Progress Callback
 

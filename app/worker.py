@@ -6,6 +6,7 @@ from typing import Callable
 
 from app.archive import ArchiveError, require_file
 from app.database import RelayDb
+from app.dinov2_artifacts import ARTIFACT_CONTRACT as DINO_CONTRACT, IDENTITY_FIELDS
 from app.auth_config import AuthStore
 from app.kaggle_adapter import (
     DatasetUploadReceipt,
@@ -434,10 +435,14 @@ def finish_kernel_job(
         artifact_contract=artifact_contract,
     )
     log(output)
+    packaging_options = {}
+    if artifact_contract == DINO_CONTRACT:
+        packaging_options["expected_identity"] = {key: current.get(key) for key in IDENTITY_FIELDS}
     adapter.package_artifacts(
         paths["output_dir"],
         paths["artifact_zip"],
         artifact_contract=artifact_contract,
+        **packaging_options,
     )
     db.finalize_job(
         job_id,
