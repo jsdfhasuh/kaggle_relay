@@ -133,3 +133,23 @@ test('overview loads uncapped counts and clears stale values on error', async ()
   assert.equal(ui.qs('failedCount').textContent, '—');
   assert.match(ui.qs('jobOverviewScope').textContent, /暂时无法加载/);
 });
+
+test('key permission hides navigation and prevents direct page selection', () => {
+  const ui = page();
+  const buttons = ['runtime', 'accounts', 'users'].map(pageNav => ({dataset: {pageNav}}));
+  ui.document.querySelectorAll = () => buttons;
+  ui.applySessionPermissions({can_view_keys: false});
+  assert.equal(buttons[0].hidden, false);
+  assert.equal(buttons[1].hidden, true);
+  assert.equal(buttons[2].hidden, true);
+  assert.equal(ui.normalizePage('accounts'), 'runtime');
+  assert.equal(ui.normalizePage('users'), 'runtime');
+  ui.applySessionPermissions({can_view_keys: true});
+  assert.equal(buttons[1].hidden, false);
+  assert.equal(ui.normalizePage('accounts'), 'accounts');
+});
+
+test('receiving deadline errors have a clear failure summary', () => {
+  const ui = page();
+  assert.equal(ui.failureSummary({status: 'failed', error: 'upload timed out: incomplete after 3 hours from job creation; submit a new job'}).title, '上传接收超时');
+});

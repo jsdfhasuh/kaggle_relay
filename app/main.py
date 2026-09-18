@@ -46,6 +46,7 @@ from app.schemas import (
     JobStatus,
     UiLoginRequest,
     UpdateKaggleKeyRequest,
+    UpdateRelayTokenPermissionsRequest,
 )
 from app.security import (
     AuthFailureLimiter,
@@ -315,8 +316,11 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
                 "callback_enabled": bool(job.get("callback_token_sha256")),
                 "cancel_requested": bool(job.get("cancel_requested_at")),
                 "upload_expires_at": (
-                    float(job["upload_activity_at"]) + getattr(db, "receiving_retention_hours", 168) * 3600
-                    if job["status"] == "receiving" and job.get("upload_activity_at") else None
+                    min(
+                        float(job.get("upload_activity_at") or job["created_at"])
+                        + getattr(db, "receiving_retention_hours", 168) * 3600,
+                        float(job["created_at"]) + getattr(db, "receiving_timeout_hours", 3) * 3600,
+                    ) if job["status"] == "receiving" else None
                 ),
                 **artifact_download_metadata(job, retention_hours),
                 **dataset_download_metadata(job, db.path.parent / "jobs"),
@@ -334,6 +338,8 @@ def public_allowed_key_ids(auth_store: AuthStore, principal: RelayPrincipal) -> 
 
 
 def public_kaggle_keys(auth_store: AuthStore, principal: RelayPrincipal) -> list[dict]:
+    if not principal.can_view_keys:
+        return []
     allowed_key_ids = public_allowed_key_ids(auth_store, principal)
     if auth_store.legacy:
         return [{"id": "", "username": "", "credential_source": "environment"}]
@@ -365,7 +371,7 @@ def public_kaggle_keys(auth_store: AuthStore, principal: RelayPrincipal) -> list
 def public_relay_tokens(auth_store: AuthStore, principal: RelayPrincipal) -> list[dict]:
     tokens = []
     for _token_value, token_principal in getattr(auth_store, "_tokens", []):
-        if not principal.allow_all_keys and token_principal.id != principal.id:
+        if not principal.management_admin and token_principal.id != principal.id:
             continue
         allowed = (
             "*"
@@ -375,7 +381,8 @@ def public_relay_tokens(auth_store: AuthStore, principal: RelayPrincipal) -> lis
         tokens.append(
             {
                 "id": token_principal.id,
-                "allowed_kaggle_key_ids": allowed,
+                "allowed_kaggle_key_ids": allowed if principal.can_view_keys else [],
+                "can_view_keys": token_principal.can_view_keys,
                 "current": token_principal.id == principal.id,
                 "management": token_principal.management_admin,
             }
@@ -384,13 +391,14 @@ def public_relay_tokens(auth_store: AuthStore, principal: RelayPrincipal) -> lis
 
 
 def auth_config_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
-    allowed_key_ids = public_allowed_key_ids(auth_store, principal)
+    allowed_key_ids = public_allowed_key_ids(auth_store, principal) if principal.can_view_keys else []
     return {
         "mode": "legacy" if auth_store.legacy else "multi_key",
         "principal_id": principal.id,
         "current_token_id": principal.id,
         "allowed_kaggle_key_ids": allowed_key_ids,
         "can_manage_auth": principal.management_admin and not auth_store.legacy,
+        "can_view_keys": principal.can_view_keys,
         "management_token_configured": auth_store.management_token_configured,
         "relay_tokens": public_relay_tokens(auth_store, principal),
         "kaggle_keys": public_kaggle_keys(auth_store, principal),
@@ -635,7 +643,9 @@ def session_summary(auth_store: AuthStore, principal: RelayPrincipal) -> dict:
     return {
         "authenticated": True,
         "principal_id": principal.id,
-        "allowed_kaggle_key_ids": public_allowed_key_ids(auth_store, principal),
+        "allowed_kaggle_key_ids": public_allowed_key_ids(auth_store, principal) if principal.can_view_keys else [],
+        "can_view_keys": principal.can_view_keys,
+        "can_manage_auth": principal.management_admin and not auth_store.legacy,
     }
 
 
@@ -790,9 +800,27 @@ def add_relay_token_config(settings: Settings, principal: RelayPrincipal, payloa
                 "id": token_id,
                 "token": token,
                 "allowed_kaggle_key_ids": allowed,
+                "can_view_keys": payload.can_view_keys,
             }
         )
         return validate_and_write_auth_config(path, data, settings.admin_token)
+
+
+def update_relay_token_permissions(settings: Settings, principal: RelayPrincipal, token_id: str,
+                                   payload: UpdateRelayTokenPermissionsRequest) -> AuthStore:
+    path = require_config_admin(settings, principal)
+    with AUTH_CONFIG_LOCK:
+        data = read_auth_config(path)
+        token = next((item for item in data["relay_tokens"] if item.get("id") == token_id), None)
+        if token is None:
+            raise HTTPException(status_code=404, detail="relay token id not found")
+        token["can_view_keys"] = payload.can_view_keys
+        return validate_and_write_auth_config(path, data, settings.admin_token)
+
+
+def require_key_view(principal: RelayPrincipal) -> None:
+    if not principal.can_view_keys:
+        raise HTTPException(status_code=403, detail="key viewing permission is required")
 
 
 def authorize_job_callback(job: dict, authorization: str, auth_store: AuthStore) -> bool:
@@ -1342,20 +1370,40 @@ def cleanup_expired_job(settings: Settings, db: RelayDb, job_id: str) -> None:
     db.append_log(job_id, "expired by relay retention cleanup")
 
 
+def expire_receiving_upload(db: RelayDb, job: dict) -> str:
+    hours = getattr(db, "receiving_timeout_hours", 3)
+    if job["status"] != "receiving" or time.time() < float(job["created_at"]) + hours * 3600:
+        return ""
+    error = f"upload timed out: incomplete after {hours} hours from job creation; submit a new job"
+    if db.update_job_if_status(job["job_id"], {"receiving"}, status="failed", error=error,
+                               cleanup_due_at=time.time()):
+        return error
+    return ""
+
+
+def reject_expired_upload(db: RelayDb, job: dict) -> None:
+    error = expire_receiving_upload(db, job)
+    if error:
+        raise HTTPException(status_code=409, detail=error)
+
+
 async def cleanup_expired_jobs(app: FastAPI) -> None:
     settings = app.state.settings
     db = app.state.db
     cutoff = time.time() - settings.retention_hours * 60 * 60
     receiving_cutoff = time.time() - settings.receiving_retention_hours * 3600
-    stale = set(db.stale_receiving(receiving_cutoff))
+    stale = set(db.stale_receiving(receiving_cutoff, time.time() - settings.receiving_timeout_hours * 3600))
     for job_id in dict.fromkeys(db.completed_before(cutoff) + sorted(stale)):
         async with job_submission_lock(app, job_id):
-            if job_id in app.state.active_uploads or job_id in app.state.active_job_ids:
-                continue
             job = db.get_job(job_id)
             if not job or job.get("cleaned_at") is not None:
                 continue
-            if job_id in stale:
+            timed_out = expire_receiving_upload(db, job)
+            # Mark the deadline even during a body stream, but never remove files
+            # until the stream has released its handles.
+            if job_id in app.state.active_uploads or job_id in app.state.active_job_ids:
+                continue
+            if job_id in stale and not timed_out:
                 if job["status"] != "receiving" or job["upload_activity_at"] >= receiving_cutoff:
                     continue
                 if not db.update_job_if_status(job_id, {"receiving"}, status="failed", error="upload expired after inactivity",
@@ -1392,7 +1440,7 @@ async def cleanup_loop(app: FastAPI) -> None:
                 raise error
         except Exception as exc:
             LOGGER.error("retention cleanup failed: %s", redact_secrets(str(exc)))
-        await asyncio.sleep(60 * 60)
+        await asyncio.sleep(60)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -1434,6 +1482,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db = RelayDb(settings.db_path)
     app.state.db.max_logs_per_job = settings.max_logs_per_job
     app.state.db.receiving_retention_hours = settings.receiving_retention_hours
+    app.state.db.receiving_timeout_hours = settings.receiving_timeout_hours
     app.state.storage_budget = StorageBudget(settings, app.state.db)
     settings._storage_budget = app.state.storage_budget
     settings._quota_cache = QuotaCache()
@@ -1524,7 +1573,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {
                 "ok": True,
                 "principal_id": principal.id,
-                "allowed_kaggle_key_ids": public_allowed_key_ids(auth_store, principal),
+                "allowed_kaggle_key_ids": public_allowed_key_ids(auth_store, principal) if principal.can_view_keys else [],
+                "can_view_keys": principal.can_view_keys,
             }
         )
         set_ui_session_cookie(
@@ -1612,6 +1662,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
 
+    @app.patch("/v1/auth/relay-tokens/{token_id}")
+    def patch_relay_token_permissions(
+        token_id: str,
+        payload: UpdateRelayTokenPermissionsRequest,
+        request: Request,
+        settings: Settings = Depends(get_settings),
+        principal: RelayPrincipal = Depends(require_auth),
+    ) -> dict:
+        new_store = update_relay_token_permissions(settings, principal, token_id, payload)
+        request.app.state.auth_store = new_store
+        return auth_config_summary(new_store, principal)
+
     @app.get("/v1/kaggle/account")
     def kaggle_account(
         kaggle_key_id: str = "",
@@ -1619,6 +1681,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
+        if kaggle_key_id.strip():
+            require_key_view(principal)
         return kaggle_account_status(settings, auth_store, principal, kaggle_key_id)
 
     @app.post("/v1/kaggle/account/probe")
@@ -1628,6 +1692,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
+        require_key_view(principal)
         return kaggle_account_probe(settings, auth_store, principal, kaggle_key_id)
 
     @app.get("/v1/kaggle/accounts")
@@ -1636,6 +1701,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
+        require_key_view(principal)
         return {
             "accounts": [
                 kaggle_account_status(settings, auth_store, principal, key_id)
@@ -1757,6 +1823,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> ChunkResponse:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
+            reject_expired_upload(db, job)
             if job["status"] != "receiving":
                 raise HTTPException(status_code=409, detail="job is no longer receiving chunks")
             total_size = job[f"{archive_type}_size"]
@@ -1808,6 +1875,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with aiofiles.open(tmp_path, "wb") as handle:
                 async for part in upload_body(request, settings.upload_idle_seconds):
+                    if time.time() >= float(job["created_at"]) + settings.receiving_timeout_hours * 3600:
+                        async with job_submission_lock(request.app, job_id):
+                            reject_expired_upload(db, job)
+                        raise HTTPException(status_code=409, detail="job upload deadline exceeded")
                     if time.monotonic() - last_space_check >= 1:
                         try:
                             state.storage_budget.check_free(len(part))
@@ -1826,6 +1897,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail="chunk sha256 mismatch")
             async with job_submission_lock(request.app, job_id):
                 job = get_authorized_job(db, job_id, principal, auth_store)
+                reject_expired_upload(db, job)
                 if job["status"] != "receiving":
                     raise HTTPException(status_code=409, detail="job is no longer receiving chunks")
                 existing = db.get_chunk(job_id, archive_type, index)
@@ -1866,6 +1938,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> JobResponse:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
+            reject_expired_upload(db, job)
             if job["status"] != "receiving":
                 return job_response(db, job_id, settings.retention_hours)
 

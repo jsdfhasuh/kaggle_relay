@@ -869,6 +869,10 @@
                     <label for="newRelayAllowedKeys">允许访问的 Key</label>
                     <select id="newRelayAllowedKeys" multiple size="4"></select>
                   </div>
+                  <label class="check-row">
+                    <input id="newRelayCanViewKeys" type="checkbox" />
+                    允许查看授权 Key 和账号列表
+                  </label>
                   <button type="submit">保存用户</button>
                   <div id="relayTokenMessage" class="message" aria-live="polite"></div>
                 </form>
@@ -924,6 +928,7 @@
     let selectedJobId = "";
     let selectedJobPinned = false;
     let activePage = "runtime";
+    let keyViewAllowed = null;
     let editingKaggleKeyId = "";
     const downloadingJobs = new Set();
     const deletingJobs = new Set();
@@ -980,6 +985,7 @@
     }
 
     function normalizePage(page) {
+      if (keyViewAllowed === false && ["accounts", "users"].includes(page)) return "runtime";
       return ["runtime", "accounts", "users"].includes(page) ? page : "runtime";
     }
 
@@ -1158,6 +1164,7 @@
       const raw = String(job.error || "").trim();
       if (job.status !== "failed") return {title: raw, suggestion: "", recognized: false};
       const rules = [
+        [/upload timed out: incomplete after (\d+) hours|upload expired after inactivity/i, "上传接收超时", "未在接收期限内完成上传，请检查网络后重新提交任务。"],
         [/CUDA out of memory|torch\.cuda\.OutOfMemoryError|CUDA error: out of memory/i, "GPU 显存不足", "尝试减小 batch size 或输入尺寸。"],
         [/(?:GPU|accelerator)[^\n]*(?:quota|hours)[^\n]*(?:exhausted|exceeded|insufficient)|(?:exceeded|exhausted)[^\n]*(?:GPU|accelerator)[^\n]*quota/i,
           "GPU 配额不足", "等待额度恢复，或使用有额度的授权账号。"],
@@ -1251,6 +1258,20 @@
       return response;
     }
 
+    function applySessionPermissions(session) {
+      keyViewAllowed = !!session.can_view_keys;
+      document.querySelectorAll("[data-page-nav]").forEach((button) => {
+        button.hidden = !keyViewAllowed && ["accounts", "users"].includes(button.dataset.pageNav);
+      });
+      if (!keyViewAllowed) {
+        authConfigCache = null;
+        qs("authConfig").innerHTML = "未授予查看 Key 权限";
+        qs("accountsStatus").innerHTML = "未授予查看账号列表权限";
+        qs("adminTools").hidden = true;
+        if (["accounts", "users"].includes(activePage)) setActivePage("runtime");
+      }
+    }
+
     async function loadSession() {
       const session = await api("/v1/ui/session");
       if (!session.authenticated) {
@@ -1259,6 +1280,7 @@
       }
       qs("sessionInfo").textContent = `已登录：${session.principal_id}`;
       qs("principalMetric").textContent = session.principal_id || "-";
+      applySessionPermissions(session);
       return session;
     }
 
@@ -1430,6 +1452,8 @@
               ${token.current ? '<span class="pill ok">当前</span>' : ""}
               ${token.management ? '<span class="pill warn">管理密钥</span>' : ""}
               <br />允许：${escapeHtml(formatAllowed(token.allowed_kaggle_key_ids))}
+              <br />查看 Key：${token.can_view_keys ? "允许" : "未授予"}
+              ${data.can_manage_auth && !token.management ? `<button class="light" type="button" data-toggle-key-view="${escapeHtml(token.id)}" data-key-view="${token.can_view_keys ? "false" : "true"}">${token.can_view_keys ? "撤销查看 Key" : "授予查看 Key"}</button>` : ""}
             </div>
           `).join("") || '<div class="muted">无</div>'}
         </div>
@@ -1793,6 +1817,7 @@
         id: qs("newRelayTokenId").value.trim(),
         token: qs("newRelayToken").value.trim(),
         allow_all_kaggle_keys: allowAll,
+        can_view_keys: qs("newRelayCanViewKeys").checked,
         allowed_kaggle_key_ids: allowAll ? [] : allowedKeys
       };
       if (!payload.id || !payload.token) {
@@ -1854,6 +1879,18 @@
     }
 
     document.addEventListener("click", (event) => {
+      const keyViewButton = event.target.closest("[data-toggle-key-view]");
+      if (keyViewButton && !keyViewButton.disabled) {
+        keyViewButton.disabled = true;
+        api(`/v1/auth/relay-tokens/${encodeURIComponent(keyViewButton.dataset.toggleKeyView)}`, {
+          method: "PATCH", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({can_view_keys: keyViewButton.dataset.keyView === "true"})
+        }).then(renderAuthConfig).catch((error) => {
+          keyViewButton.disabled = false;
+          formMessage("relayTokenMessage", error.message || String(error), true);
+        });
+        return;
+      }
       const statusCard = event.target.closest("[data-status-filter]");
       if (statusCard) {
         qs("statusSelect").value = qs("statusSelect").value === statusCard.dataset.statusFilter ? "all" : statusCard.dataset.statusFilter;

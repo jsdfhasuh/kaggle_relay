@@ -123,12 +123,21 @@ Archive copies check free space between 1 MiB blocks; transfer subprocesses are
 stopped if free space falls below the reserve. These checks are not a filesystem
 quota and concurrent external writes can still exhaust the disk.
 
-Incomplete uploads have their own inactivity lease
+Incomplete uploads must finish within `RELAY_RECEIVING_TIMEOUT_HOURS=3` hours
+of job creation, including paused time. Retries and new chunks do not extend
+this absolute deadline. Overdue receiving jobs become failed with an upload
+timeout error; new chunks and completion requests reject expired uploads.
+Background expiry checks run every minute, including for existing jobs.
+In-flight streams fail at the next body block or idle timeout; cleanup waits
+until their file handles are released. Queued/running jobs are unaffected.
+
+Incomplete uploads also have their own inactivity lease
 (`RELAY_RECEIVING_RETENTION_HOURS=168`). Accepted or retried chunks renew it;
 active body streams are excluded from expiry, with a 60-second idle-body timeout.
 Ordinary status polling does not renew the lease. Existing jobs receive a full
 lease during the schema upgrade. `upload_expires_at` and `queue_reason` are
-additive response fields. Manual pause/resume remains available within the lease.
+additive response fields. `upload_expires_at` reports the earlier deadline.
+Manual pause/resume remains available within both limits.
 Expired uploads become failed and their partial files are removed. Terminal
 results retain the independent `RELAY_RETENTION_HOURS` policy.
 
@@ -341,6 +350,22 @@ dynamic scheduling pool while retaining access only to their own jobs. New keys
 need an explicit grant; submitted jobs keep their original eligible-account
 snapshot. Do not use `"*"` for this setup: wildcard tokens can access other users'
 jobs. Kaggle credentials stay on the server.
+
+Key visibility is a separate permission: ordinary tokens default to
+`"can_view_keys": false`, including existing tokens without this field. Their
+login/session/config summaries omit key lists, and account-list, explicit-key
+account queries and account probes return 403. The UI hides the Key/user
+management and account-list navigation. Management principals retain visibility;
+wildcard execution rights alone do not grant it when a dedicated admin exists.
+Admins can grant visibility when creating a user or toggle it for an existing
+user in the management page (`PATCH /v1/auth/relay-tokens/{id}` with
+`{"can_view_keys": true}` or `false`). Existing sessions observe changes
+immediately. Viewing only reveals authorized key metadata, never credential
+secrets, and grants no management rights.
+
+This permission restricts browsing the key/account lists. The implicit
+`GET /v1/kaggle/account` desktop preflight and per-job assignment fields remain
+available for client identity checks and dynamic scheduling compatibility.
 
 `GET /v1/kaggle/account` discovers an authorized account and reports its actual
 authentication/quota status. With multiple keys it prefers a configured username

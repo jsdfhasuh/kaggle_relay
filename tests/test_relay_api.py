@@ -69,8 +69,8 @@ def multi_key_auth_config() -> dict:
     return {
         "relay_tokens": [
             {"id": "admin", "token": "admin-token", "allowed_kaggle_key_ids": "*"},
-            {"id": "user-a", "token": "user-a-token", "allowed_kaggle_key_ids": ["ka"]},
-            {"id": "user-b", "token": "user-b-token", "allowed_kaggle_key_ids": ["kb"]},
+            {"id": "user-a", "token": "user-a-token", "allowed_kaggle_key_ids": ["ka"], "can_view_keys": True},
+            {"id": "user-b", "token": "user-b-token", "allowed_kaggle_key_ids": ["kb"], "can_view_keys": True},
         ],
         "kaggle_keys": [
             {"id": "ka", "username": "alice", "key": "alice-key"},

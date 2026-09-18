@@ -591,10 +591,11 @@ class RelayDb:
                                (excluding_job_id,)).fetchone()
         return int(row[0])
 
-    def stale_receiving(self, cutoff: float) -> list[str]:
+    def stale_receiving(self, cutoff: float, created_cutoff: float = 0) -> list[str]:
         with self.connect() as conn:
-            rows = conn.execute("SELECT job_id FROM jobs WHERE status='receiving' AND upload_activity_at<?",
-                                (cutoff,)).fetchall()
+            rows = conn.execute("SELECT job_id FROM jobs WHERE status='receiving' "
+                                "AND (upload_activity_at<? OR created_at<=?)",
+                                (cutoff, created_cutoff)).fetchall()
         return [row[0] for row in rows]
 
     def get_chunk(

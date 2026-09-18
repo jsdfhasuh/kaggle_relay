@@ -57,8 +57,8 @@ def multi_key_auth_config() -> dict:
     return {
         "relay_tokens": [
             {"id": "admin", "token": "admin-token", "allowed_kaggle_key_ids": "*"},
-            {"id": "user-a", "token": "user-a-token", "allowed_kaggle_key_ids": ["ka"]},
-            {"id": "user-b", "token": "user-b-token", "allowed_kaggle_key_ids": ["kb"]},
+            {"id": "user-a", "token": "user-a-token", "allowed_kaggle_key_ids": ["ka"], "can_view_keys": True},
+            {"id": "user-b", "token": "user-b-token", "allowed_kaggle_key_ids": ["kb"], "can_view_keys": True},
         ],
         "kaggle_keys": [
             {"id": "ka", "username": "alice", "key": "alice-key"},
@@ -393,6 +393,8 @@ def test_multi_user_key_permissions_work_with_ui_cookie(tmp_path):
         "authenticated": True,
         "principal_id": "user-a",
         "allowed_kaggle_key_ids": ["ka"],
+        "can_view_keys": True,
+        "can_manage_auth": False,
     }
     assert created.status_code == 200
     assert created.json()["kaggle_key_id"] == "ka"
@@ -453,7 +455,8 @@ def test_admin_can_add_kaggle_key_and_relay_token(tmp_path):
     assert new_user_health.status_code == 200
     assert new_user_config.status_code == 200
     assert new_user_config.json()["principal_id"] == "user-c"
-    assert [key["id"] for key in new_user_config.json()["kaggle_keys"]] == ["kc"]
+    assert new_user_config.json()["kaggle_keys"] == []
+    assert new_user_config.json()["can_view_keys"] is False
     assert "user-c-token-secret" not in new_user_config.text
     assert "carol-key" not in new_user_config.text
 

@@ -174,3 +174,9 @@ class CreateRelayTokenRequest(BaseModel):
     token: str = Field(min_length=16)
     allowed_kaggle_key_ids: list[str] = Field(default_factory=list)
     allow_all_kaggle_keys: bool = False
+    can_view_keys: bool = False
+
+
+class UpdateRelayTokenPermissionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    can_view_keys: bool

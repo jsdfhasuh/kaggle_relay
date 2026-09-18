@@ -77,6 +77,7 @@ class Settings:
     command_timeout_seconds: int = 300
     transfer_timeout_seconds: int = 7200
     receiving_retention_hours: int = 168
+    receiving_timeout_hours: int = 3
     max_logs_per_job: int = 2000
     max_active_jobs: int = 40
     max_active_jobs_per_user: int = 4
@@ -102,6 +103,7 @@ class Settings:
             "command_timeout_seconds",
             "transfer_timeout_seconds",
             "receiving_retention_hours",
+            "receiving_timeout_hours",
             "max_logs_per_job",
             "max_active_jobs",
             "max_active_jobs_per_user",
@@ -163,6 +165,7 @@ class Settings:
             command_timeout_seconds=_read_positive_int("RELAY_COMMAND_TIMEOUT_SECONDS", 300),
             transfer_timeout_seconds=_read_positive_int("RELAY_TRANSFER_TIMEOUT_SECONDS", 7200),
             receiving_retention_hours=_read_positive_int("RELAY_RECEIVING_RETENTION_HOURS", 168),
+            receiving_timeout_hours=_read_positive_int("RELAY_RECEIVING_TIMEOUT_HOURS", 3),
             max_logs_per_job=_read_positive_int("RELAY_MAX_LOGS_PER_JOB", 2000),
             max_active_jobs=_read_positive_int("RELAY_MAX_ACTIVE_JOBS", 40),
             max_active_jobs_per_user=_read_positive_int("RELAY_MAX_ACTIVE_JOBS_PER_USER", 4),

@@ -50,6 +50,11 @@ class RelayPrincipal:
     allowed_kaggle_key_ids: frozenset[str] | None
     legacy: bool = False
     management_admin: bool = False
+    view_keys: bool = False
+
+    @property
+    def can_view_keys(self) -> bool:
+        return self.management_admin or self.view_keys
 
     @property
     def allow_all_keys(self) -> bool:
@@ -70,6 +75,7 @@ class AuthStore:
         kaggle_keys: dict[str, KaggleCredentials],
         legacy: bool = False,
         admin_token: str = "",
+        key_viewer_ids: frozenset[str] = frozenset(),
     ):
         self.legacy = legacy
         self._kaggle_keys = dict(kaggle_keys)
@@ -89,6 +95,7 @@ class AuthStore:
                     allowed,
                     legacy=legacy,
                     management_admin=configured_tokens_are_admins and allowed is None,
+                    view_keys=token_id in key_viewer_ids,
                 ),
             )
             for token_id, token, allowed in relay_tokens
@@ -145,10 +152,14 @@ class AuthStore:
 
         kaggle_keys = cls._parse_kaggle_keys(data.get("kaggle_keys"))
         relay_tokens = cls._parse_relay_tokens(data.get("relay_tokens"), set(kaggle_keys))
+        for item in data["relay_tokens"]:
+            if type(item.get("can_view_keys", False)) is not bool:
+                raise AuthConfigError("can_view_keys must be a boolean")
         return cls(
             relay_tokens=relay_tokens,
             kaggle_keys=kaggle_keys,
             admin_token=admin_token,
+            key_viewer_ids=frozenset(str(item["id"]).strip() for item in data["relay_tokens"] if item.get("can_view_keys", False)),
         )
 
     @staticmethod
