@@ -2077,6 +2077,75 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
     assert kernel_metadata["dataset_sources"] == ["demo/data/7"]
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_worker_restricts_gpu_before_push_preserving_upload(tmp_path, monkeypatch, cached):
+    from app.gpu_policy import POLICY_MESSAGE
+
+    dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
+    kernel_zip = build_zip({
+        "kernel-metadata.json": json.dumps({
+            "code_file": "train.py", "enable_gpu": True,
+            "dataset_sources": ["demo/data"], "is_private": True,
+        }).encode(),
+        "train.py": (
+            b'DEVICE = "auto"\nCALLBACK_TOKEN = "test-callback"\n'
+            b'def main(model):\n    return model.train(data="data.yaml", device="0,1")\n'
+        ),
+    })
+    settings = make_settings(tmp_path)
+    monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    app = create_app(settings)
+    calls = {"upload": 0, "push": 0}
+
+    class FakeAdapter:
+        def __init__(self, _settings, _log, credentials=None):
+            pass
+
+        def upload_dataset(self, *_args, **_kwargs):
+            calls["upload"] += 1
+            return DatasetUploadReceipt(expected_version_number=7)
+
+        def wait_dataset(self, *_args, **kwargs):
+            assert kwargs["upload_receipt"].expected_version_number == 7
+            return ready_dataset_status(7)
+
+        def push_kernel(self, kernel_dir):
+            namespace = {}
+            exec(compile((kernel_dir / "train.py").read_text(), "train.py", "exec"), namespace)
+            assert namespace["DEVICE"] == "auto"
+            assert namespace["CALLBACK_TOKEN"] == "test-callback"
+            assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1"
+            assert "_relay_yolo_train" in namespace["main"].__code__.co_names
+            metadata = json.loads((kernel_dir / "kernel-metadata.json").read_text())
+            assert metadata["dataset_sources"] == ["demo/data/7"]
+            assert metadata["id"] == "demo/kernel"
+            assert metadata["is_private"] is True
+            calls["push"] += 1
+            return "pushed"
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+    # Keep this test scoped to submission; output collection has separate tests.
+    monkeypatch.setattr("app.worker.finish_kernel_job", lambda *_args: None)
+    with TestClient(app) as client:
+        if cached:
+            app.state.db.upsert_dataset_cache(
+                dataset_ref="demo/data", payload_hash="gpu-policy",
+                status="ready", dataset_status=ready_dataset_status(7), source_job_id="previous",
+            )
+        job_id = create_job(client, dataset_zip, kernel_zip, payload_hash="gpu-policy")
+        if not cached:
+            upload_all(client, job_id, "dataset", dataset_zip)
+        upload_all(client, job_id, "kernel", kernel_zip)
+        assert client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers()).status_code == 200
+        process_job(settings, app.state.db, job_id)
+        status = client.get(f"/v1/jobs/{job_id}", headers=auth_headers()).json()
+        assert POLICY_MESSAGE in status["recent_logs"]
+        assert status["kernel_archive_sha256"] == hashlib.sha256(kernel_zip).hexdigest()
+        assert (tmp_path / "jobs" / job_id / "archives" / "kernel.zip").read_bytes() == kernel_zip
+    assert calls == {"upload": int(not cached), "push": 1}
+
+
 def test_worker_passes_upload_receipt_to_dataset_wait(tmp_path, monkeypatch):
     dataset_zip = build_zip({"dataset-metadata.json": b"{}"})
     kernel_zip = build_zip(

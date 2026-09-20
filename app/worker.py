@@ -8,6 +8,7 @@ from app.archive import ArchiveError, require_file
 from app.database import RelayDb
 from app.dinov2_artifacts import ARTIFACT_CONTRACT as DINO_CONTRACT, IDENTITY_FIELDS
 from app.auth_config import AuthStore
+from app.gpu_policy import apply_yolo_gpu_policy
 from app.kaggle_adapter import (
     DatasetUploadReceipt,
     KaggleAdapter,
@@ -613,6 +614,11 @@ def process_job(
                         kaggle_key_id=kaggle_key_id,
                     )
 
+            policy_message = apply_yolo_gpu_policy(
+                kernel_dir, str(job.get("artifact_contract") or "yolo"),
+            )
+            if policy_message:
+                log(policy_message)
             transition_before_submission(
                 {"queued", "waiting_dataset"},
                 "pushing_kernel",
