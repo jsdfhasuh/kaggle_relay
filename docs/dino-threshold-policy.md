@@ -31,6 +31,34 @@ entrypoint layouts are rejected rather than implicitly patched. The policy diges
 is logged before submission, and the exact threshold reduction is written to
 worker stderr and the bound calibration receipt.
 
+## Opaque RGBA compatibility
+
+The gateway also installs the `dino_opaque_rgba_rgb_v1` image reader in the
+supported isolated worker. Before training, it verifies and decodes every frozen
+sample. Only uint8 four-channel images whose alpha values are all 255 are read
+as RGB, with the base decoder's IMREAD_COLOR orientation. RGB and grayscale8
+retain the original decoder. Partial transparency, higher bit depths, corrupt
+images and hash mismatches fail with the sample filename. Original image bytes,
+archives and frozen identities are never rewritten.
+
+The same reader serves training, calibration, test scoring and native verification
+reference inputs. The independent target probe retains its original PIL RGB
+conversion and integrity checks. Multiprocess loading requires the supported
+Linux fork mode; another start method fails explicitly instead of losing the
+overlay in child processes. Normal-only calibration also carries the image
+receipt without changing its threshold calculation.
+
+`calibration.gateway_image_policy` records the image policy source digest, base
+runtime, converted sample count and SHA-256 of the sorted `(sample_id, original
+image SHA-256)` pairs serialized as compact ASCII JSON. The receipt propagates
+into the native PT source-threshold receipt. Exact previous gateway overlays are
+authenticated and replaced on a submission retry; current rewriting is idempotent.
+Unknown base runtimes keep their original behavior. Already submitted kernels
+are not changed or retried.
+
+Image test dependencies are in `requirements-test.txt`; the gateway production
+container does not need OpenCV, NumPy or Pillow. Image decoding runs on Kaggle.
+
 Dynamic account callbacks continue authenticating with their original kernel
 alias. Progress responses expose the actual bound kernel/dataset references, so
 older desktop clients cannot overwrite the assigned reference with that alias.

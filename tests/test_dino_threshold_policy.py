@@ -106,14 +106,19 @@ def test_injected_worker_applies_policy_without_disabling_integrity_or_acceptanc
     package.mkdir()
     (package / "__init__.py").write_text("")
     (package / "worker.py").write_text(f'def verify_runtime():\n    return {_RELAY_DINO_RUNTIME!r}\n')
+    (package / "data.py").write_text('def decode_rgb(*args):\n    return None\n')
     (package / "calibration.py").write_text('''from types import SimpleNamespace
-contract = SimpleNamespace(calibration_details=lambda *args: ({"method": "f1_validation"}, 0.6087480783462524))
+contract = SimpleNamespace(calibration_details=lambda *args: ({"method": "f1_validation"}, 0.6087480783462524),
+                           make_threshold_document=lambda threshold, calibration: calibration)
 def score_contract():
     return contract
 ''')
     (package / "remote_training.py").write_text('''import json
 from .calibration import score_contract
+def validate_payload(*args, **kwargs):
+    return {"request": {"training": {"workers": 0}}, "samples": []}
 def main():
+    validate_payload()
     calibration, threshold = score_contract().calibration_details([0.23], [0.6087480783462524])
     print(json.dumps({"threshold": threshold, "calibration": calibration}))
     return 0
@@ -134,6 +139,29 @@ def test_other_backends_are_unchanged(tmp_path, contract):
     entry = kernel(tmp_path, "print('original')\n")
     assert apply_dino_threshold_policy(tmp_path, contract) is None
     assert entry.read_text() == "print('original')\n"
+
+
+def test_previous_deployed_overlay_upgrades_once(tmp_path):
+    from app.dino_threshold_policy import _LEGACY_POLICY_SHA256
+    guard = (Path(__file__).parent / "fixtures/dino_threshold_guard_v1.txt").read_text(encoding="utf-8")
+    assert hashlib.sha256(guard.encode()).hexdigest() == _LEGACY_POLICY_SHA256
+    header = f"_RELAY_DINO_POLICY_SHA256 = {_LEGACY_POLICY_SHA256!r}\n"
+    worker = header + guard + "\nraise SystemExit(_relay_dino_worker_main())\n"
+    source = (header + f"_RELAY_DINO_WORKER_SOURCE = {worker!r}\n" + guard
+              + '\nfrom patchcore_dino_runtime.kaggle_bootstrap import run\nrun = _relay_dino_wrap_run(run)\n')
+    entry = kernel(tmp_path, source)
+    apply_dino_threshold_policy(tmp_path, "patchcore_dinov2_v3")
+    first = entry.read_bytes()
+    apply_dino_threshold_policy(tmp_path, "patchcore_dinov2_v3")
+    assert entry.read_bytes() == first
+    namespace = {}
+    # Inspect only the overlay; the real bootstrap import runs on Kaggle.
+    import ast
+    tree = ast.parse(first)
+    functions = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert functions.count("_relay_dino_worker_main") == 1
+    assert functions.count("_relay_dino_image_scope") == 1
+    assert _LEGACY_POLICY_SHA256 not in first.decode()
 
 
 @pytest.mark.parametrize("source", ["def broken(", "print('unsupported')"])

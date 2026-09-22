@@ -62,8 +62,7 @@ def _relay_dino_worker_main():
         _relay_dino_lower_threshold, original, policy_sha256=_RELAY_DINO_POLICY_SHA256,
     )
     try:
-        with _relay_dino_image_scope(contract):
-            return main()
+        return main()
     finally:
         contract.calibration_details = original
 
