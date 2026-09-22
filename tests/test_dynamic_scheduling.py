@@ -132,6 +132,10 @@ def test_upload_then_dispatch_to_idle_account_preserves_frozen_identity(tmp_path
     result = client.post("/v1/jobs/by-kernel/progress", headers=auth_headers(token="test-callback"), json=callback)
     assert result.status_code == 200 and result.json()["job_id"] == job["job_id"]
     assert result.json()["kernel_ref"] == "user1/kernel"
+    current = client.get(f"/v1/jobs/{job['job_id']}", headers=auth_headers(token="fake-relay-token-0")).json()
+    assert json.loads(current["kernel_status"])["kernel_ref"] == "user1/kernel"
+    # Authentication continues to use the original alias on subsequent callbacks.
+    assert client.post("/v1/jobs/by-kernel/progress", headers=auth_headers(token="test-callback"), json=callback).status_code == 200
     assert client.post(f"/v1/jobs/{job['job_id']}/cancel", headers=auth_headers(token="fake-relay-token-0")).status_code == 200
     result = client.post("/v1/jobs/by-kernel/progress", headers=auth_headers(token="test-callback"), json=callback)
     assert result.status_code == 200 and result.json()["cancel_requested"]

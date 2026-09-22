@@ -871,6 +871,11 @@ def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest)
     ):
         raise HTTPException(status_code=409, detail="job has not been submitted to Kaggle")
     data = payload.model_dump()
+    # Callback authentication may use the original pre-assignment alias. The
+    # progress returned to clients must carry the bound provider references.
+    for field in ("kernel_ref", "dataset_ref"):
+        if field in data:
+            data[field] = job[field]
     clean_message = redact_secrets(callback_log_message(data))[-8000:]
     if clean_message:
         db.append_log(job["job_id"], clean_message)
