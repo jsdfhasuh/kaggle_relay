@@ -1,5 +1,8 @@
 # A3 transport / identity repair（2026-09-25）
 
+后续仅 SDK 签名兼容修复见 [2529a12 签名修复证据](sdk-signature-2529a12.md)。
+以下记录保留为前一提交的验证结果。
+
 基点 `4d7723373d5d49482a054e480f8f0db986374581`，独立分支
 `codex/a3-transport-identity-fix`。应用配套分支 `feat/kaggle-job-build-foundation`，
 基点 `ef2cfa17250525a3439a4921b67051e6bad11260`。**只交付代码供审查，未部署。**

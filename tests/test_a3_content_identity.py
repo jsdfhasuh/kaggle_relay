@@ -64,6 +64,7 @@ class Api:
         self.exists_error = None
         self.status_calls = 0
         self.basic_checks = 0
+        self.basic_error = None
 
     def authenticate(self):
         pass
@@ -71,8 +72,11 @@ class Api:
     def _introspect_token(self, token):
         return self.config_values["username"]
 
-    def dataset_list(self, **kwargs):
+    def dataset_list(self, mine=False, page=1):
+        assert mine is True and page == 1
         self.basic_checks += 1
+        if self.basic_error is not None:
+            raise self.basic_error
         return []
 
     def dataset_status(self, ref, format=None):
@@ -125,6 +129,54 @@ def test_identity_reports_authentication_source_and_rejects_wrong_owner(tmp_path
     assert not api.uploads
     assert not list((tmp_path / "storage").rglob("*.json"))
     assert api.basic_checks == (2 if method == "legacy_api_key" else 0)
+
+
+def test_legacy_key_validates_authenticated_request_before_upload(tmp_path, monkeypatch):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    api.config_values["auth_method"] = "legacy_api_key"
+    adapter.credentials = KaggleCredentials("test", username="owner", key="fake-key")
+    assert adapter.require_identity("owner")["identity_source"] == "validated_basic_principal"
+    assert api.basic_checks == 1 and api.uploads == 0
+    receipt = adapter.upload_dataset(dataset, "owner/data", "test")
+    assert api.basic_checks == 2 and api.uploads == 1
+    assert receipt.expected_version_number == 7
+
+
+@pytest.mark.parametrize("failure", ["invalid_key_401", "forbidden_403", "wrong_owner"])
+def test_legacy_key_failures_block_worker_without_remote_mutation(tmp_path, monkeypatch, failure):
+    from requests.exceptions import HTTPError
+    from app.main import create_app
+    from app.worker import process_job, job_paths
+    from test_relay_api import seed_job
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    api.config_values["auth_method"] = "legacy_api_key"
+    adapter.credentials = KaggleCredentials("test", username="owner", key="fake-key")
+    if failure != "wrong_owner":
+        status = 401 if failure == "invalid_key_401" else 403
+        api.basic_error = HTTPError(str(status), response=SimpleNamespace(status_code=status))
+    else:
+        api.config_values["username"] = "different-owner"
+    app = create_app(adapter.settings)
+    job_id = seed_job(app, "queued", dataset_ref="owner/data", kernel_ref="owner/kernel")
+    paths = job_paths(adapter.settings, job_id)
+    paths["dataset_dir"].mkdir(parents=True)
+    paths["kernel_dir"].mkdir(parents=True)
+    payload = paths["dataset_dir"] / "file.txt"
+    script = paths["kernel_dir"] / "train.py"
+    payload.write_bytes(b"original dataset")
+    script.write_bytes(b"original frozen script")
+    pushes = []
+    adapter.push_kernel = lambda folder: pushes.append(folder)
+    monkeypatch.setattr("app.worker.KaggleAdapter", lambda *args, **kwargs: adapter)
+    process_job(adapter.settings, app.state.db, job_id)
+    job = app.state.db.get_job(job_id)
+    assert job["status"] == "failed"
+    assert ("identity rejected" if failure == "wrong_owner" else str(status)) in job["error"]
+    assert api.basic_checks == 1  # A real request boundary, not authenticate() alone.
+    assert api.uploads == api.status_calls == 0 and not pushes and not api.remote
+    assert read_intent(intent_path(adapter.settings.storage_dir, paths["dataset_dir"], "owner/data")) is None
+    assert job["dataset_ref"] == "owner/data" and job["kernel_ref"] == "owner/kernel"
+    assert payload.read_bytes() == b"original dataset" and script.read_bytes() == b"original frozen script"
 
 
 @pytest.mark.parametrize("response", [{"status": "ok", "error": "denied"},

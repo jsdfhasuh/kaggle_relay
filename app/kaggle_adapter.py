@@ -505,7 +505,7 @@ class KaggleAdapter:
         # Basic auth's username is a credential input, not a token introspection
         # result. Prove that exact principal/key pair against an authenticated API.
         if method == "legacy_api_key":
-            api.dataset_list(mine=True, page_size=1)
+            api.dataset_list(mine=True, page=1)
         error = ""
         if source == "unverified":
             error = "unsupported_auth_method"
