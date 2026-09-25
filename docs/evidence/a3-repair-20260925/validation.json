@@ -1,0 +1,183 @@
+{
+  "application_base": "ef2cfa17250525a3439a4921b67051e6bad11260",
+  "relay_base": "4d7723373d5d49482a054e480f8f0db986374581",
+  "runs": {
+    "app-baseline": {
+      "exit_code": 1,
+      "passed": 231,
+      "failed": 2,
+      "skipped": 3,
+      "failures": [
+        "tests.test_kaggle_func.KaggleFuncTests::test_dataset_upload_dir_contains_single_payload_zip",
+        "tests.test_kaggle_func.KaggleFuncTests::test_remote_run_cleans_old_output_and_allows_pt_only_result"
+      ],
+      "skips": [
+        {
+          "test": "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_rejects_provider_owner_symlink_outside_input",
+          "reason": "directory symlinks unavailable: [WinError 1314] 客户端没有所需的特权。: 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpsn4pdth2\\\\outside\\\\dataset-owner' -> 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpsn4pdth2\\\\input\\\\datasets\\\\dataset-owner'"
+        },
+        {
+          "test": "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_rejects_symlinked_dataset_root",
+          "reason": "directory symlinks unavailable: [WinError 1314] 客户端没有所需的特权。: 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmphn4h3y48\\\\real-dataset' -> 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmphn4h3y48\\\\mounted-dataset'"
+        },
+        {
+          "test": "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_resolves_contained_provider_owner_symlink",
+          "reason": "directory symlinks unavailable: [WinError 1314] 客户端没有所需的特权。: 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmplthko5dl\\\\input\\\\.provider\\\\dataset-owner' -> 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmplthko5dl\\\\input\\\\datasets\\\\dataset-owner'"
+        }
+      ],
+      "junit_sha256": "26836c64429ce72d4a7b650479de351c69bb8952fa89ba7c2cc20e827dd0703b"
+    },
+    "app-final": {
+      "exit_code": 1,
+      "passed": 282,
+      "failed": 2,
+      "skipped": 3,
+      "failures": [
+        "tests.test_kaggle_func.KaggleFuncTests::test_dataset_upload_dir_contains_single_payload_zip",
+        "tests.test_kaggle_func.KaggleFuncTests::test_remote_run_cleans_old_output_and_allows_pt_only_result"
+      ],
+      "skips": [
+        {
+          "test": "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_rejects_provider_owner_symlink_outside_input",
+          "reason": "directory symlinks unavailable: [WinError 1314] 客户端没有所需的特权。: 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpjof9mmna\\\\outside\\\\dataset-owner' -> 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpjof9mmna\\\\input\\\\datasets\\\\dataset-owner'"
+        },
+        {
+          "test": "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_rejects_symlinked_dataset_root",
+          "reason": "directory symlinks unavailable: [WinError 1314] 客户端没有所需的特权。: 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpxncz3yrx\\\\real-dataset' -> 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpxncz3yrx\\\\mounted-dataset'"
+        },
+        {
+          "test": "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_resolves_contained_provider_owner_symlink",
+          "reason": "directory symlinks unavailable: [WinError 1314] 客户端没有所需的特权。: 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpihpbmxk9\\\\input\\\\.provider\\\\dataset-owner' -> 'C:\\\\Users\\\\JSDFHA~1\\\\AppData\\\\Local\\\\Temp\\\\tmpihpbmxk9\\\\input\\\\datasets\\\\dataset-owner'"
+        }
+      ],
+      "junit_sha256": "5188b46fd8a34b5f2448e98bf6fc16188bd8ac21dee5a83ce3c1374ccd9db982"
+    },
+    "app-final-target": {
+      "exit_code": 0,
+      "passed": 53,
+      "failed": 0,
+      "skipped": 0,
+      "failures": [],
+      "skips": [],
+      "junit_sha256": "035fe2b28cc08291a4ce0b621c58167ed31f80d8825d8d27e767f25052d8d0c0"
+    },
+    "app-hooks": {
+      "exit_code": 0,
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0,
+      "failures": [],
+      "skips": [],
+      "junit_sha256": "a1e45ab98e6bf1c63145d519ebbd94472a29c16fc7c3789cb8bba43de9a68840"
+    },
+    "app-legacy": {
+      "exit_code": 0,
+      "passed": 153,
+      "failed": 0,
+      "skipped": 0,
+      "failures": [],
+      "skips": [],
+      "junit_sha256": "73db4c4d879df52cbbf3dfef610bb8a3ffb3a202361468ff367e89ca1fd88465"
+    },
+    "app-updater-final": {
+      "exit_code": 0,
+      "passed": 108,
+      "failed": 0,
+      "skipped": 0,
+      "failures": [],
+      "skips": [],
+      "junit_sha256": "c24b107940aa27459d7cf5d6666252f390fe7cb571abeff1e04f9f1af4619473"
+    },
+    "relay-baseline": {
+      "exit_code": 0,
+      "passed": 295,
+      "failed": 0,
+      "skipped": 2,
+      "failures": [],
+      "skips": [
+        {
+          "test": "tests.test_concurrency::test_timeout_kills_descendants_after_group_leader_exits",
+          "reason": "POSIX process groups"
+        },
+        {
+          "test": "tests.test_dino_image_policy::test_fork_workers_inherit_decoder",
+          "reason": "Kaggle Linux fork test"
+        }
+      ],
+      "junit_sha256": "0370775ac1a4691f249cb2856d9fb67070cbc260ba4c51e6bed4b36fed060aa3"
+    },
+    "relay-final4": {
+      "exit_code": 0,
+      "passed": 329,
+      "failed": 0,
+      "skipped": 2,
+      "failures": [],
+      "skips": [
+        {
+          "test": "tests.test_concurrency::test_timeout_kills_descendants_after_group_leader_exits",
+          "reason": "POSIX process groups"
+        },
+        {
+          "test": "tests.test_dino_image_policy::test_fork_workers_inherit_decoder",
+          "reason": "Kaggle Linux fork test"
+        }
+      ],
+      "junit_sha256": "34de58c86e183a698498785a9a6ea191a4e7b04262d30138ad136dd1e216ce6a"
+    },
+    "relay-final-target": {
+      "exit_code": 0,
+      "passed": 37,
+      "failed": 0,
+      "skipped": 0,
+      "failures": [],
+      "skips": [],
+      "junit_sha256": "66fb4ce4f1dd5907e828be87123dac4cb18bc4b12f541fe6e5f744e82cc2f639"
+    }
+  },
+  "application_classification": {
+    "PASS": 547,
+    "BASELINE_FAILURE": [
+      "tests.test_kaggle_func.KaggleFuncTests::test_dataset_upload_dir_contains_single_payload_zip",
+      "tests.test_kaggle_func.KaggleFuncTests::test_remote_run_cleans_old_output_and_allows_pt_only_result"
+    ],
+    "REGRESSION": [],
+    "SKIPPED": [
+      "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_rejects_provider_owner_symlink_outside_input",
+      "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_rejects_symlinked_dataset_root",
+      "tests.test_kaggle_func.KaggleFuncTests::test_patchcore_runtime_resolves_contained_provider_owner_symlink"
+    ],
+    "baseline_cases_not_rerun": []
+  },
+  "relay_classification": {
+    "PASS": 332,
+    "BASELINE_FAILURE": [],
+    "REGRESSION": [],
+    "SKIPPED": [
+      "tests.test_concurrency::test_timeout_kills_descendants_after_group_leader_exits",
+      "tests.test_dino_image_policy::test_fork_workers_inherit_decoder"
+    ],
+    "baseline_cases_not_rerun": []
+  },
+  "original_layout_replay": {
+    "kind": "offline replay from original payload and recorded remote names/sizes; not remote byte download or cloud training",
+    "payload_sha256": "3d1387d6ff8c099318f9a3ec0bf91724743c29e92fcbeafa10c5170d6084d2de",
+    "original_count": 336,
+    "expanded_count": 338,
+    "matches_recorded_remote_inventory": true,
+    "app_byte_verifier": "PASS",
+    "relay_byte_verifier": "PASS",
+    "bootstrap_frozen_runtime_sha": "PASS",
+    "original_payload_unchanged": true
+  },
+  "NOT_RUN": [
+    "post-fix live Kaggle jobs/training/calibration/workers=0,2",
+    "live same-run output recovery/reopen",
+    "frozen product acceptance",
+    "production deployment/configuration changes"
+  ],
+  "interrupted_attempts": [
+    "Combined hook/updater process stopped before results; rerun separately with QT_QPA_PLATFORM=offscreen",
+    "60-second diagnostic watchdog stopped updater run; full unbounded rerun passed"
+  ],
+  "raw_evidence_location": "D:\\kaggle-a3-repair-evidence"
+}

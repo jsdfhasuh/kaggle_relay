@@ -118,6 +118,7 @@ def test_shared_account_pool_balances_atomic_reservations_and_reuses_quota(tmp_p
         calls.append(adapter.credentials.id)
         return {"available": True, "accelerators": [{"resource": "GPU", "remaining_hours": 30}]}
     monkeypatch.setattr(main.KaggleAdapter, "quota", quota)
+    monkeypatch.setattr(main.KaggleAdapter, "require_identity", lambda self, owner: {"identity_verified": True})
     with TestClient(app) as client, ThreadPoolExecutor(10) as executor:
         def submit(i):
             return client.post("/v1/jobs", headers=auth_headers(token=f"fake-relay-token-{i}"),
@@ -167,6 +168,11 @@ from types import SimpleNamespace
 class KaggleApi:
     def authenticate(self):
         self.owner = os.environ['KAGGLE_USERNAME']
+        self.config_values = {'username': self.owner, 'auth_method': 'legacy_api_key'}
+    def dataset_list(self, **kwargs):
+        return []
+    def dataset_download_files(self, *args, **kwargs):
+        raise AssertionError('upload-only test must not download')
     def dataset_status(self, ref, format=None):
         return '{"status":"ready","current_version_number":3}' if format else 'ready'
     def dataset_create_version(self, *args, **kwargs):
@@ -179,6 +185,7 @@ class KaggleApi:
             time.sleep(.01)
         assert os.environ['KAGGLE_USERNAME'] == self.owner
         print('credential=' + os.environ['KAGGLE_KEY'])
+        return SimpleNamespace(status='ok',error='')
     def quota_view(self):
         return SimpleNamespace(gpu_quota=None,tpu_quota=None,quota_refresh_time=None)
 ''', encoding="utf-8")

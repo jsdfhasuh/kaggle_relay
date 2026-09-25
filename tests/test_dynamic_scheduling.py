@@ -16,6 +16,15 @@ from app.scheduler import schedule_pending_jobs, scheduler_loop
 from app.worker import validate_payloads
 
 
+@pytest.fixture(autouse=True)
+def verified_fixture_identity(monkeypatch):
+    # Scheduler tests use synthetic credentials; identity rejection has dedicated
+    # A3 tests which do not use this fixture.
+    monkeypatch.setattr("app.kaggle_adapter.KaggleAdapter.identity", lambda self, configured_owner="": {
+        "identity_verified": True, "auth_method": "legacy_api_key", "identity_source": "validated_basic_principal",
+        "identity_error": ""})
+
+
 def pending_job(app, job_id, *, owner="user0"):
     seed_job(app, "queued", job_id=job_id, dataset_ref="user0/data", kernel_ref="user0/kernel")
     app.state.db.update_job(job_id, relay_token_id=owner, kaggle_key_id="key0",
@@ -32,6 +41,7 @@ def occupy(app, key):
 
 def enable_quota(monkeypatch, hours=None):
     hours = hours or {"key0": 30, "key1": 30}
+    monkeypatch.setattr("app.kaggle_adapter.KaggleAdapter.identity", lambda self, configured_owner="": {"identity_verified": True})
     monkeypatch.setattr("app.kaggle_adapter.KaggleAdapter.quota", lambda adapter: {
         "available": True, "accelerators": [{"resource": "GPU", "remaining_hours": hours[adapter.credentials.id]}],
     })

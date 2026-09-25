@@ -630,6 +630,9 @@ def test_multi_key_token_auto_selects_key_and_enforces_job_access(tmp_path, monk
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -835,6 +838,9 @@ def test_create_job_auto_selects_available_kaggle_key_by_quota(tmp_path, monkeyp
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -879,6 +885,9 @@ def test_create_job_falls_back_and_rewrites_refs_when_owner_quota_is_exhausted(t
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -925,6 +934,9 @@ def test_create_job_falls_back_and_rewrites_refs_when_owner_has_no_key(tmp_path,
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -968,6 +980,9 @@ def test_create_job_returns_conflict_when_all_allowed_key_quotas_are_exhausted(t
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1003,6 +1018,9 @@ def test_kaggle_account_respects_token_key_permissions(tmp_path, monkeypatch):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1055,6 +1073,9 @@ def test_kaggle_accounts_lists_only_accessible_keys(tmp_path, monkeypatch):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1089,6 +1110,9 @@ def test_kaggle_account_probe_respects_token_key_permissions(tmp_path, monkeypat
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1955,6 +1979,9 @@ def test_worker_prefers_structured_patchcore_kernel_failure(tmp_path, monkeypatc
     }
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2003,6 +2030,7 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     app = create_app(settings)
+    (settings.jobs_dir / "previous/extracted/dataset").mkdir(parents=True)
 
     with TestClient(app) as client:
         app.state.db.upsert_dataset_cache(
@@ -2024,6 +2052,9 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
         }
 
         class FakeAdapter:
+            def require_identity(self, owner):
+                return {"identity_verified": True}
+
             def __init__(self, _settings, _log, credentials=None):
                 pass
 
@@ -2096,9 +2127,13 @@ def test_worker_restricts_gpu_before_push_preserving_upload(tmp_path, monkeypatc
     monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     app = create_app(settings)
+    (settings.jobs_dir / "previous/extracted/dataset").mkdir(parents=True)
     calls = {"upload": 0, "push": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2166,6 +2201,9 @@ def test_worker_passes_upload_receipt_to_dataset_wait(tmp_path, monkeypatch):
     calls = {"receipt": None, "waited": False, "pushed_after_wait": False}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2242,6 +2280,9 @@ def test_workers_serialize_shared_dataset_until_kernel_push(tmp_path, monkeypatc
     calls_lock = threading.Lock()
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2322,6 +2363,9 @@ def test_worker_uses_job_bound_kaggle_credentials(tmp_path, monkeypatch):
     captured = {}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             captured["id"] = credentials.id
             captured["username"] = credentials.username
@@ -2387,6 +2431,9 @@ def test_worker_cancels_queued_job_before_kaggle_push(tmp_path, monkeypatch):
     calls = {"upload_dataset": 0, "push_kernel": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2437,6 +2484,9 @@ def test_worker_does_not_resurrect_cancel_during_upload_transition(tmp_path, mon
     calls = {"upload_dataset": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2500,6 +2550,9 @@ def test_worker_cancels_during_dataset_polling_without_kernel_push(tmp_path, mon
     calls = {"poll": 0, "push": 0}
 
     class PollingAdapter(KaggleAdapter):
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def upload_dataset(self, *_args, **_kwargs):
             return None
 
@@ -2530,6 +2583,9 @@ def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_pat
     app = create_app(settings)
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2620,6 +2676,9 @@ def test_finish_kernel_job_does_not_overwrite_concurrent_cancel(tmp_path, monkey
     monkeypatch.setattr(db, "update_job", monitored_update)
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def wait_kernel(self, _kernel_ref, progress_callback):
             state["armed"] = True
             progress_callback({"epoch": 1, "epochs": 2, "remote_progress": 50})
@@ -2653,6 +2712,9 @@ def test_startup_recovery_resumes_kernel_finish_without_upload_or_push(tmp_path,
     calls = {"upload_dataset": 0, "push_kernel": 0, "wait_kernel": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2715,6 +2777,9 @@ def test_startup_recovery_cancel_requested_before_submission_goes_canceled(tmp_p
     app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, *_args, **_kwargs):
             raise AssertionError("Kaggle should not be called for unsubmitted cancel")
 
@@ -2734,6 +2799,9 @@ def test_startup_recovery_cancel_requested_after_submission_finishes_canceled(tm
     app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2935,6 +3003,9 @@ def test_startup_recovery_skips_terminal_and_receiving_jobs(tmp_path, monkeypatc
     receiving_id = seed_job(app, "receiving", progress=0)
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, *_args, **_kwargs):
             raise AssertionError("terminal and receiving jobs should not recover")
 
@@ -3576,10 +3647,15 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
     with zipfile.ZipFile(payload_zip, "w") as archive:
         archive.writestr("data.yaml", b"data")
         archive.writestr("model_source/best.pt", b"pt")
-    (tmp_path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "dataset-metadata.json").write_text('{"id":"demo/data"}', encoding="utf-8")
     calls = []
 
     class FakeKaggleApi:
+        config_values = {"username": "demo", "auth_method": "access_token"}
+
+        def dataset_download_files(self, *args, **kwargs):
+            raise AssertionError("upload-only test must not download")
+
         def authenticate(self):
             pass
 
@@ -3590,6 +3666,7 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
 
         def dataset_create_version(self, dataset_dir, update_message, **kwargs):
             calls.append((dataset_dir, update_message, kwargs))
+            return SimpleNamespace(status="ok", error="")
 
     kaggle_api_module = importlib.import_module(
         "kaggle.api.kaggle_api_extended"
@@ -3600,7 +3677,9 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
 
     receipt = adapter.upload_dataset(tmp_path, "demo/data", "update files")
 
+    from app.upload_intent import content_digest
     assert receipt == DatasetUploadReceipt(
+        dataset_dir=str(tmp_path.absolute()), content_sha256=content_digest(tmp_path),
         expected_version_number=4,
         expected_files=(
             ("data.yaml", 4),
@@ -3615,10 +3694,15 @@ def test_upload_dataset_fails_when_existing_version_is_unavailable(
     tmp_path,
     monkeypatch,
 ):
-    (tmp_path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "dataset-metadata.json").write_text('{"id":"demo/data"}', encoding="utf-8")
     upload_called = False
 
     class FakeKaggleApi:
+        config_values = {"username": "demo", "auth_method": "access_token"}
+
+        def dataset_download_files(self, *args, **kwargs):
+            raise AssertionError("upload-only test must not download")
+
         def authenticate(self):
             pass
 

@@ -65,7 +65,7 @@ async def schedule_pending_jobs(app: FastAPI) -> None:
             credentials = app.state.auth_store.credentials_for(key)
             adapter = KaggleAdapter(settings, lambda _: None, credentials=credentials,
                                     shutdown_event=app.state.shutdown_event)
-            future = settings._quota_cache.submit((credentials, settings.kaggle_cmd), adapter.quota)
+            future = settings._quota_cache.submit(("verified_identity", credentials, settings.kaggle_cmd), adapter.scheduling_status)
             waiting = not future.done()
             lookups[key] = asyncio.wrap_future(future)
             if waiting:
@@ -97,9 +97,13 @@ async def schedule_pending_jobs(app: FastAPI) -> None:
                 continue
             occupied = occupied_accounts(app)
             available = []
+            identity_errors = []
             for key, username in allowed.items():
                 quota = quotas.get(key)
                 if occupied.get(username.lower(), 0) >= settings.account_concurrency or not isinstance(quota, dict):
+                    continue
+                if not quota.get("identity_verified"):
+                    identity_errors.append(f"{key}: {quota.get('identity_error', 'identity_unverified')}")
                     continue
                 if not quota.get("available"):
                     continue
@@ -110,7 +114,8 @@ async def schedule_pending_jobs(app: FastAPI) -> None:
                     available.append((-remaining, key, username))
             if not available:
                 db.update_job_if_status(current["job_id"], {"queued"},
-                                        queue_reason="waiting for an idle authorized account with GPU quota")
+                                        queue_reason=("account identity blocked: " + "; ".join(identity_errors) if identity_errors
+                                                      else "waiting for an idle authorized account with GPU quota"))
                 continue
             _, key, username = min(available)
             bound = db.update_job_if_status(

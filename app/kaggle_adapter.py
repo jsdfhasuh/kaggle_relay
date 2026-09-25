@@ -1,4 +1,5 @@
 import json
+import inspect
 import math
 import os
 import re
@@ -24,6 +25,8 @@ from app.dinov2_artifacts import package_artifacts as package_dinov2_artifacts
 from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
+from app.payload_contract import verify_upload_archive
+from app.upload_intent import content_digest, intent_path, read_intent, write_intent
 
 
 YOLO_ARTIFACT_FILE_PATTERN = (
@@ -64,10 +67,16 @@ class KaggleAdapterInterrupted(RuntimeError):
     pass
 
 
+class DatasetUploadUnknown(KaggleAdapterError):
+    """The durable candidate must be reconciled, never uploaded again."""
+
+
 @dataclass(frozen=True)
 class DatasetUploadReceipt:
     expected_version_number: int | None = None
     expected_files: tuple[tuple[str, int], ...] = ()
+    dataset_dir: str = ""
+    content_sha256: str = ""
 
 
 def kaggle_status_lines(output: str) -> list[str]:
@@ -416,10 +425,10 @@ class KaggleAdapter:
         result = self._run_command(
             [sys.executable, "-m", "app.kaggle_sdk"],
             cwd=Path(__file__).resolve().parent.parent,
-            timeout=(self.settings.transfer_timeout_seconds if operation in {"upload_dataset", "probe_username_write_access"}
+            timeout=(self.settings.transfer_timeout_seconds if operation in {"upload_dataset", "verify_dataset_content", "probe_username_write_access"}
                      else self.settings.command_timeout_seconds),
             input_text=json.dumps(payload),
-            check_space=operation in {"upload_dataset", "probe_username_write_access"},
+            check_space=operation in {"upload_dataset", "verify_dataset_content", "probe_username_write_access"},
         )
         for line in reversed(result.stdout.splitlines()):
             if line.startswith("RELAY_SDK_RESULT="):
@@ -469,6 +478,62 @@ class KaggleAdapter:
             "authenticated": auth_result.returncode == 0,
             "auth_output": auth_result.stdout[-2000:],
         }
+
+    def identity(self, configured_owner: str = "") -> dict:
+        configured_owner = configured_owner or (self.credentials.username if self.credentials else
+                                                 self._env().get("KAGGLE_USERNAME", ""))
+        if not self._sdk_in_process:
+            return self._sdk_call("identity", configured_owner=configured_owner)
+        with self._temporary_kaggle_env():
+            from kaggle.api.kaggle_api_extended import KaggleApi
+            api = KaggleApi()
+            api.authenticate()
+            return self._authenticated_identity(api, configured_owner)
+
+    def _authenticated_identity(self, api, configured_owner):
+        config = api.config_values
+        method = str(config.get("auth_method", "")).split(".")[-1].lower()
+        sources = {"access_token": "token_introspection", "oauth": "oauth_token_introspection",
+                   "legacy_api_key": "validated_basic_principal"}
+        source = sources.get(method, "unverified")
+        actual = str(config.get("username", "") or "").strip()
+        if method == "oauth":
+            # OAuth's cached username is not itself an authenticated claim.
+            actual = str(api._introspect_token(config.get("token", "")) or "").strip()
+        credential_owner = (self.credentials.username if self.credentials else
+                            self._env().get("KAGGLE_USERNAME", "")) or ""
+        # Basic auth's username is a credential input, not a token introspection
+        # result. Prove that exact principal/key pair against an authenticated API.
+        if method == "legacy_api_key":
+            api.dataset_list(mine=True, page_size=1)
+        error = ""
+        if source == "unverified":
+            error = "unsupported_auth_method"
+        elif not actual:
+            error = "authenticated_owner_missing"
+        elif not configured_owner:
+            error = "configured_owner_missing"
+        elif (actual.casefold() != configured_owner.strip().casefold() or
+              (credential_owner and actual.casefold() != credential_owner.strip().casefold())):
+            error = "configured_owner_identity_mismatch"
+        return {"identity_verified": not error, "auth_method": method,
+                "identity_source": source, "identity_error": error}
+
+    def require_identity(self, owner):
+        identity = self.identity(owner)
+        if not identity.get("identity_verified"):
+            raise KaggleAdapterError("Kaggle owner identity rejected: " + identity.get("identity_error", "unverified"))
+        return identity
+
+    def scheduling_status(self):
+        try:
+            identity = self.identity()
+        except Exception as exc:
+            return {"available": False, "identity_verified": False,
+                    "identity_error": "identity_lookup_failed: " + redact_secrets(str(exc))[-300:]}
+        if not identity.get("identity_verified"):
+            return {"available": False, **identity, "error": identity.get("identity_error", "identity_unverified")}
+        return {**self.quota(), **identity}
 
     def quota(self) -> dict:
         if not self._sdk_in_process:
@@ -625,13 +690,11 @@ class KaggleAdapter:
                 api = KaggleApi()
                 api.authenticate()
                 result = api.dataset_status(dataset_ref)
-            text = str(result).lower()
-            return "not found" not in text and "404" not in text
+            return True
         except Exception as exc:
-            detail = str(exc).lower()
-            if "not found" in detail or "404" in detail:
+            if getattr(getattr(exc, "response", None), "status_code", None) == 404:
                 return False
-            return False
+            raise
 
     @staticmethod
     def _dataset_version_number(api, dataset_ref: str) -> int:
@@ -725,41 +788,104 @@ class KaggleAdapter:
             return DatasetUploadReceipt(
                 expected_version_number=result["expected_version_number"],
                 expected_files=tuple(tuple(item) for item in result["expected_files"]),
+                dataset_dir=result["dataset_dir"], content_sha256=result["content_sha256"],
             )
         self._check_interrupted()
         from kaggle.api.kaggle_api_extended import KaggleApi
 
         expected_files = dataset_upload_inventory(dataset_dir)
+        source_digest = content_digest(dataset_dir)
+        saved_path = intent_path(self.settings.storage_dir, dataset_dir, dataset_ref)
+        intent = read_intent(saved_path)
+        if intent is not None:
+            if (intent.get("dataset_ref") != dataset_ref or intent.get("content_sha256") != source_digest
+                    or intent.get("dataset_dir") != str(Path(dataset_dir).absolute())):
+                raise KaggleAdapterError("upload_intent_scope_or_content_mismatch")
+            if intent["state"] == "rejected":
+                raise KaggleAdapterError("Dataset upload was rejected; retained original intent")
+            self.require_identity(dataset_ref.split("/")[0])
+            return DatasetUploadReceipt(intent["version_number"], expected_files,
+                                        str(Path(dataset_dir).absolute()), source_digest)
         with self._temporary_kaggle_env():
             api = KaggleApi()
             api.authenticate()
+            identity = self._authenticated_identity(api, dataset_ref.split("/")[0])
+            if not identity["identity_verified"]:
+                raise KaggleAdapterError("Kaggle owner identity rejected: " + identity["identity_error"])
+            try:
+                inspect.signature(api.dataset_download_files).bind(
+                    dataset_ref + "/1", path="unused", force=True, quiet=True, unzip=False)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise KaggleAdapterError("Kaggle API cannot verify exact Dataset content; upgrade explicitly") from exc
+            metadata_path = Path(dataset_dir) / "dataset-metadata.json"
+            if metadata_path.is_file():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata.get("id") != dataset_ref:
+                    raise KaggleAdapterError("Dataset metadata owner/ref binding mismatch")
             exists = self.dataset_exists(dataset_ref)
             if exists:
                 current_version_number = self._dataset_version_number(api, dataset_ref)
                 expected_version_number = current_version_number + 1
-                self.log(f"Updating dataset {dataset_ref}")
-                api.dataset_create_version(
-                    str(dataset_dir),
-                    update_message,
-                    quiet=False,
-                    convert_to_csv=False,
-                    delete_old_versions=False,
-                    dir_mode="tar",
-                )
             else:
                 expected_version_number = 1
-                self.log(f"Creating dataset {dataset_ref}")
-                api.dataset_create_new(
-                    str(dataset_dir),
-                    public=False,
-                    quiet=False,
-                    convert_to_csv=False,
-                    dir_mode="tar",
-                )
+            intent = {"schema_version": 1, "dataset_ref": dataset_ref,
+                      "dataset_dir": str(Path(dataset_dir).absolute()), "content_sha256": source_digest,
+                      "version_number": expected_version_number, "operation": "version" if exists else "create",
+                      "state": "unknown", **identity}
+            # Durably record BEFORE remote mutation. Failures here never upload.
+            write_intent(saved_path, intent)
+            self.log(f"{'Updating' if exists else 'Creating'} dataset {dataset_ref}")
+            try:
+                if exists:
+                    response = api.dataset_create_version(str(dataset_dir), update_message, quiet=False,
+                                                          convert_to_csv=False, delete_old_versions=False, dir_mode="tar")
+                else:
+                    response = api.dataset_create_new(str(dataset_dir), public=False, quiet=False,
+                                                      convert_to_csv=False, dir_mode="tar")
+            except BaseException as exc:
+                raise DatasetUploadUnknown("Dataset upload outcome unknown; original candidate retained") from exc
+            response_fields = ("status", "error", "error_message", "errorMessage", "invalid_tags", "invalidTags")
+            if not any(name in response if isinstance(response, dict) else hasattr(response, name)
+                       for name in response_fields):
+                raise DatasetUploadUnknown("Dataset response missing; original candidate retained")
+            get = response.get if isinstance(response, dict) else lambda k, d=None: getattr(response, k, d)
+            error = get("error") or get("error_message") or get("errorMessage") or get("invalid_tags") or get("invalidTags")
+            status = str(get("status", "") or "").lower()
+            if error or (status and status not in {"ok", "ready", "complete"}):
+                write_intent(saved_path, {**intent, "state": "rejected"})
+                raise KaggleAdapterError("Dataset business response rejected: " + redact_secrets(str(error or status)))
+            if content_digest(dataset_dir) != source_digest:
+                raise DatasetUploadUnknown("Dataset source changed after upload; original candidate retained")
+            write_intent(saved_path, {**intent, "state": "accepted"})
         return DatasetUploadReceipt(
             expected_version_number=expected_version_number,
             expected_files=expected_files,
+            dataset_dir=str(Path(dataset_dir).absolute()), content_sha256=source_digest,
         )
+
+    def verify_dataset_content(self, dataset_ref, version_number, dataset_dir, content_sha256):
+        if not self._sdk_in_process:
+            return self._sdk_call("verify_dataset_content", dataset_ref=dataset_ref, version_number=version_number,
+                                  dataset_dir=str(dataset_dir), content_sha256=content_sha256)
+        if content_digest(dataset_dir) != content_sha256:
+            raise KaggleAdapterError("Dataset frozen content changed")
+        with self._temporary_kaggle_env():
+            from kaggle.api.kaggle_api_extended import KaggleApi
+            api = KaggleApi()
+            api.authenticate()
+            identity = self._authenticated_identity(api, dataset_ref.split("/")[0])
+            if not identity["identity_verified"]:
+                raise KaggleAdapterError("Kaggle owner identity rejected")
+            with tempfile.TemporaryDirectory(prefix="relay-version-check-") as directory:
+                api.dataset_download_files(f"{dataset_ref}/{version_number}", path=directory,
+                                           force=True, quiet=True, unzip=False)
+                paths = list(Path(directory).iterdir())
+                if len(paths) != 1 or not paths[0].is_file() or paths[0].is_symlink():
+                    raise KaggleAdapterError("Dataset version archive missing")
+                verify_upload_archive(dataset_dir, paths[0])
+                if content_digest(dataset_dir) != content_sha256:
+                    raise KaggleAdapterError("Dataset frozen content changed during verification")
+        return True
 
     def wait_dataset(
         self,
@@ -768,7 +894,22 @@ class KaggleAdapter:
         upload_receipt: DatasetUploadReceipt | None = None,
     ) -> str:
         start = time.time()
-        visibility_retry_logged = False
+        last_reason, last_reason_at = None, 0.0
+        def report(reason, message):
+            nonlocal last_reason, last_reason_at
+            now = time.monotonic()
+            if reason != last_reason or now - last_reason_at >= 60:
+                self.log(message)
+                last_reason, last_reason_at = reason, now
+
+        @contextmanager
+        def quiet_poll():
+            original_log = self.log
+            self.log = lambda message: None
+            try:
+                yield
+            finally:
+                self.log = original_log
         visibility_grace = max(0, int(permission_grace_seconds or 0))
         expected_version_number = getattr(
             upload_receipt,
@@ -780,13 +921,38 @@ class KaggleAdapter:
             raise KaggleAdapterError(
                 "Dataset upload receipt is missing the expected version number"
             )
+        source_dir = getattr(upload_receipt, "dataset_dir", "")
+        source_digest = getattr(upload_receipt, "content_sha256", "")
         while True:
             status_args = ["datasets", "status", dataset_ref]
             if self.dataset_cancel_check is not None:
                 self.dataset_cancel_check()
+            if source_dir:
+                try:
+                    with quiet_poll():
+                        self.verify_dataset_content(dataset_ref, expected_version_number, source_dir, source_digest)
+                except Exception as exc:
+                    detail = redact_secrets(str(exc))
+                    elapsed = time.time() - start
+                    if any(code in detail.lower() for code in ("403", "404", "forbidden", "not found")):
+                        report("permission", "Dataset exact candidate is not yet accessible: " + detail[-500:])
+                        if visibility_grace <= 0 or elapsed > visibility_grace:
+                            raise
+                    elif any(code in detail for code in ("409", "429", "503")):
+                        report("transient", "Dataset exact candidate temporarily unavailable: " + detail[-500:])
+                        if elapsed > 30 * 60:
+                            raise
+                    else:
+                        report("content_mismatch", "Dataset exact candidate content rejected: " + detail[-500:])
+                        raise
+                    self._sleep(self.settings.dataset_poll_seconds)
+                    continue
+                report("verified", f"Dataset exact version {expected_version_number} bytes verified")
+                return json.dumps({"status": "ready", "current_version_number": expected_version_number})
             if expected_version_number is not None:
                 status_args.extend(["--format", "json"])
-            result = self._run(status_args, check=False)
+            with quiet_poll():
+                result = self._run(status_args, check=False)
             output = result.stdout.strip() or f"returncode={result.returncode}"
             status_text = output.lower()
             status, current_version_number = parse_kaggle_dataset_status(output)
@@ -813,10 +979,11 @@ class KaggleAdapter:
                 inventory_error = ""
                 if version_visible and expected_files:
                     try:
-                        remote_files = self._dataset_file_inventory(
-                            dataset_ref,
-                            version_number=expected_version_number,
-                        )
+                        with quiet_poll():
+                            remote_files = self._dataset_file_inventory(
+                                dataset_ref,
+                                version_number=expected_version_number,
+                            )
                     except Exception as exc:
                         inventory_error = redact_secrets(str(exc))
                         detail = inventory_error.lower()
@@ -850,31 +1017,29 @@ class KaggleAdapter:
                 )
                 if version_visible and files_visible:
                     return output
-                if not visibility_retry_logged:
-                    details = []
-                    if not version_visible:
-                        details.append(
-                            "expected version "
-                            f"{expected_version_number}, current version "
-                            f"{current_version_number or 'unknown'}"
-                        )
-                    if inventory_error:
-                        details.append(f"file listing unavailable: {inventory_error}")
-                    if missing_files:
-                        details.append(
-                            f"{len(missing_files)} expected files missing "
-                            f"(for example {missing_files[0]})"
-                        )
-                    if size_mismatches:
-                        details.append(
-                            f"{len(size_mismatches)} expected file sizes differ "
-                            f"(for example {size_mismatches[0]})"
-                        )
-                    self.log(
-                        "Dataset reports ready before the uploaded version is fully visible; "
-                        + "; ".join(details)
+                details = []
+                if not version_visible:
+                    details.append(
+                        "expected version "
+                        f"{expected_version_number}, current version "
+                        f"{current_version_number or 'unknown'}"
                     )
-                    visibility_retry_logged = True
+                if inventory_error:
+                    details.append(f"file listing unavailable: {inventory_error}")
+                if missing_files:
+                    details.append(
+                        f"{len(missing_files)} expected files missing "
+                        f"(for example {missing_files[0]})"
+                    )
+                if size_mismatches:
+                    details.append(
+                        f"{len(size_mismatches)} expected file sizes differ "
+                        f"(for example {size_mismatches[0]})"
+                    )
+                report(tuple(details),
+                    "Dataset reports ready before the uploaded version is fully visible; "
+                    + "; ".join(details)
+                )
             if result.returncode == 0 and any(word in status_text for word in ["failed", "error", "deleted"]):
                 raise KaggleAdapterError(f"Dataset failed:\n{output}")
             if result.returncode != 0 and any(word in status_text for word in ["401", "unauthorized"]):
@@ -883,12 +1048,8 @@ class KaggleAdapter:
                 word in status_text for word in ["403", "404", "forbidden", "not found"]
             ):
                 if visibility_grace > 0 and elapsed <= visibility_grace:
-                    if not visibility_retry_logged:
-                        self.log(
-                            "Dataset status is temporarily unavailable after upload; "
-                            f"retrying for up to {visibility_grace} seconds"
-                        )
-                        visibility_retry_logged = True
+                    report("permission", "Dataset status is temporarily unavailable after upload; "
+                           f"retrying for up to {visibility_grace} seconds")
                     self._sleep(self.settings.dataset_poll_seconds)
                     continue
                 raise KaggleAdapterError(f"Dataset status failed:\n{output}")

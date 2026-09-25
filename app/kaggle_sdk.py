@@ -18,7 +18,7 @@ def main() -> int:
         payload = json.load(sys.stdin)
         operation = payload["operation"]
         if operation not in {"quota", "upload_dataset", "dataset_exists", "_dataset_file_inventory",
-                             "probe_username_write_access"}:
+                             "probe_username_write_access", "identity", "verify_dataset_content"}:
             raise ValueError("unsupported SDK operation")
         settings = Settings(
             api_token="", storage_dir=Path(payload["storage_dir"]),

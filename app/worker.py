@@ -18,6 +18,7 @@ from app.kaggle_adapter import (
     parse_kaggle_dataset_status,
 )
 from app.security import redact_secrets
+from app.upload_intent import content_digest, intent_path, read_intent
 
 TERMINAL_JOB_STATUSES = {"complete", "failed", "canceled"}
 _DATASET_SUBMISSION_LOCKS: dict[str, list] = {}
@@ -526,13 +527,27 @@ def process_job(
             adapter.shutdown_event = shutdown_event
         with dataset_submission_lock(job["dataset_ref"], shutdown_event):
             stop_if_cancel_requested()
+            if job["kernel_ref"].split("/")[0] != job["dataset_ref"].split("/")[0]:
+                raise ValueError("Dataset and Kernel owner binding mismatch")
+            adapter.require_identity(job["dataset_ref"].split("/")[0])
             dataset_cache = get_ready_dataset_cache(
                 db,
                 job["dataset_ref"],
                 job["payload_hash"],
                 kaggle_key_id=kaggle_key_id,
             )
+            saved_intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+            if saved_intent is not None:
+                # Even a valid shared cache cannot replace this run's candidate.
+                dataset_cache = None
             if dataset_cache:
+                # A cache hit may omit this job's dataset upload. Revalidate the
+                # original cache source, never synthesize an unbound inventory.
+                cached_source = dataset_dir
+                if not cached_source.is_dir():
+                    cached_source = job_paths(settings, dataset_cache["source_job_id"])["dataset_dir"]
+                if not cached_source.is_dir():
+                    raise ValueError("Cached Dataset source unavailable for byte verification")
                 validate_kernel_payload(
                     kernel_dir,
                     job["kernel_ref"],
@@ -549,6 +564,8 @@ def process_job(
                     ),
                     upload_receipt=DatasetUploadReceipt(
                         expected_version_number=cached_version_number,
+                        dataset_dir=str(cached_source),
+                        content_sha256=content_digest(cached_source),
                     ),
                 )
                 pin_kernel_dataset_version(
@@ -567,7 +584,7 @@ def process_job(
                     job["kernel_ref"],
                     credentials,
                 )
-                transition_before_submission({"queued"}, "uploading_dataset", 20)
+                transition_before_submission({"queued", "uploading_dataset", "waiting_dataset"}, "uploading_dataset", 20)
                 upload_receipt = adapter.upload_dataset(
                     dataset_dir,
                     job["dataset_ref"],
@@ -641,6 +658,19 @@ def process_job(
         db.append_log(job_id, message)
     except Exception as exc:
         current = latest_job()
+        if current.get("status") in {"uploading_dataset", "waiting_dataset"}:
+            try:
+                intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+            except (OSError, ValueError):
+                intent = None
+            integrity_failure = any(code in str(exc) for code in (
+                "payload_", "identity rejected", "intent_scope_or_content_mismatch", "frozen content changed"))
+            if intent and (intent["state"] == "unknown" or
+                           (intent["state"] == "accepted" and not integrity_failure)):
+                message = "dataset_upload_outcome_unknown: original candidate retained; " + redact_secrets(str(exc))
+                db.update_job(job_id, status="waiting_dataset", error=message)
+                db.append_log(job_id, message)
+                return
         message = structured_kernel_failure_error(current.get("kernel_status")) or str(exc)
         message = redact_secrets(message)
         db.finalize_job(job_id, "failed", progress=0, error=message)

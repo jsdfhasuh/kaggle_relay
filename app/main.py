@@ -35,6 +35,7 @@ from app.quota_cache import QuotaCache
 from app.scheduler import awaiting_assignment, eligible_accounts, scheduler_loop
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted
+from app.upload_intent import intent_path, read_intent
 from app.schemas import (
     ChunkResponse,
     CreateKaggleKeyRequest,
@@ -495,16 +496,27 @@ def quota_key_candidates(
 
     lookups = {}
     cache = getattr(settings, "_quota_cache", None)
+
+    def verified_quota(adapter, owner):
+        adapter.require_identity(owner)
+        return {**adapter.quota(), "identity_verified": True}
+
     if cache:
         for key_id in key_ids:
             credentials = auth_store.credentials_for(key_id)
             adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
-            lookups[key_id] = cache.submit((credentials, settings.kaggle_cmd), adapter.quota)
+            lookups[key_id] = cache.submit(
+                ("verified_identity", credentials, settings.kaggle_cmd),
+                lambda adapter=adapter, owner=credentials.username: verified_quota(adapter, owner))
     for key_id in key_ids:
         try:
             credentials = auth_store.credentials_for(key_id)
             quota = (lookups[key_id].result() if cache else
-                     KaggleAdapter(settings, lambda _message: None, credentials=credentials).quota())
+                     verified_quota(KaggleAdapter(settings, lambda _message: None, credentials=credentials),
+                                    credentials.username))
+            if not quota.get("identity_verified"):
+                unavailable.append(f"{key_id}: owner identity unverified")
+                continue
             remaining = quota_remaining_hours(quota)
         except Exception as exc:
             unavailable.append(f"{key_id}: {redact_secrets(str(exc))[-300:]}")
@@ -1136,6 +1148,18 @@ def recover_job_after_restart(
         return {"action": "resume_kernel", "job_id": job_id}
 
     if status in {"uploading_dataset", "waiting_dataset"}:
+        dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
+        try:
+            intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+        except (OSError, ValueError) as exc:
+            fail_recovered_job(db, job_id, f"upload intent invalid; original record retained: {exc}")
+            return None
+        if intent and intent["state"] in {"unknown", "accepted"}:
+            append_internal_log(db, job_id, "restart recovery: verify original Dataset candidate without reupload")
+            if not db.update_job_if_status(job_id, {status}, require_not_canceled=True,
+                                           status="queued", error=""):
+                return None
+            return {"action": "process", "job_id": job_id}
         fail_recovered_job(
             db,
             job_id,
@@ -1957,6 +1981,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
             reject_expired_upload(db, job)
+            if (job["status"] == "waiting_dataset"
+                    and str(job.get("error", "")).startswith("dataset_upload_outcome_unknown:")):
+                dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
+                try:
+                    intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail="upload intent invalid; retained for review") from exc
+                if not intent or intent["state"] not in {"unknown", "accepted"}:
+                    raise HTTPException(status_code=409, detail="original upload candidate unavailable")
+                if db.update_job_if_status(job_id, {"waiting_dataset"}, require_not_canceled=True,
+                                           status="queued", error=""):
+                    request.app.state.queue.put_nowait({"action": "process", "job_id": job_id})
+                return job_response(db, job_id, settings.retention_hours)
             if job["status"] != "receiving":
                 return job_response(db, job_id, settings.retention_hours)
 
