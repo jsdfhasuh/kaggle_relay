@@ -65,6 +65,8 @@ class Api:
         self.status_calls = 0
         self.basic_checks = 0
         self.basic_error = None
+        self.owned_refs = ["owner/data"]
+        self.list_pages = []
 
     def authenticate(self):
         pass
@@ -73,11 +75,12 @@ class Api:
         return self.config_values["username"]
 
     def dataset_list(self, mine=False, page=1):
-        assert mine is True and page == 1
+        assert mine is True
+        self.list_pages.append(page)
         self.basic_checks += 1
         if self.basic_error is not None:
             raise self.basic_error
-        return []
+        return [SimpleNamespace(ref=ref) for ref in self.owned_refs] if page == 1 else []
 
     def dataset_status(self, ref, format=None):
         self.status_calls += 1
@@ -116,6 +119,109 @@ def fixture_adapter(tmp_path, monkeypatch):
     return api, adapter, dataset
 
 
+def test_new_dataset_uses_complete_owned_inventory_not_status_403(tmp_path, monkeypatch):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    api.exists_error = RuntimeError("403 Forbidden for uncreated private ref")
+    pages = []
+    def dataset_list(mine=False, page=1):
+        assert mine is True
+        pages.append(page)
+        return [SimpleNamespace(ref="owner/other")] if page == 1 else []
+    api.dataset_list = dataset_list
+    receipt = adapter.upload_dataset(dataset, "owner/data", "create")
+    assert pages == [1, 2] and api.status_calls == 0 and api.uploads == 1
+    assert receipt.expected_version_number == 1
+    saved = read_intent(intent_path(adapter.settings.storage_dir, dataset, "owner/data"))
+    assert saved["operation"] == "create" and saved["state"] == "accepted"
+    assert saved["existence_basis"] == "authenticated_mine_inventory"
+    # A delayed readback never licenses a second create or a latest query.
+    receipt = adapter.upload_dataset(dataset, "owner/data", "retry")
+    assert api.uploads == 1 and pages == [1, 2]
+    assert adapter.wait_dataset("owner/data", upload_receipt=receipt)
+    assert api.downloads == ["owner/data/1"]
+
+
+def test_created_candidate_visibility_delay_only_retries_readback(tmp_path, monkeypatch):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    api.owned_refs = []
+    receipt = adapter.upload_dataset(dataset, "owner/data", "create")
+    original_download = api.dataset_download_files
+    calls = []
+    def download(ref, path=None, force=False, quiet=False, unzip=True):
+        calls.append(ref)
+        if len(calls) == 1:
+            raise RuntimeError("403 Forbidden: not visible yet")
+        return original_download(ref, path=path, force=force, quiet=quiet, unzip=unzip)
+    api.dataset_download_files = download
+    adapter._sleep = lambda _: None
+    adapter.wait_dataset("owner/data", permission_grace_seconds=60, upload_receipt=receipt)
+    assert calls == ["owner/data/1", "owner/data/1"]
+    assert api.uploads == 1 and api.status_calls == 0
+
+
+def test_create_intent_write_failure_never_uploads(tmp_path, monkeypatch):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    api.owned_refs = []
+    def fail(path, value):
+        assert value["operation"] == "create" and value["version_number"] == 1
+        raise OSError("disk full")
+    monkeypatch.setattr("app.kaggle_adapter.write_intent", fail)
+    with pytest.raises(OSError, match="disk full"):
+        adapter.upload_dataset(dataset, "owner/data", "create")
+    assert api.uploads == api.status_calls == 0
+
+
+@pytest.mark.parametrize("mode", ["403", "incomplete", "malformed", "repeated"])
+def test_bad_inventory_never_creates_intent_or_mutates_dataset(tmp_path, monkeypatch, mode):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    def dataset_list(mine=False, page=1):
+        assert mine is True
+        if mode == "403":
+            raise RuntimeError("403 Forbidden")
+        if mode == "incomplete":
+            return None
+        if mode == "malformed":
+            return [SimpleNamespace()]
+        return [SimpleNamespace(ref="owner/other")]
+    api.dataset_list = dataset_list
+    with pytest.raises((RuntimeError, KaggleAdapterError)):
+        adapter.upload_dataset(dataset, "owner/data", "create")
+    assert api.uploads == api.status_calls == 0
+    assert read_intent(intent_path(adapter.settings.storage_dir, dataset, "owner/data")) is None
+
+
+def test_existing_dataset_on_later_page_uses_version_not_create(tmp_path, monkeypatch):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    def dataset_list(mine=False, page=1):
+        assert mine is True
+        return [SimpleNamespace(ref="owner/other" if page == 1 else "owner/data")]
+    api.dataset_list = dataset_list
+    receipt = adapter.upload_dataset(dataset, "owner/data", "version")
+    assert receipt.expected_version_number == 7 and api.status_calls == 1
+
+
+@pytest.mark.parametrize("outcome", ["conflict", "lost_response"])
+def test_create_race_or_lost_response_never_falls_back_to_version(tmp_path, monkeypatch, outcome):
+    api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
+    api.owned_refs = []
+    api.response = {"error": "Dataset already exists"} if outcome == "conflict" else {"status": "ok"}
+    api.lost_response = outcome == "lost_response"
+    with pytest.raises(KaggleAdapterError):
+        adapter.upload_dataset(dataset, "owner/data", "create")
+    saved = read_intent(intent_path(adapter.settings.storage_dir, dataset, "owner/data"))
+    assert saved["version_number"] == 1 and saved["operation"] == "create"
+    if outcome == "conflict":
+        assert saved["state"] == "rejected"
+        with pytest.raises(KaggleAdapterError, match="rejected"):
+            adapter.upload_dataset(dataset, "owner/data", "retry")
+    else:
+        assert saved["state"] == "unknown"
+        receipt = adapter.upload_dataset(dataset, "owner/data", "retry")
+        adapter.wait_dataset("owner/data", upload_receipt=receipt)
+        assert api.downloads == ["owner/data/1"]
+    assert api.uploads == 1 and api.status_calls == 0
+
+
 @pytest.mark.parametrize("method,source", [("access_token", "token_introspection"),
                                            ("oauth", "oauth_token_introspection"),
                                            ("legacy_api_key", "validated_basic_principal")])
@@ -138,7 +244,7 @@ def test_legacy_key_validates_authenticated_request_before_upload(tmp_path, monk
     assert adapter.require_identity("owner")["identity_source"] == "validated_basic_principal"
     assert api.basic_checks == 1 and api.uploads == 0
     receipt = adapter.upload_dataset(dataset, "owner/data", "test")
-    assert api.basic_checks == 2 and api.uploads == 1
+    assert api.basic_checks == 3 and api.uploads == 1
     assert receipt.expected_version_number == 7
 
 
@@ -187,6 +293,7 @@ def test_http_success_business_error_cannot_create_receipt(tmp_path, monkeypatch
     api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
     api.response = response
     if create:
+        api.owned_refs = []
         api.exists_error = RuntimeError("404 Not found")
         api.exists_error.response = SimpleNamespace(status_code=404)
     with pytest.raises(KaggleAdapterError, match="business response"):
@@ -398,6 +505,9 @@ def test_hard_exit_keeps_candidate_and_only_reads_back_on_retry(tmp_path, monkey
         class Api:
             config_values = {"username": "owner", "auth_method": "access_token"}
             def authenticate(self): pass
+            def dataset_list(self, mine=False, page=1):
+                from types import SimpleNamespace
+                return [SimpleNamespace(ref="owner/data")]
             def dataset_status(self, *a, **kw):
                 return '{"status":"ready","current_version_number":6}'
             def dataset_download_files(self, *a, **kw): pass

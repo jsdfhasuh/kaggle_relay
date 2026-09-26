@@ -697,6 +697,27 @@ class KaggleAdapter:
             raise
 
     @staticmethod
+    def _owned_dataset_exists(api, dataset_ref: str) -> bool:
+        """Select create/version from authenticated inventory, never from a 403."""
+        seen = set()
+        for page in range(1, 1001):
+            rows = api.dataset_list(mine=True, page=page)
+            if not isinstance(rows, list):
+                raise KaggleAdapterError("Dataset owner inventory is incomplete")
+            if not rows:
+                return False
+            refs = [getattr(row, "ref", None) for row in rows]
+            if any(not isinstance(ref, str) or len(ref.split("/")) != 2
+                   or not all(ref.split("/")) for ref in refs):
+                raise KaggleAdapterError("Dataset owner inventory contains invalid refs")
+            if len(set(refs)) != len(refs) or seen.intersection(refs):
+                raise KaggleAdapterError("Dataset owner inventory pagination repeated")
+            if dataset_ref in refs:
+                return True
+            seen.update(refs)
+        raise KaggleAdapterError("Dataset owner inventory pagination limit reached")
+
+    @staticmethod
     def _dataset_version_number(api, dataset_ref: str) -> int:
         try:
             output = api.dataset_status(dataset_ref, format="json")
@@ -822,7 +843,10 @@ class KaggleAdapter:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 if metadata.get("id") != dataset_ref:
                     raise KaggleAdapterError("Dataset metadata owner/ref binding mismatch")
-            exists = self.dataset_exists(dataset_ref)
+            # A new private ref can return 403 from status before it exists.
+            # A complete authenticated inventory permits only a create attempt;
+            # the create response remains authoritative for conflicts/races.
+            exists = self._owned_dataset_exists(api, dataset_ref)
             if exists:
                 current_version_number = self._dataset_version_number(api, dataset_ref)
                 expected_version_number = current_version_number + 1
@@ -831,7 +855,7 @@ class KaggleAdapter:
             intent = {"schema_version": 1, "dataset_ref": dataset_ref,
                       "dataset_dir": str(Path(dataset_dir).absolute()), "content_sha256": source_digest,
                       "version_number": expected_version_number, "operation": "version" if exists else "create",
-                      "state": "unknown", **identity}
+                      "state": "unknown", "existence_basis": "authenticated_mine_inventory", **identity}
             # Durably record BEFORE remote mutation. Failures here never upload.
             write_intent(saved_path, intent)
             self.log(f"{'Updating' if exists else 'Creating'} dataset {dataset_ref}")

@@ -171,7 +171,7 @@ class KaggleApi:
         self.config_values = {'username': self.owner, 'auth_method': 'legacy_api_key'}
     def dataset_list(self, mine=False, page=1):
         assert mine is True and page == 1
-        return []
+        return [SimpleNamespace(ref=self.owner + "/data")]
     def dataset_download_files(self, *args, **kwargs):
         raise AssertionError('upload-only test must not download')
     def dataset_status(self, ref, format=None):

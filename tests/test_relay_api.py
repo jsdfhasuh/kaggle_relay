@@ -3659,6 +3659,10 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
         def authenticate(self):
             pass
 
+        def dataset_list(self, mine=False, page=1):
+            assert mine is True and page == 1
+            return [SimpleNamespace(ref="demo/data")]
+
         def dataset_status(self, _dataset_ref, format=None):
             if format == "json":
                 return '{"status":"ready","current_version_number":3}'
@@ -3705,6 +3709,10 @@ def test_upload_dataset_fails_when_existing_version_is_unavailable(
 
         def authenticate(self):
             pass
+
+        def dataset_list(self, mine=False, page=1):
+            assert mine is True and page == 1
+            return [SimpleNamespace(ref="demo/data")]
 
         def dataset_status(self, _dataset_ref, format=None):
             if format == "json":
