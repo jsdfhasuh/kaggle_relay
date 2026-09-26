@@ -1,0 +1,41 @@
+{
+  "account": {
+    "authenticated": true,
+    "username": "jsdfhasuh",
+    "kaggle_key_id": "first",
+    "quota": {
+      "available": true,
+      "refresh_at": "2026-10-03T00:00:00",
+      "accelerators": [
+        {
+          "resource": "GPU",
+          "used_hours": 0.146,
+          "remaining_hours": 29.854,
+          "total_hours": 30.0
+        },
+        {
+          "resource": "TPU",
+          "used_hours": 0.0,
+          "remaining_hours": 20.0,
+          "total_hours": 20.0
+        }
+      ],
+      "error": ""
+    }
+  },
+  "health": {
+    "status": "ok",
+    "free_bytes": 55628595200
+  },
+  "linux_tests": [
+    {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "52",
+      "time": "8.675",
+      "timestamp": "2026-09-26T01:11:32.863158+00:00"
+    }
+  ]
+}
