@@ -121,14 +121,15 @@ def test_output_guard_rejects_head_advance(tmp_path, monkeypatch, advance_after_
     assert requests[0].kernel_slug == 'run'
 
 
-def test_observation_requires_frozen_candidate_at_current_head():
+@pytest.mark.parametrize('observed_dataset', ['owner/data/3', 'owner/data'])
+def test_observation_requires_frozen_candidate_at_current_head(observed_dataset):
     from app.dinov2_kaggle_output import observe_kernel
     class Client:
         def get_kernel(self, request):
             assert request.kernel_slug == 'run'
             assert request.version_label == ''
             return SimpleNamespace(metadata=SimpleNamespace(current_version_number=7,
-                ref='owner/run', dataset_data_sources=['owner/data/3']), blob=SimpleNamespace(source='pass\n'))
+                ref='owner/run', dataset_data_sources=[observed_dataset]), blob=SimpleNamespace(source='pass\n'))
     class Service:
         kernels = SimpleNamespace(kernels_api_client=Client())
         def __enter__(self): return self
@@ -142,3 +143,13 @@ def test_observation_requires_frozen_candidate_at_current_head():
 
     with pytest.raises(ValueError, match='version'):
         observe_kernel(Api(), 'owner/run', 'pass\n', ['owner/data/3'], version=1)
+
+    for invalid in ['owner/other/3', 'other/data/3', 'owner/data', 'owner/data/0']:
+        with pytest.raises(ValueError, match='binding'):
+            observe_kernel(Api(), 'owner/run', 'pass\n', [invalid], version=7)
+
+
+def test_explicit_wrong_dataset_version_is_never_accepted():
+    from app.dinov2_kaggle_output import _dataset_binding
+    assert not _dataset_binding(['owner/data/4'], ['owner/data/3'])
+    assert not _dataset_binding([], ['owner/data/3'])

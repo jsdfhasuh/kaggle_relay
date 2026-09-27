@@ -4,6 +4,22 @@ import hashlib
 import re
 
 
+def _dataset_binding(actual, expected):
+    """SDK metadata omits versions; preserve frozen candidates, never query latest.
+
+    The exact source embeds the frozen task and verifies all runtime/data bytes
+    before training. Unversioned metadata alone is not a dataset version receipt.
+    """
+    if not isinstance(actual, list) or not isinstance(expected, list) or len(actual) != len(expected) or not expected:
+        return False
+    for observed, frozen in zip(actual, expected):
+        if not isinstance(frozen, str) or not re.fullmatch(r'[^/]+/[^/]+/[1-9][0-9]*', frozen):
+            return False
+        if observed not in (frozen, frozen.rsplit('/', 1)[0]):
+            return False
+    return True
+
+
 def observe_kernel(api, kernel_ref, expected_source, expected_datasets, *, version=1):
     from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
     owner, slug = kernel_ref.split('/')
@@ -21,11 +37,13 @@ def observe_kernel(api, kernel_ref, expected_source, expected_datasets, *, versi
     if type(actual_version) is not int or actual_version < 1 or (version is not None and actual_version != version):
         raise ValueError('exact Kernel version metadata unavailable/mismatched')
     if (metadata.ref != kernel_ref or response.blob.source != expected_source
-            or metadata.dataset_data_sources != expected_datasets):
+            or not _dataset_binding(metadata.dataset_data_sources, expected_datasets)):
         raise ValueError('authenticated Kernel source/Dataset binding mismatch')
     return {'kernel_ref': kernel_ref, 'kernel_version': actual_version,
             'source_sha256': hashlib.sha256(expected_source.encode('utf-8')).hexdigest(),
-            'dataset_sources': expected_datasets}
+            'dataset_sources': expected_datasets,
+            'observed_dataset_sources': metadata.dataset_data_sources,
+            'dataset_binding_method': 'frozen_submission_and_verified_runtime_content'}
 
 
 def verify_observation(api, observation):
@@ -38,7 +56,8 @@ def verify_observation(api, observation):
     if (response.metadata.ref != observation['kernel_ref']
             or response.metadata.current_version_number != observation['kernel_version']
             or hashlib.sha256(response.blob.source.encode('utf-8')).hexdigest() != observation['source_sha256']
-            or response.metadata.dataset_data_sources != observation['dataset_sources']):
+            or not _dataset_binding(response.metadata.dataset_data_sources, observation['dataset_sources'])
+            or response.metadata.dataset_data_sources != observation.get('observed_dataset_sources', observation['dataset_sources'])):
         raise ValueError('original Kernel version/source advanced or changed; refusing latest output')
 
 
