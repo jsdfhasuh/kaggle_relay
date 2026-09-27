@@ -1,4 +1,4 @@
-"""P6 exact-version output transport, bypassing SDK kernels_output's discarded version."""
+"""P6 original-version transport; reject an advanced Kernel instead of using latest."""
 from pathlib import Path
 import hashlib
 import re
@@ -12,7 +12,8 @@ def observe_kernel(api, kernel_ref, expected_source, expected_datasets, *, versi
     request.kernel_slug = slug
     if type(version) is not int or version < 1:
         raise ValueError('explicit original Kernel version required')
-    request.version_label = str(version)
+    # SDK 2.2.4 exposes version_label but the live service returns 404 for numeric
+    # labels. The current head must equal the frozen candidate; no substitution.
     with api.build_kaggle_client() as service:
         response = service.kernels.kernels_api_client.get_kernel(request)
     metadata = response.metadata
@@ -27,9 +28,24 @@ def observe_kernel(api, kernel_ref, expected_source, expected_datasets, *, versi
             'dataset_sources': expected_datasets}
 
 
+def verify_observation(api, observation):
+    from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
+    owner, slug = observation['kernel_ref'].split('/')
+    request = ApiGetKernelRequest()
+    request.user_name, request.kernel_slug = owner, slug
+    with api.build_kaggle_client() as service:
+        response = service.kernels.kernels_api_client.get_kernel(request)
+    if (response.metadata.ref != observation['kernel_ref']
+            or response.metadata.current_version_number != observation['kernel_version']
+            or hashlib.sha256(response.blob.source.encode('utf-8')).hexdigest() != observation['source_sha256']
+            or response.metadata.dataset_data_sources != observation['dataset_sources']):
+        raise ValueError('original Kernel version/source advanced or changed; refusing latest output')
+
+
 def download_version(api, observation, destination, *, pattern, max_bytes):
     from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutputRequest
     import requests
+    verify_observation(api, observation)
     owner, slug = observation['kernel_ref'].split('/')
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
@@ -38,7 +54,6 @@ def download_version(api, observation, destination, *, pattern, max_bytes):
         while True:
             request = ApiListKernelSessionOutputRequest()
             request.user_name, request.kernel_slug = owner, slug
-            request.version_label = str(observation['kernel_version'])
             request.page_size, request.page_token = 100, token
             response = service.kernels.kernels_api_client.list_kernel_session_output(request)
             for remote in response.files:
@@ -74,4 +89,7 @@ def download_version(api, observation, destination, *, pattern, max_bytes):
             tokens.add(token)
     if not seen:
         raise ValueError('no matching exact-version output')
+    # Kernel versions are monotonic. Both observations must still equal the same
+    # original candidate before downloaded bytes can receive a trusted receipt.
+    verify_observation(api, observation)
     return {**observation, 'downloaded_bytes': total, 'downloaded_files': len(seen)}

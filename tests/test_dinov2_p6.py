@@ -76,11 +76,18 @@ def test_p6_schema_survives_database_reopen(tmp_path):
     assert RelayDb(tmp_path/'db.sqlite').get_job('job-p6')['artifact_contract'] == CONTRACT
 
 
-def test_exact_output_request_carries_version_label(tmp_path, monkeypatch):
+@pytest.mark.parametrize('advance_after_download', [False, True])
+def test_output_guard_rejects_head_advance(tmp_path, monkeypatch, advance_after_download):
     from app.dinov2_kaggle_output import download_version
     from app.dinov2_251_artifacts import DOWNLOAD_PATTERN
     requests = []
+    observations = []
     class Client:
+        def get_kernel(self, request):
+            observations.append(request)
+            version = 8 if advance_after_download and len(observations) > 1 else 7
+            return SimpleNamespace(metadata=SimpleNamespace(current_version_number=version,
+                ref='owner/run', dataset_data_sources=['owner/data/3']), blob=SimpleNamespace(source='pass\n'))
         def list_kernel_session_output(self, request):
             requests.append(request)
             return SimpleNamespace(files=[SimpleNamespace(file_name='p6_result/reports/export.json',
@@ -100,18 +107,26 @@ def test_exact_output_request_carries_version_label(tmp_path, monkeypatch):
         assert stream is True
         return Download()
     monkeypatch.setattr('requests.get', get)
-    download_version(Api(), {'kernel_ref': 'owner/run', 'kernel_version': 7}, tmp_path/'out',
-                     pattern=DOWNLOAD_PATTERN, max_bytes=10)
-    assert requests[0].version_label == '7'
+    def download():
+        return download_version(Api(), {'kernel_ref': 'owner/run', 'kernel_version': 7,
+            'source_sha256': __import__('hashlib').sha256(b'pass\n').hexdigest(),
+            'dataset_sources': ['owner/data/3']}, tmp_path/'out', pattern=DOWNLOAD_PATTERN, max_bytes=10)
+    if advance_after_download:
+        with pytest.raises(ValueError, match='advanced'):
+            download()
+    else:
+        assert download()['kernel_version'] == 7
+    assert len(observations) == 2
+    assert requests[0].version_label == ''
     assert requests[0].kernel_slug == 'run'
 
 
-def test_exact_observation_uses_sdk_version_field():
+def test_observation_requires_frozen_candidate_at_current_head():
     from app.dinov2_kaggle_output import observe_kernel
     class Client:
         def get_kernel(self, request):
             assert request.kernel_slug == 'run'
-            assert request.version_label == '7'
+            assert request.version_label == ''
             return SimpleNamespace(metadata=SimpleNamespace(current_version_number=7,
                 ref='owner/run', dataset_data_sources=['owner/data/3']), blob=SimpleNamespace(source='pass\n'))
     class Service:
@@ -124,3 +139,6 @@ def test_exact_observation_uses_sdk_version_field():
     assert observation['kernel_version'] == 7
     with pytest.raises(ValueError, match='binding'):
         observe_kernel(Api(), 'owner/run', 'changed', ['owner/data/3'], version=7)
+
+    with pytest.raises(ValueError, match='version'):
+        observe_kernel(Api(), 'owner/run', 'pass\n', ['owner/data/3'], version=1)
