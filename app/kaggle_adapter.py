@@ -1168,7 +1168,7 @@ class KaggleAdapter:
             api = KaggleApi()
             api.authenticate()
             observation = observe_kernel(api, kernel_ref, source, metadata['dataset_sources'],
-                                         version=saved['kernel_version'] if saved else None)
+                                         version=saved['kernel_version'] if saved else 1)
             if saved is not None and observation != saved:
                 raise ValueError('P6 original Kernel candidate changed')
             write_intent(observed_path, observation)

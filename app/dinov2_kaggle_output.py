@@ -4,14 +4,15 @@ import hashlib
 import re
 
 
-def observe_kernel(api, kernel_ref, expected_source, expected_datasets, *, version=None):
+def observe_kernel(api, kernel_ref, expected_source, expected_datasets, *, version=1):
     from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
     owner, slug = kernel_ref.split('/')
     request = ApiGetKernelRequest()
     request.user_name = owner
     request.kernel_slug = slug
-    if version is not None:
-        request.version_label = str(version)
+    if type(version) is not int or version < 1:
+        raise ValueError('explicit original Kernel version required')
+    request.version_label = str(version)
     with api.build_kaggle_client() as service:
         response = service.kernels.kernels_api_client.get_kernel(request)
     metadata = response.metadata
