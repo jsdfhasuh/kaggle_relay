@@ -22,6 +22,7 @@ from app.archive import require_file
 from app.dinov2_artifacts import (ARTIFACT_CONTRACT as DINO_CONTRACT, ARTIFACT_SUBDIR as DINO_SUBDIR,
                                 DOWNLOAD_PATTERN as DINO_PATTERN)
 from app.dinov2_artifacts import package_artifacts as package_dinov2_artifacts
+from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT, DOWNLOAD_PATTERN as DINO251_PATTERN, package_result
 from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
@@ -40,6 +41,7 @@ PATCHCORE_ARTIFACT_FILE_PATTERN = (
     r"overlay_sample\.png|training_artifacts\.json)$"
 )
 ARTIFACT_FILE_PATTERNS = {
+    DINO251_CONTRACT: DINO251_PATTERN,
     DINO_CONTRACT: DINO_PATTERN,
     "yolo": YOLO_ARTIFACT_FILE_PATTERN,
     "patchcore": PATCHCORE_ARTIFACT_FILE_PATTERN,
@@ -425,10 +427,10 @@ class KaggleAdapter:
         result = self._run_command(
             [sys.executable, "-m", "app.kaggle_sdk"],
             cwd=Path(__file__).resolve().parent.parent,
-            timeout=(self.settings.transfer_timeout_seconds if operation in {"upload_dataset", "verify_dataset_content", "probe_username_write_access"}
+            timeout=(self.settings.transfer_timeout_seconds if operation in {"p6_download", "upload_dataset", "verify_dataset_content", "probe_username_write_access"}
                      else self.settings.command_timeout_seconds),
             input_text=json.dumps(payload),
-            check_space=operation in {"upload_dataset", "verify_dataset_content", "probe_username_write_access"},
+            check_space=operation in {"p6_download", "upload_dataset", "verify_dataset_content", "probe_username_write_access"},
         )
         for line in reversed(result.stdout.splitlines()):
             if line.startswith("RELAY_SDK_RESULT="):
@@ -1150,6 +1152,32 @@ class KaggleAdapter:
             check=False,
         ).stdout
 
+    def p6_download(self, kernel_ref, output_dir, kernel_dir):
+        if not self._sdk_in_process:
+            return self._sdk_call('p6_download', kernel_ref=kernel_ref, output_dir=str(output_dir), kernel_dir=str(kernel_dir))
+        from app.dinov2_kaggle_output import observe_kernel, download_version
+        from app.dinov2_251_artifacts import read_json, plain
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        root = Path(kernel_dir)
+        task = read_json(plain(root, 'p6_task.json'))
+        metadata = read_json(plain(root, 'kernel-metadata.json'))
+        source = plain(root, 'train.py').read_text(encoding='utf-8')
+        observed_path = root/'p6_output_observation.json'
+        saved = read_json(observed_path) if observed_path.exists() else None
+        with self._temporary_kaggle_env():
+            api = KaggleApi()
+            api.authenticate()
+            observation = observe_kernel(api, kernel_ref, source, metadata['dataset_sources'],
+                                         version=saved['kernel_version'] if saved else None)
+            if saved is not None and observation != saved:
+                raise ValueError('P6 original Kernel candidate changed')
+            write_intent(observed_path, observation)
+            destination = Path(output_dir)
+            if destination.exists():
+                shutil.rmtree(destination)
+            return download_version(api, observation, destination, pattern=DINO251_PATTERN,
+                                    max_bytes=task['budget']['disk_bytes'])
+
     def package_artifacts(
         self,
         output_dir: Path,
@@ -1157,7 +1185,12 @@ class KaggleAdapter:
         artifact_contract: str = "yolo",
         *,
         expected_identity: dict | None = None,
+        expected_task_sha256: str = '',
     ) -> None:
+        if artifact_contract == DINO251_CONTRACT:
+            return package_result(output_dir / 'p6_result', artifact_zip,
+                                  expected_identity=expected_identity, expected_task_sha256=expected_task_sha256,
+                                  storage_budget=getattr(self.settings, '_storage_budget', None))
         if artifact_contract == DINO_CONTRACT:
             package_dinov2_artifacts(output_dir / DINO_SUBDIR, artifact_zip, expected_identity=expected_identity,
                                     storage_budget=getattr(self.settings, "_storage_budget", None))

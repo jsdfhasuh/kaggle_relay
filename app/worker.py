@@ -7,6 +7,7 @@ from typing import Callable
 from app.archive import ArchiveError, require_file
 from app.database import RelayDb
 from app.dinov2_artifacts import ARTIFACT_CONTRACT as DINO_CONTRACT, IDENTITY_FIELDS
+from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT
 from app.auth_config import AuthStore
 from app.gpu_policy import apply_yolo_gpu_policy
 from app.dino_threshold_policy import apply_dino_threshold_policy
@@ -432,21 +433,38 @@ def finish_kernel_job(
         },
     )
     artifact_contract = str(current.get("artifact_contract") or "yolo")
-    output = adapter.download_output(
-        kernel_ref,
-        paths["output_dir"],
-        artifact_contract=artifact_contract,
-    )
-    log(output)
+    if artifact_contract == DINO251_CONTRACT:
+        output_observation = adapter.p6_download(kernel_ref, paths['output_dir'], paths['kernel_dir'])
+        log('P6 exact-version output downloaded')
+    else:
+        output = adapter.download_output(
+            kernel_ref,
+            paths["output_dir"],
+            artifact_contract=artifact_contract,
+        )
+        log(output)
     packaging_options = {}
-    if artifact_contract == DINO_CONTRACT:
+    if artifact_contract in {DINO_CONTRACT, DINO251_CONTRACT}:
         packaging_options["expected_identity"] = {key: current.get(key) for key in IDENTITY_FIELDS}
-    adapter.package_artifacts(
+    if artifact_contract == DINO251_CONTRACT:
+        from app.dinov2_251_artifacts import read_json, plain, canonical_hash
+        task = read_json(plain(paths['kernel_dir'], 'p6_task.json'))
+        if any(task.get('identity', {}).get(k) != current.get(k) for k in IDENTITY_FIELDS):
+            raise ValueError('P6 frozen submission identity mismatch')
+        packaging_options['expected_task_sha256'] = canonical_hash(task)
+    receipt = adapter.package_artifacts(
         paths["output_dir"],
         paths["artifact_zip"],
         artifact_contract=artifact_contract,
         **packaging_options,
     )
+    if artifact_contract == DINO251_CONTRACT:
+        receipt.update(job_id=job_id, kernel_ref=kernel_ref, dataset_ref=current['dataset_ref'],
+                       kernel_version=output_observation['kernel_version'],
+                       source_sha256=output_observation['source_sha256'],
+                       dataset_sources=output_observation['dataset_sources'])
+        from app.upload_intent import write_intent
+        write_intent(paths['artifact_zip'].with_suffix('.receipt.json'), receipt)
     db.finalize_job(
         job_id,
         final_status or "complete",

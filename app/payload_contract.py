@@ -65,22 +65,23 @@ def verify_payload_archive(payload_path, downloaded_path):
         with zipfile.ZipFile(payload_path) as original:
             members = zip_members(original)
             expected = _archive_inventory(original, members)
-            if RUNTIME_PATH in members and RUNTIME_PATH not in actual:
-                runtime = members[RUNTIME_PATH]
-                if runtime.file_size > MAX_RUNTIME_BYTES:
-                    raise ValueError("runtime_expansion_limit")
-                with zipfile.ZipFile(io.BytesIO(original.read(runtime))) as package:
-                    sources = zip_members(package)
-                    if len(sources) > 32 or sum(i.file_size for i in sources.values()) > MAX_RUNTIME_BYTES:
+            for runtime_path, max_files in ((RUNTIME_PATH, 32), ("model_source/p6_runtime/runtime.zip", 128)):
+                if runtime_path in members and runtime_path not in actual:
+                    runtime = members[runtime_path]
+                    if runtime.file_size > MAX_RUNTIME_BYTES:
                         raise ValueError("runtime_expansion_limit")
-                    expanded = _archive_inventory(package, sources)
-                del expected[RUNTIME_PATH]
-                prefix = RUNTIME_PATH[:-4] + "/"
-                for name, value in expanded.items():
-                    target = prefix + name
-                    if target in expected:
-                        raise ValueError("payload_path_conflict")
-                    expected[target] = value
+                    with zipfile.ZipFile(io.BytesIO(original.read(runtime))) as package:
+                        sources = zip_members(package)
+                        if len(sources) > max_files or sum(i.file_size for i in sources.values()) > MAX_RUNTIME_BYTES:
+                            raise ValueError("runtime_expansion_limit")
+                        expanded = _archive_inventory(package, sources)
+                    del expected[runtime_path]
+                    prefix = runtime_path[:-4] + "/"
+                    for name, value in expanded.items():
+                        target = prefix + name
+                        if target in expected:
+                            raise ValueError("payload_path_conflict")
+                        expected[target] = value
         _verify_inventory(remote, actual, expected)
 
 

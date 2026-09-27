@@ -273,6 +273,17 @@ def artifact_download_metadata(job: dict, retention_hours: int = 168) -> dict:
 
     metadata["can_download"] = True
     metadata["artifact_size"] = stat.st_size
+    if job.get('artifact_contract') == 'patchcore_dinov2_251_onnx_v1':
+        from app.dinov2_251_artifacts import read_json, IDENTITY_FIELDS
+        try:
+            receipt = read_json(artifact_path.with_suffix('.receipt.json'))
+            if (receipt.get('job_id') != job['job_id'] or receipt.get('archive_size') != stat.st_size
+                    or any(receipt.get('identity', {}).get(k) != job.get(k) for k in IDENTITY_FIELDS)):
+                raise ValueError('P6 receipt does not bind authenticated job')
+            metadata['result_receipt'] = receipt
+        except (OSError, ValueError):
+            metadata.update(can_download=False, download_unavailable_code='receipt_invalid',
+                            download_unavailable_reason='verified P6 result receipt missing or invalid')
     if job.get("completed_at") is not None:
         metadata["artifact_expires_at"] = job["completed_at"] + retention_hours * 3600
     return metadata
