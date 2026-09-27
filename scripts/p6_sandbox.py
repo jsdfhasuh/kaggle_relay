@@ -53,7 +53,12 @@ def main():
     for path in private.iterdir():
         os.chmod(path, 0o600)
     shutil.copytree(source/'app', context/'app', ignore=shutil.ignore_patterns('__pycache__'))
-    (context/'Dockerfile').write_text('FROM '+image+'\nCOPY app /app/app\nLABEL p6.revision="'+args.revision+'"\n')
+    # Dockerfile FROM interprets sha256:... as a registry name; use an exact local tag.
+    base_tag = 'kaggle-relay-p6-base:'+image.split(':')[1][:16]
+    subprocess.run(['docker', 'tag', image, base_tag], check=True)
+    if command('docker', 'image', 'inspect', base_tag, '--format', '{{.Id}}') != image:
+        raise ValueError('base image identity changed')
+    (context/'Dockerfile').write_text('FROM '+base_tag+'\nCOPY app /app/app\nLABEL p6.revision="'+args.revision+'"\n')
     tag = 'kaggle-relay-p6:'+args.revision[:12]
     subprocess.run(['docker', 'build', '--network=none', '--pull=false', '-t', tag, str(context)], check=True)
     subprocess.run(['docker', 'run', '-d', '--name', 'kaggle-relay-p6', '--restart=no',
