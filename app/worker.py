@@ -462,7 +462,9 @@ def finish_kernel_job(
         receipt.update(job_id=job_id, kernel_ref=kernel_ref, dataset_ref=current['dataset_ref'],
                        kernel_version=output_observation['kernel_version'],
                        source_sha256=output_observation['source_sha256'],
-                       dataset_sources=output_observation['dataset_sources'])
+                       dataset_sources=output_observation['dataset_sources'],
+                       observed_dataset_sources=output_observation['observed_dataset_sources'],
+                       dataset_binding_method=output_observation['dataset_binding_method'])
         from app.upload_intent import write_intent
         write_intent(paths['artifact_zip'].with_suffix('.receipt.json'), receipt)
     db.finalize_job(
