@@ -1,0 +1,19 @@
+{
+  "test_service_state": "exited",
+  "test_image": "sha256:ab344299bda2c6a073170b3173613b9acdf9bf09dcdc096d52f1c74ef1c3da07",
+  "active_test_relay_jobs": 0,
+  "relay_jobs": [
+    [
+      "b1190b1a1a174113a869a920fc14eecf",
+      "failed"
+    ],
+    [
+      "81d2e73cdc0f495192e9435d0fe0db5b",
+      "complete"
+    ]
+  ],
+  "production_image": "sha256:07bfc8f35deb099802edacde3751bbf1cb8551032d4a703ece27fef02f194fe8",
+  "production_revision": "e8255b5665c113f8be74359ef3cbad8369d98049",
+  "production_state": "running",
+  "retained": "test state, all original candidates, images, backup databases and diagnostic model artifacts; no Dataset/Kernel deletion"
+}

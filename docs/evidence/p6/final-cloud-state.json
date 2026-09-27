@@ -1,0 +1,29 @@
+{
+  "kernels": [
+    {
+      "kernel_ref": "jsdfhasuh/relay-003-relay-003-7363866-20260927-153424-dc6ab5",
+      "version": 1,
+      "status": "KernelWorkerStatus.ERROR",
+      "observed_dataset_sources": [
+        "jsdfhasuh/relay-003-anomaly-74126b2a0695"
+      ]
+    },
+    {
+      "kernel_ref": "jsdfhasuh/relay-004-relay-004-06e2845-20260927-161526-ae59fc",
+      "version": 1,
+      "status": "KernelWorkerStatus.COMPLETE",
+      "observed_dataset_sources": [
+        "jsdfhasuh/relay-004-anomaly-74126b2a0695"
+      ]
+    },
+    {
+      "kernel_ref": "jsdfhasuh/direct-003-direct-003-d01a8-20260927-170701-2e0ef8",
+      "version": 1,
+      "status": "KernelWorkerStatus.COMPLETE",
+      "observed_dataset_sources": [
+        "jsdfhasuh/direct-003-anomaly-74126b2a0695"
+      ]
+    }
+  ],
+  "active_test_kernels": 0
+}
