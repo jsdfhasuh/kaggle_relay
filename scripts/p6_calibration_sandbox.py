@@ -13,7 +13,27 @@ def command(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
-def inspect(revision):
+def require_idle_account(database, auth, account_id):
+    """Check all configured aliases of the explicitly selected account."""
+    accounts = auth['kaggle_keys']
+    matches = [row for row in accounts if row['id'] == account_id]
+    if len(matches) != 1 or not matches[0].get('enabled', True):
+        raise ValueError('selected test account is missing or disabled')
+    owner = str(matches[0].get('username', '')).strip().casefold()
+    if not owner:
+        raise ValueError('selected test account has no configured owner')
+    aliases = [row['id'] for row in accounts
+               if str(row.get('username', '')).strip().casefold() == owner]
+    query = ("select count(*) from jobs where kaggle_key_id in ("
+             + ','.join('?' for _ in aliases)
+             + ") and status not in ('complete','failed','canceled')")
+    with sqlite3.connect('file:'+str(database)+'?mode=ro', uri=True) as db:
+        if db.execute(query, aliases).fetchone()[0]:
+            raise ValueError('test account has an active task; defer without canceling it')
+    return owner
+
+
+def inspect(revision, account_id):
     root = Path('/docker_volume/kaggle_relay-p6')
     source, production = root/'source', Path('/docker_volume/kaggle_relay')
     if Path(__file__).resolve().parents[1] != source or root.resolve() != root:
@@ -27,14 +47,20 @@ def inspect(revision):
     state = json.loads(command('docker', 'inspect', 'kaggle-relay-p6', '--format', '{{json .State}}'))
     if state['Status'] != 'exited':
         raise ValueError('sandbox must already be stopped; never interrupt live tasks')
+    auth = json.loads((production/'relay-data/auth.json').read_text())
+    owner = require_idle_account(production/'relay-data/relay.db', auth, account_id)
+    sandbox_auth = json.loads((root/'state/auth.json').read_text())
+    sandbox_owner = require_idle_account(root/'state/relay.db', sandbox_auth, account_id)
+    if owner != sandbox_owner:
+        raise ValueError('sandbox selected owner differs from production account configuration')
     for database, query in [
-        (production/'relay-data/relay.db', "select count(*) from jobs where kaggle_key_id='first' and status not in ('complete','failed','canceled')"),
         (root/'state/relay.db', "select count(*) from jobs where status not in ('complete','failed','canceled')")]:
         with sqlite3.connect('file:'+str(database)+'?mode=ro', uri=True) as db:
             if db.execute(query).fetchone()[0]:
                 raise ValueError('test account or sandbox has an active task; defer without canceling it')
     return root, source, {
-        'revision': revision, 'production_revision': command('git', '-C', str(production), 'rev-parse', 'HEAD'),
+        'revision': revision, 'account_id': account_id, 'configured_owner': owner,
+        'production_revision': command('git', '-C', str(production), 'rev-parse', 'HEAD'),
         'production_dirty': bool(command('git', '-C', str(production), 'status', '--porcelain')),
         'production_image': command('docker', 'inspect', 'kaggle_relay-kaggle-relay-1', '--format', '{{.Image}}'),
         'previous_image': command('docker', 'inspect', 'kaggle-relay-p6', '--format', '{{.Image}}')}
@@ -43,9 +69,10 @@ def inspect(revision):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--revision', required=True)
+    parser.add_argument('--account-id', required=True, help='explicitly authorized test account')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
-    root, source, record = inspect(args.revision)
+    root, source, record = inspect(args.revision, args.account_id)
     if not args.apply:
         print(json.dumps({**record, 'status': 'READY', 'applied': False}))
         return
@@ -66,7 +93,7 @@ def main():
     tag = 'kaggle-relay-p6:'+identifier
     subprocess.run(['docker', 'build', '--network=none', '--pull=false', '-t', tag, str(context)], check=True)
     # Repeat all guards after building; no other task may have started meanwhile.
-    inspect(args.revision)
+    inspect(args.revision, args.account_id)
     previous = 'kaggle-relay-p6-before-'+identifier
     command('docker', 'rename', 'kaggle-relay-p6', previous)
     record.update(previous_container=previous, backup=str(backup), image=command('docker', 'image', 'inspect', tag, '--format', '{{.Id}}'))
