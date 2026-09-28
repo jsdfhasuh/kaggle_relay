@@ -15,3 +15,9 @@ The app's two retained 129×768 model local replays passed new deployment labels
 After authorization, prefer one Relay and one direct task, same original-role 4 train/3 val/2 test sample set and existing Small weights. Reuse the runs for recovery, receipt, registered target validation and fresh-process prediction. Preserve original v1 failed runs and all original artifacts. P6 overall qualification remains pending.
 
 Implementation revisions prepared for review (not deployed): application `cefb7d79f8be5d28821f367c373d446a6c496feb`; Relay `3fe98a1e73185a572cd41a761349f195b3ca238f`. The final app local build preflight used this committed application version.
+
+## Authorized, waiting for idle account
+
+The user subsequently authorized exactly the prepared two-task serial scope and isolated sandbox update/start, conditional on the existing account having no unrelated active task. At 2026-09-28 09:52 +08:00 the application's real credential wrapper verified ACCESS_TOKEN identity `jsdfhasuh` and the unrelated Kernel was still RUNNING. No production job was canceled or changed.
+
+The clean stopped sandbox source was fast-forwarded to authorized `e0147930c4523342c2f4403b400f632133510ff1`; the prior container/image were not rebuilt or started. `python3 scripts/p6_calibration_sandbox.py --revision e0147930c4523342c2f4403b400f632133510ff1` (read-only) exited 1 at the active-account guard before any backup/build/container operation. This is expected safety behavior, not a new calibration failure. Two local acceptance projects are ready, new cloud-task usage is 0/2, and real v2 deployment/reception remains NOT_RUN. The existing authorization remains valid once the account becomes idle.
