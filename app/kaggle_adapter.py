@@ -22,7 +22,7 @@ from app.archive import require_file
 from app.dinov2_artifacts import (ARTIFACT_CONTRACT as DINO_CONTRACT, ARTIFACT_SUBDIR as DINO_SUBDIR,
                                 DOWNLOAD_PATTERN as DINO_PATTERN)
 from app.dinov2_artifacts import package_artifacts as package_dinov2_artifacts
-from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT, DOWNLOAD_PATTERN as DINO251_PATTERN, package_result
+from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT, CONTRACT_V2 as DINO251_V2, CONTRACTS as DINO251_CONTRACTS, DOWNLOAD_PATTERN as DINO251_PATTERN, package_result
 from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
@@ -42,6 +42,7 @@ PATCHCORE_ARTIFACT_FILE_PATTERN = (
 )
 ARTIFACT_FILE_PATTERNS = {
     DINO251_CONTRACT: DINO251_PATTERN,
+    DINO251_V2: DINO251_PATTERN,
     DINO_CONTRACT: DINO_PATTERN,
     "yolo": YOLO_ARTIFACT_FILE_PATTERN,
     "patchcore": PATCHCORE_ARTIFACT_FILE_PATTERN,
@@ -1187,10 +1188,10 @@ class KaggleAdapter:
         expected_identity: dict | None = None,
         expected_task_sha256: str = '',
     ) -> None:
-        if artifact_contract == DINO251_CONTRACT:
+        if artifact_contract in DINO251_CONTRACTS:
             return package_result(output_dir / 'p6_result', artifact_zip,
                                   expected_identity=expected_identity, expected_task_sha256=expected_task_sha256,
-                                  storage_budget=getattr(self.settings, '_storage_budget', None))
+                                  storage_budget=getattr(self.settings, '_storage_budget', None), expected_contract=artifact_contract)
         if artifact_contract == DINO_CONTRACT:
             package_dinov2_artifacts(output_dir / DINO_SUBDIR, artifact_zip, expected_identity=expected_identity,
                                     storage_budget=getattr(self.settings, "_storage_budget", None))

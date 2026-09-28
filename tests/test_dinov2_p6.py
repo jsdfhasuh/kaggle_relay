@@ -41,6 +41,20 @@ def test_partial_failure_pack_and_receipt(result, tmp_path):
     assert receipt['deployment_manifest_sha256'] == ''
 
 
+def test_v2_partial_failure_receipt_and_version_mismatch(result, tmp_path):
+    from app.dinov2_251_artifacts import CONTRACT_V2
+    root, identity, document = result
+    document.update(format='dino_cloud_result_p6_v2', artifact_contract=CONTRACT_V2)
+    (root/'result_manifest.json').write_text(json.dumps(document))
+    receipt = package_result(root, tmp_path/'v2.zip', expected_identity=identity,
+                             expected_task_sha256='d'*64, expected_contract=CONTRACT_V2)
+    assert receipt['format'] == 'dino_p6_verified_receipt_v2' and receipt['onnx_status'] == 'FAIL'
+    with pytest.raises(ValueError):
+        package_result(root, tmp_path/'wrong.zip', expected_identity=identity,
+                       expected_task_sha256='d'*64, expected_contract=CONTRACT)
+    assert not (tmp_path/'wrong.zip').exists()
+
+
 @pytest.mark.parametrize('mutation', ['same_length', 'missing', 'identity', 'task', 'claim_pass', 'duplicate'])
 def test_negative_transport(result, mutation):
     root, identity, document = result
@@ -62,18 +76,19 @@ def test_negative_transport(result, mutation):
         validate_result(root, expected_identity=identity, expected_task_sha256=task_hash)
 
 
-def test_p6_schema_survives_database_reopen(tmp_path):
+@pytest.mark.parametrize("contract", [CONTRACT, "patchcore_dinov2_251_onnx_v2"])
+def test_p6_schema_survives_database_reopen(tmp_path, contract):
     from app.database import RelayDb
     from app.schemas import CreateJobRequest
     from test_relay_api import job_request_body
     values = job_request_body(b'dataset', b'kernel')
-    values.update(artifact_contract=CONTRACT, dataset_id='a'*64, identity_sha256='b'*64,
+    values.update(artifact_contract=contract, dataset_id='a'*64, identity_sha256='b'*64,
                   run_id='run', run_identity_sha256='c'*64)
     request = CreateJobRequest(**values)
     db = RelayDb(tmp_path/'db.sqlite')
-    assert request.artifact_contract == CONTRACT
+    assert request.artifact_contract == contract
     db.create_job({'job_id': 'job-p6', **request.model_dump()})
-    assert RelayDb(tmp_path/'db.sqlite').get_job('job-p6')['artifact_contract'] == CONTRACT
+    assert RelayDb(tmp_path/'db.sqlite').get_job('job-p6')['artifact_contract'] == contract
 
 
 @pytest.mark.parametrize('advance_after_download', [False, True])

@@ -35,7 +35,7 @@ class CreateJobRequest(BaseModel):
     identity_sha256: str = ""
     run_id: str = ""
     run_identity_sha256: str = ""
-    artifact_contract: Literal["", "yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1"] = ""
+    artifact_contract: Literal["", "yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"] = ""
 
     @model_validator(mode="after")
     def validate_frozen_identity(self):
@@ -58,7 +58,7 @@ class CreateJobRequest(BaseModel):
         artifact_contract = str(self.artifact_contract or "").strip().lower()
         if not artifact_contract:
             artifact_contract = "patchcore" if all(values.values()) else "yolo"
-        if artifact_contract in {"patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1"} and not all(values.values()):
+        if artifact_contract in {"patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"} and not all(values.values()):
             raise ValueError(
                 "PatchCore artifact contract requires all frozen identity fields"
             )
@@ -91,7 +91,7 @@ class JobResponse(BaseModel):
     identity_sha256: str = ""
     run_id: str = ""
     run_identity_sha256: str = ""
-    artifact_contract: Literal["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1"] = "yolo"
+    artifact_contract: Literal["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"] = "yolo"
     result_receipt: dict[str, Any] = Field(default_factory=dict)
     callback_enabled: bool = False
     created_at: float
@@ -148,7 +148,7 @@ class HealthResponse(BaseModel):
     version: str
     storage_dir: str
     free_bytes: int
-    artifact_contracts: list[str] = Field(default_factory=lambda: ["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1"])
+    artifact_contracts: list[str] = Field(default_factory=lambda: ["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"])
 
 
 class UiLoginRequest(BaseModel):

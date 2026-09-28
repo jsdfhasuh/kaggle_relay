@@ -10,12 +10,16 @@ import zipfile
 
 CONTRACT = 'patchcore_dinov2_251_onnx_v1'
 FORMAT = 'dino_cloud_result_p6_v1'
+CONTRACT_V2 = 'patchcore_dinov2_251_onnx_v2'
+CONTRACTS = (CONTRACT, CONTRACT_V2)
+FORMATS = {FORMAT: (CONTRACT, 'dino_onnx_deployment_p6_v1', 'dino_cloud_task_p6_v1'),
+           'dino_cloud_result_p6_v2': (CONTRACT_V2, 'dino_onnx_deployment_p6_v2', 'dino_cloud_task_p6_v2')}
 MANIFEST = 'result_manifest.json'
 IDENTITY_FIELDS = ('dataset_id', 'identity_sha256', 'run_id', 'run_identity_sha256')
 TRAINING_FILES = {'training/model.ckpt', 'training/threshold.json', 'training/metrics.json', 'training/runtime_result.json'}
 DEPLOYMENT_FILES = {'deployment/deployment.json', 'deployment/model.onnx', 'deployment/threshold.json',
                     'deployment/verification_report.json', 'deployment/runtime_requirements.txt', 'deployment/README_deployment.md'}
-DOWNLOAD_PATTERN = r'^p6_result[/\\](?:result_manifest\.json|training[/\\](?:model\.ckpt|threshold\.json|metrics\.json|runtime_result\.json)|reports[/\\][a-zA-Z0-9_-]+\.json|validation[/\\](?:reference\.json|reference[/\\][a-zA-Z0-9_-]+\.(?:npz|npy))|deployment[/\\](?:deployment\.json|threshold\.json|verification_report\.json|runtime_requirements\.txt|README_deployment\.md|model\.onnx(?:\.data(?:\.[0-9]+)?)?))$'
+DOWNLOAD_PATTERN = r'^p6_result[/\\](?:result_manifest\.json|training[/\\](?:model\.ckpt|threshold\.json|metrics\.json|runtime_result\.json)|reports[/\\][a-zA-Z0-9_-]+\.json|validation[/\\](?:reference\.json|reference[/\\][a-zA-Z0-9_-]+\.(?:npz|npy))|deployment[/\\](?:deployment\.json|training_candidate_threshold\.json|threshold\.json|verification_report\.json|runtime_requirements\.txt|README_deployment\.md|model\.onnx(?:\.data(?:\.[0-9]+)?)?))$'
 
 
 def sha256(path):
@@ -83,9 +87,11 @@ def inventory(root, rows, max_bytes):
     return {row['path']: row for row in rows}
 
 
-def validate_result(root, *, expected_identity, expected_task_sha256, max_bytes=8*1024**3):
+def validate_result(root, *, expected_identity, expected_task_sha256, max_bytes=8*1024**3, expected_contract=None):
     document = read_json(plain(root, MANIFEST))
-    if (document.get('format') != FORMAT or document.get('artifact_contract') != CONTRACT
+    versions = FORMATS.get(document.get('format'))
+    if (versions is None or document.get('artifact_contract') != versions[0]
+            or (expected_contract is not None and versions[0] != expected_contract)
             or document.get('training_status') != 'PASS' or document.get('windows_status') != 'PENDING'):
         raise ValueError('unsupported P6 result contract')
     if not re.fullmatch('[0-9a-f]{64}', str(expected_task_sha256)):
@@ -126,13 +132,24 @@ def validate_result(root, *, expected_identity, expected_task_sha256, max_bytes=
         if not DEPLOYMENT_FILES <= rows.keys():
             raise ValueError('P6 deployment incomplete')
         deployment = read_json(plain(root, 'deployment/deployment.json'))
-        if (deployment.get('format') != 'dino_onnx_deployment_p6_v1'
+        if (deployment.get('format') != versions[1]
+                or deployment.get('task_contract', {}).get('format') != versions[2]
                 or deployment.get('task_sha256') != expected_task_sha256
                 or canonical_hash(deployment.get('task_contract')) != expected_task_sha256
                 or deployment.get('cloud_qualification') != 'PASS'
                 or deployment.get('windows_qualification') != 'PENDING'):
             raise ValueError('P6 deployment source/qualification mismatch')
         bound = deployment['graph']['files'] + [deployment['threshold_file'], deployment['verification_report']] + deployment['support_files']
+        if versions[0] == CONTRACT_V2:
+            bound += [deployment['training_candidate_file']]
+            calibration = read_json(plain(root, 'deployment/threshold.json'))
+            if (calibration.get('format') != 'dino_onnx_rgb_calibration_p6_v2'
+                    or deployment.get('deployment_calibration_state') != 'FROZEN'
+                    or calibration.get('task_sha256') != expected_task_sha256
+                    or calibration.get('graph_files') != deployment['graph']['files']
+                    or calibration.get('environment', {}).get('scope') != 'linux_cloud'
+                    or calibration.get('threshold') != deployment['threshold']):
+                raise ValueError('P6 v2 deployment calibration binding mismatch')
         for row in bound:
             if rows.get('deployment/'+row['path']) != {**row, 'path': 'deployment/'+row['path']}:
                 raise ValueError('P6 deployment file binding mismatch')
@@ -143,21 +160,24 @@ def validate_result(root, *, expected_identity, expected_task_sha256, max_bytes=
         if reference['graph'] != deployment['graph'] or reference['threshold'] != deployment['threshold']:
             raise ValueError('P6 training reference differs from deployment')
         allowed.add('validation/reference.json')
+        if versions[0] == CONTRACT_V2 and reference.get('deployment_calibration_sha256') != deployment['threshold_file']['sha256']:
+            raise ValueError('P6 v2 deployment reference calibration mismatch')
         for item in reference['items']:
-            row = item['reference']
-            if rows.get('validation/'+row['path']) != {**row, 'path': 'validation/'+row['path']}:
-                raise ValueError('P6 validation reference file mismatch')
-            allowed.add('validation/'+row['path'])
+            for key in (('reference', 'deployment_reference') if versions[0] == CONTRACT_V2 else ('reference',)):
+                row = item[key]
+                if rows.get('validation/'+row['path']) != {**row, 'path': 'validation/'+row['path']}:
+                    raise ValueError('P6 validation reference file mismatch')
+                allowed.add('validation/'+row['path'])
     if set(rows) != allowed or any(not re.fullmatch(DOWNLOAD_PATTERN, 'p6_result/'+name) for name in rows):
         raise ValueError('P6 undeclared/disallowed file')
-    return {'format': 'dino_p6_verified_receipt_v1', 'identity': {k: expected_identity[k] for k in IDENTITY_FIELDS},
+    return {'format': ('dino_p6_verified_receipt_v2' if versions[0] == CONTRACT_V2 else 'dino_p6_verified_receipt_v1'), 'identity': {k: expected_identity[k] for k in IDENTITY_FIELDS},
             'task_sha256': expected_task_sha256, 'result_manifest_sha256': sha256(Path(root)/MANIFEST),
             'file_set_sha256': document['file_set_sha256'], 'deployment_manifest_sha256': deployment_digest,
             'training_status': 'PASS', 'onnx_status': status, 'windows_status': 'PENDING'}
 
 
-def package_result(root, destination, *, expected_identity, expected_task_sha256, storage_budget=None):
-    receipt = validate_result(root, expected_identity=expected_identity, expected_task_sha256=expected_task_sha256)
+def package_result(root, destination, *, expected_identity, expected_task_sha256, storage_budget=None, expected_contract=None):
+    receipt = validate_result(root, expected_identity=expected_identity, expected_task_sha256=expected_task_sha256, expected_contract=expected_contract)
     rows = read_json(Path(root)/MANIFEST)['files']
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)

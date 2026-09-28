@@ -273,7 +273,7 @@ def artifact_download_metadata(job: dict, retention_hours: int = 168) -> dict:
 
     metadata["can_download"] = True
     metadata["artifact_size"] = stat.st_size
-    if job.get('artifact_contract') == 'patchcore_dinov2_251_onnx_v1':
+    if job.get('artifact_contract') in {'patchcore_dinov2_251_onnx_v1', 'patchcore_dinov2_251_onnx_v2'}:
         from app.dinov2_251_artifacts import read_json, IDENTITY_FIELDS
         try:
             receipt = read_json(artifact_path.with_suffix('.receipt.json'))
