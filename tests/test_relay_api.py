@@ -1178,12 +1178,113 @@ def test_chunk_bodies_are_received_concurrently(tmp_path):
             assert [r.status_code for r in responses] == [200] * 4
             current = (await client.get(f"/v1/jobs/{job_id}", headers=auth_headers())).json()
             assert current["accepted_chunks"]["dataset"] == [0, 1, 2, 3]
-            assert current["max_parallel_uploads"] == 4
+            assert current["max_parallel_uploads"] == 8
             assert current["chunk_size"] == 8
             assert current["dataset_archive_sha256"] == app.state.db.get_job(job_id)["dataset_archive_sha256"]
 
     asyncio.run(scenario())
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+@pytest.mark.parametrize("global_limit,user_limit", [(40, 8), (3, 8), (40, 2)])
+def test_upload_limit_shared_across_jobs_and_released(tmp_path, global_limit, user_limit):
+    settings = make_settings(tmp_path)
+    settings.max_parallel_uploads = global_limit
+    settings.max_parallel_uploads_per_user = user_limit
+    app = create_app(settings)
+    jobs = [seed_job(app, "receiving"), seed_job(app, "receiving")]
+    limit = min(global_limit, user_limit)
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        started = 0
+
+        async def body():
+            nonlocal started
+            started += 1
+            if started == limit:
+                entered.set()
+            yield b"1234"
+            await release.wait()
+            yield b"5678"
+
+        headers = auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(), "X-Chunk-Size": "8"})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            pending = [asyncio.create_task(client.put(
+                f"/v1/jobs/{jobs[i % 2]}/archives/dataset/chunks/{i}", headers=headers, content=body(),
+            )) for i in range(limit)]
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                assert app.state.upload_count == limit
+                rejected = await client.put(f"/v1/jobs/{jobs[1]}/archives/dataset/chunks/{limit}",
+                                            headers=headers, content=b"12345678")
+                assert rejected.status_code == 429
+                assert rejected.headers["Retry-After"] == "1"
+                current = (await client.get(f"/v1/jobs/{jobs[0]}", headers=auth_headers())).json()
+                assert current["max_parallel_uploads"] == limit
+            finally:
+                release.set()
+                responses = await asyncio.gather(*pending)
+            assert all(r.status_code == 200 for r in responses)
+            assert app.state.upload_count == 0
+            assert not app.state.user_uploads
+            resumed = await client.put(f"/v1/jobs/{jobs[1]}/archives/dataset/chunks/{limit}",
+                                       headers=headers, content=b"12345678")
+            assert resumed.status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_upload_user_limit_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAY_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setenv("RELAY_MAX_PARALLEL_UPLOADS_PER_USER", "4")
+    assert Settings.from_env().max_parallel_uploads_per_user == 4
+    with pytest.raises(ValueError):
+        Settings(api_token="test", storage_dir=tmp_path, max_parallel_uploads_per_user=0)
+
+
+def test_upload_limits_isolate_users_but_share_global_budget(tmp_path):
+    settings = make_auth_config_settings(tmp_path, multi_key_auth_config())
+    settings.max_parallel_uploads = 9
+    app = create_app(settings)
+    jobs = [seed_job(app, "receiving"), seed_job(app, "receiving")]
+    for job, user, key in zip(jobs, ("user-a", "user-b"), ("ka", "kb")):
+        app.state.db.update_job(job, relay_token_id=user, kaggle_key_id=key)
+
+    async def scenario():
+        ready, release = asyncio.Event(), asyncio.Event()
+        started = 0
+
+        async def body():
+            nonlocal started
+            started += 1
+            if started == 9:
+                ready.set()
+            yield b"1234"
+            await release.wait()
+            yield b"5678"
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            def put(user, index, content):
+                headers = auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(),
+                                        "X-Chunk-Size": "8"}, token=f"user-{'a' if user == 0 else 'b'}-token")
+                return client.put(f"/v1/jobs/{jobs[user]}/archives/dataset/chunks/{index}",
+                                  headers=headers, content=content)
+
+            pending = [asyncio.create_task(put(0, i, body())) for i in range(8)]
+            pending.append(asyncio.create_task(put(1, 0, body())))
+            try:
+                await asyncio.wait_for(ready.wait(), 5)
+                assert app.state.user_uploads == {"user-a": 8, "user-b": 1}
+                assert (await put(1, 1, b"12345678")).status_code == 429
+            finally:
+                release.set()
+                results = await asyncio.gather(*pending)
+            assert all(r.status_code == 200 for r in results)
+            assert app.state.upload_count == 0
+            assert not app.state.user_uploads
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("action,chunk_status", [("cancel", 409), ("delete", 200), ("complete", 200)])

@@ -338,6 +338,7 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
                 **dataset_download_metadata(job, db.path.parent / "jobs"),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
+                "max_parallel_uploads": getattr(db, "max_parallel_uploads_per_user", 8),
             },
             db.accepted_chunks(job_id),
             db.recent_logs(job_id),
@@ -1532,6 +1533,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.db = RelayDb(settings.db_path)
     app.state.db.max_logs_per_job = settings.max_logs_per_job
+    app.state.db.max_parallel_uploads_per_user = min(settings.max_parallel_uploads, settings.max_parallel_uploads_per_user)
     app.state.db.receiving_retention_hours = settings.receiving_retention_hours
     app.state.db.receiving_timeout_hours = settings.receiving_timeout_hours
     app.state.storage_budget = StorageBudget(settings, app.state.db)
@@ -1911,7 +1913,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             chunk_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = chunk_dir / f"{index}.{uuid.uuid4().hex}.tmp"
             state = request.app.state
-            if state.upload_count >= settings.max_parallel_uploads or state.user_uploads.get(principal.id, 0) >= 4:
+            if state.upload_count >= settings.max_parallel_uploads or state.user_uploads.get(principal.id, 0) >= settings.max_parallel_uploads_per_user:
                 raise HTTPException(status_code=429, detail="upload slots are busy; retry this chunk", headers={"Retry-After": "1"})
             try:
                 state.storage_budget.check_free(x_chunk_size)

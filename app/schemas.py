@@ -117,7 +117,7 @@ class JobResponse(BaseModel):
     kernel_size: int = 0
     dataset_archive_sha256: str = ""
     kernel_archive_sha256: str = ""
-    max_parallel_uploads: int = 4
+    max_parallel_uploads: int = 8
     recent_logs: list[str] = []
 
 
