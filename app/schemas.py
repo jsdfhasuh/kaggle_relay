@@ -149,7 +149,8 @@ class HealthResponse(BaseModel):
     storage_dir: str
     free_bytes: int
     artifact_contracts: list[str] = Field(default_factory=lambda: ["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"])
-    training_profiles: list[str] = Field(default_factory=lambda: ['dino_cuda_features_cpu_coreset_v1'])
+    training_profiles: list[str] = Field(default_factory=lambda: [
+        'dino_cuda_features_cpu_coreset_v1', 'dino_cuda_host_torch210_cu128_cpu_coreset_v2'])
 
 
 class UiLoginRequest(BaseModel):

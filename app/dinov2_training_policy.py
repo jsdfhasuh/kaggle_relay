@@ -4,6 +4,8 @@ from app.dinov2_251_artifacts import read_json, plain, CONTRACTS, CONTRACT_V2
 GPU_PROFILE = 'dino_cuda_features_cpu_coreset_v1'
 GPU_POLICY = {'profile': GPU_PROFILE, 'device': 'cuda', 'coreset_device': 'cpu',
               'precision': 'fp32', 'torch_index': 'cu126', 'batch': 1, 'workers': 0}
+HOST_GPU_POLICY = {**GPU_POLICY, 'profile': 'dino_cuda_host_torch210_cu128_cpu_coreset_v2',
+                   'torch_index': 'host_cu128', 'environment': 'verified_host_overlay_v1'}
 
 
 def validate_training_request(kernel_dir, artifact_contract):
@@ -17,7 +19,7 @@ def validate_training_request(kernel_dir, artifact_contract):
     profile = task.get('training_execution')
     if profile is not None:
         if (artifact_contract != CONTRACT_V2 or task.get('format') != 'dino_cloud_task_p6_v2'
-                or profile != GPU_POLICY):
+                or profile not in (GPU_POLICY, HOST_GPU_POLICY)):
             raise ValueError('unsupported DINO training execution policy')
         if enabled is not True:
             raise ValueError('DINO CUDA task requires bound Kernel enable_gpu=true')
