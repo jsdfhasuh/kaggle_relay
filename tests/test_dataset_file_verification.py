@@ -7,6 +7,7 @@ import pytest
 import requests
 
 from app.dataset_file_verification import archive_url_missing, version_file_inventory
+from app.dataset_verification_process import DatasetVerificationError, verification_error
 from app.kaggle_adapter import DatasetUploadReceipt, KaggleAdapterInterrupted, KaggleAdapterError
 from app.payload_contract import RUNTIME_PATH
 from app.upload_intent import content_digest
@@ -246,7 +247,8 @@ def test_publishing_listing_waits_then_hashes_same_version(tmp_path, monkeypatch
             try:
                 return verify(*args)
             except ValueError as exc:
-                raise KaggleAdapterError(f"Kaggle command failed: 1\nKaggle SDK operation failed: {exc}") from exc
+                error = verification_error(exc)
+                raise DatasetVerificationError(error["detail"], error["category"], error["http_status"]) from exc
         adapter.verify_dataset_content = subprocess_error
     waits = []
     def settle(seconds):
@@ -270,12 +272,13 @@ def test_permanent_listing_mismatch_times_out_with_diagnostics(tmp_path, monkeyp
     adapter.settings.dataset_status_permission_grace_seconds = 2
     clock = [0]
     monkeypatch.setattr("app.kaggle_adapter.time.time", lambda: clock[0])
+    monkeypatch.setattr("app.kaggle_adapter.time.monotonic", lambda: clock[0])
     adapter._sleep = lambda _: clock.__setitem__(0, clock[0] + 2)
     receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
     with pytest.raises(KaggleAdapterError, match="payload_publication_timeout") as error:
         adapter.wait_dataset("owner/data", upload_receipt=receipt)
     assert "file.txt" in str(error.value) and "other.txt" in str(error.value)
-    assert len(api.downloads) == 2 and not api.requests and api.uploads == 0
+    assert len(api.downloads) == 1 and not api.requests and api.uploads == 0
     assert not any("bytes verified" in msg for msg in logs)
 
 

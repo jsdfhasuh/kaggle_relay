@@ -150,7 +150,10 @@ def test_created_candidate_visibility_delay_only_retries_readback(tmp_path, monk
     def download(ref, path=None, force=False, quiet=False, unzip=True):
         calls.append(ref)
         if len(calls) == 1:
-            raise RuntimeError("403 Forbidden: not visible yet")
+            import requests
+            response = requests.Response()
+            response.status_code = 403
+            raise requests.HTTPError("not visible yet", response=response)
         return original_download(ref, path=path, force=force, quiet=quiet, unzip=unzip)
     api.dataset_download_files = download
     adapter._sleep = lambda _: None
@@ -575,7 +578,10 @@ def test_exact_content_poll_logs_permission_then_missing_source(tmp_path, monkey
     api, adapter, dataset = fixture_adapter(tmp_path, monkeypatch)
     messages = []
     adapter.log = messages.append
-    errors = iter([RuntimeError("403 Forbidden"), RuntimeError("403 Forbidden"),
+    import requests
+    response = requests.Response()
+    response.status_code = 403
+    errors = iter([requests.HTTPError("Forbidden", response=response), requests.HTTPError("Forbidden", response=response),
                    ValueError("payload_inventory_mismatch: missing=runtime/config.py")])
     def verify(*args):
         raise next(errors)

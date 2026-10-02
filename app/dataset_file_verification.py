@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import time
 from contextlib import closing
 
 from app.payload_contract import upload_content_inventory
@@ -60,7 +61,7 @@ def version_file_inventory(api, target_ref: str, check) -> dict[str, int]:
     return inventory
 
 
-def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir, check, log):
+def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir, check, log, phase=lambda value: None):
     # Use the same SDK request as dataset_download_file, but hash its stream
     # directly. No remote paths or signed URLs are written to disk or logs.
     from kaggle.api.kaggle_api_extended import ApiDownloadDatasetRequest
@@ -69,7 +70,10 @@ def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir
         raise ValueError("payload_version_invalid")
     owner, slug = dataset_ref.split("/")
     target_ref = f"{dataset_ref}/{version_number}"
+    phase("publication")
+    log(f"Dataset version {version_number}: reading exact-version file inventory")
     actual = version_file_inventory(api, target_ref, check)
+    phase("content")
     expected = upload_content_inventory(dataset_dir, actual)
     if set(actual) != set(expected):
         missing, extra = sorted(set(expected) - set(actual)), sorted(set(actual) - set(expected))
@@ -86,6 +90,7 @@ def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir
         }))
     total = sum(actual.values())
     verified_bytes = 0
+    last_report = time.monotonic()
     log(f"Dataset version {version_number}: verifying {len(expected)} files ({total} bytes) individually")
     with api.build_kaggle_client() as service:
         for index, name in enumerate(sorted(expected), 1):
@@ -104,14 +109,21 @@ def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir
                     if received > expected[name][0]:
                         raise ValueError("payload_size_mismatch")
                     digest.update(block)
+                    if time.monotonic() - last_report >= 5:
+                        log(f"Dataset version {version_number}: checking file {index}/{len(expected)}, "
+                            f"received {received}/{expected[name][0]} bytes; {index - 1} files verified")
+                        last_report = time.monotonic()
             if received != expected[name][0]:
                 raise ValueError("payload_size_mismatch")
             if digest.hexdigest() != expected[name][1]:
                 raise ValueError("payload_digest_mismatch")
             verified_bytes += received
-            if index % 100 == 0 or index == len(expected):
+            if index % 100 == 0 or index == len(expected) or time.monotonic() - last_report >= 5:
                 log(f"Dataset version {version_number}: verified {index}/{len(expected)} files, "
                     f"{verified_bytes}/{total} bytes")
+                last_report = time.monotonic()
     # Recheck the complete inventory before accepting the verification result.
+    phase("publication")
+    log(f"Dataset version {version_number}: rechecking final file inventory")
     if version_file_inventory(api, target_ref, check) != actual:
         raise DatasetVersionNotReady("payload_file_listing_changed")
