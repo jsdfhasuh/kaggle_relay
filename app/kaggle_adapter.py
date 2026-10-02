@@ -40,7 +40,9 @@ YOLO_ARTIFACT_FILE_PATTERN = (
 PATCHCORE_ARTIFACT_FILE_PATTERN = (
     r"^(model\.ckpt|deployment_model\.pt|pt_export\.json|threshold\.json|"
     r"anomaly_metrics\.json|environment\.json|heatmap_sample\.png|"
-    r"overlay_sample\.png|training_artifacts\.json)$"
+    r"overlay_sample\.png|training_artifacts\.json|cnn_onnx/result\.json|"
+    r"cnn_onnx/package-[a-f0-9]{32}/(?:model\.onnx(?:\.data)?|deployment\.json|"
+    r"verification\.json|threshold\.json|predict\.py|preprocess\.py|README\.txt))$"
 )
 ARTIFACT_FILE_PATTERNS = {
     DINO251_CONTRACT: DINO251_PATTERN,
@@ -1270,6 +1272,26 @@ class KaggleAdapter:
             )
         for relative_path in required_files:
             require_file(output_dir, relative_path)
+        if artifact_contract == "patchcore" and (output_dir / "cnn_onnx" / "result.json").is_file():
+            from app.cnn_onnx_artifacts import read, source_from_run, validate_package
+            try:
+                source = source_from_run(output_dir / "model.ckpt")
+                if expected_identity and any(source["identity"].get(key) != value for key, value in expected_identity.items()):
+                    raise ValueError("onnx_identity_mismatch")
+                report = read(output_dir / "cnn_onnx" / "result.json")
+                if report.get("status") not in {"PASS", "FAIL", "CANCELLED", "PENDING"}:
+                    raise ValueError("onnx_status_invalid")
+                name = report.get("package", "")
+                if name and not re.fullmatch(r"package-[a-f0-9]{32}", name):
+                    raise ValueError("onnx_package_path_invalid")
+                if report["status"] == "PASS" and not name:
+                    raise ValueError("onnx_package_missing")
+                if name:
+                    document = validate_package(output_dir / "cnn_onnx" / name, source=source)
+                    if document["status"] != report["status"]:
+                        raise ValueError("onnx_status_mismatch")
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise KaggleAdapterError("CNN ONNX artifact validation failed: " + str(exc)) from exc
         artifact_zip.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(artifact_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(output_dir.rglob("*")):
