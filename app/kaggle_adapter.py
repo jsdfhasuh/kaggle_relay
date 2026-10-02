@@ -1,4 +1,5 @@
 import json
+import random
 import inspect
 import math
 import os
@@ -28,7 +29,7 @@ from app.config import Settings
 from app.security import redact_secrets, register_secret
 from app.payload_contract import verify_upload_archive
 from app.dataset_file_verification import archive_url_missing, verify_version_files
-from app.dataset_verification_process import run_verification, verification_error
+from app.dataset_verification_process import DatasetVerificationError, run_verification, verification_error
 from app.upload_intent import content_digest, intent_path, read_intent, write_intent
 
 
@@ -299,6 +300,7 @@ class KaggleAdapter:
         self.dataset_cancel_check: Callable[[], None] | None = None
         self.verification_phase = lambda phase: None
         self._publication_remaining = None
+        self._verification_retry_remaining = None
 
     def _check_interrupted(self) -> None:
         if self.shutdown_event and self.shutdown_event.is_set():
@@ -437,6 +439,7 @@ class KaggleAdapter:
                 self._publication_remaining if self._publication_remaining is not None
                 else self.settings.dataset_status_permission_grace_seconds
             ),
+            "verification_retry_timeout_seconds": self._verification_retry_remaining,
         }
         result = self._run_command(
             [sys.executable, "-m", "app.kaggle_sdk"],
@@ -999,11 +1002,21 @@ class KaggleAdapter:
         source_dir = getattr(upload_receipt, "dataset_dir", "")
         source_digest = getattr(upload_receipt, "content_sha256", "")
         publication_detail = ""
+        transient_attempts = 0
+        retry_deadline = None
         while True:
+            self._check_interrupted()
             status_args = ["datasets", "status", dataset_ref]
             if self.dataset_cancel_check is not None:
                 self.dataset_cancel_check()
             if source_dir:
+                if retry_deadline is not None:
+                    self._verification_retry_remaining = max(0, retry_deadline - time.monotonic())
+                    if self._verification_retry_remaining <= 0:
+                        self._verification_retry_remaining = None
+                        raise DatasetVerificationError(
+                            "dataset_verification_retry_exhausted: original candidate retained; " + publication_detail,
+                            "transport")
                 self._publication_remaining = max(0, publication_grace - (time.monotonic() - publication_start))
                 if self._publication_remaining <= 0:
                     self._publication_remaining = None
@@ -1015,6 +1028,7 @@ class KaggleAdapter:
                     finally:
                         publication_start += self._verification_content_seconds
                         self._publication_remaining = None
+                        self._verification_retry_remaining = None
                 except Exception as exc:
                     detail = redact_secrets(str(exc))
                     publication_detail = detail[-1200:]
@@ -1032,12 +1046,34 @@ class KaggleAdapter:
                         report("permission", f"Dataset exact candidate is not yet accessible (HTTP {error['http_status']}): " + detail[-500:])
                         if visibility_grace <= 0 or elapsed > visibility_grace:
                             raise
-                    elif error["category"] == "http" and error["http_status"] in {409, 429, 503}:
-                        report("transient", f"Dataset exact candidate temporarily unavailable (HTTP {error['http_status']}): " + detail[-500:])
-                        if elapsed > 30 * 60:
-                            raise
+                    elif (error["category"] == "transport" or
+                          error["category"] == "http" and error["http_status"] in {408, 409, 429, 500, 502, 503, 504}):
+                        if retry_deadline is None:
+                            retry_deadline = time.monotonic() + 600
+                        transient_attempts += 1
+                        remaining = min(retry_deadline - time.monotonic(), publication_grace - elapsed)
+                        delay = max(error.get("retry_after") or 0,
+                                    min(60, 5 * 2 ** min(transient_attempts - 1, 4)) + random.uniform(0, 3))
+                        if transient_attempts > 5 or delay >= remaining:
+                            raise DatasetVerificationError(
+                                "dataset_verification_retry_exhausted: original candidate retained; " + detail[-1200:],
+                                "transport") from exc
+                        reason = f"HTTP {error['http_status']}" if error["http_status"] else "network"
+                        self.log(f"Dataset verification retry {transient_attempts}/5 in {delay:.0f}s ({reason}); "
+                                 f"original version {expected_version_number} retained; " + detail[-500:])
+                        # Keep cancellation responsive during Retry-After and backoff.
+                        wake_at = time.monotonic() + delay
+                        while time.monotonic() < wake_at:
+                            self._check_interrupted()
+                            if self.dataset_cancel_check is not None:
+                                self.dataset_cancel_check()
+                            self._sleep(min(1, max(0, wake_at - time.monotonic())))
+                        continue
                     else:
-                        report("content_mismatch", "Dataset exact candidate content rejected: " + detail[-500:])
+                        if error["category"] == "integrity":
+                            report("content_mismatch", "Dataset exact candidate content rejected: " + detail[-500:])
+                        else:
+                            report("verification_stopped", "Dataset exact candidate verification stopped: " + detail[-500:])
                         raise
                     self._sleep(min(self.settings.dataset_poll_seconds, max(0, publication_grace - elapsed)))
                     continue

@@ -4,12 +4,13 @@ import json
 import os
 import sys
 from dataclasses import asdict, is_dataclass
+from contextlib import nullcontext
 from pathlib import Path
 
 from app.config import Settings
 from app.kaggle_adapter import KaggleAdapter
 from app.security import redact_secrets, register_secret
-from app.dataset_verification_process import verification_error
+from app.dataset_verification_process import verification_error, verification_request_timeouts
 
 
 def main() -> int:
@@ -37,7 +38,8 @@ def main() -> int:
         arguments = payload["arguments"]
         if operation == "upload_dataset":
             arguments["dataset_dir"] = Path(arguments["dataset_dir"])
-        result = getattr(adapter, operation)(**arguments)
+        with verification_request_timeouts() if operation == "verify_dataset_content" else nullcontext():
+            result = getattr(adapter, operation)(**arguments)
         if is_dataclass(result):
             result = asdict(result)
         print("RELAY_SDK_RESULT=" + json.dumps(result), flush=True)
