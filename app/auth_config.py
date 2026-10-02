@@ -153,7 +153,13 @@ class AuthStore:
             raise AuthConfigError("RELAY_AUTH_CONFIG must be a JSON object")
 
         kaggle_keys = cls._parse_kaggle_keys(data.get("kaggle_keys"))
-        relay_tokens = cls._parse_relay_tokens(data.get("relay_tokens"), set(kaggle_keys))
+        relay_tokens = cls._parse_relay_tokens(data.get("relay_tokens"), set(kaggle_keys), allow_empty=bool(admin_token))
+        retired = data.get("retired_relay_token_ids", [])
+        if not isinstance(retired, list) or any(not isinstance(value, str) or not value.strip() for value in retired):
+            raise AuthConfigError("retired_relay_token_ids must be a list of non-empty strings")
+        retired_ids = {value.strip() for value in retired}
+        if any(token_id in retired_ids for token_id, _token, _allowed in relay_tokens):
+            raise AuthConfigError("retired relay token ids cannot be reused")
         for item in data["relay_tokens"]:
             if type(item.get("can_view_keys", False)) is not bool:
                 raise AuthConfigError("can_view_keys must be a boolean")
@@ -205,8 +211,9 @@ class AuthStore:
     def _parse_relay_tokens(
         raw: Any,
         known_kaggle_key_ids: set[str],
+        allow_empty: bool = False,
     ) -> list[tuple[str, str, frozenset[str] | None]]:
-        if not isinstance(raw, list) or not raw:
+        if not isinstance(raw, list) or (not raw and not allow_empty):
             raise AuthConfigError("RELAY_AUTH_CONFIG requires a non-empty relay_tokens list")
         seen_ids: set[str] = set()
         seen_tokens: set[str] = set()

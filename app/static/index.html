@@ -739,6 +739,7 @@
             </label>
             <label class="search-field">
               搜索任务
+              <span id="ownerFilterLabel" hidden></span><button id="clearOwnerFilter" type="button" class="light" hidden>清除用户筛选</button>
               <input id="jobSearch" type="search" maxlength="200" placeholder="任务 ID、数据集、训练名称、账号或失败原因" />
             </label>
             <label>
@@ -803,9 +804,10 @@
         <div class="management-column">
           <section class="panel">
             <div class="panel-header">
-              <h2>用户与 Token</h2>
+              <h2 id="usersTitle">用户与 Token</h2>
             </div>
             <div class="panel-body">
+              <div id="userActionMessage" class="message" role="status"></div>
               <div id="authConfig" class="summary-list">加载中...</div>
             </div>
           </section>
@@ -924,6 +926,9 @@
     let autoRefresh = true;
     let timer = null;
     let authConfigCache = null;
+    let jobOwnerFilter = null;
+    let tokenDisplayVersion = 0;
+    let tokenHideTimer = null;
     let jobsCache = [];
     let selectedJobId = "";
     let selectedJobPinned = false;
@@ -985,7 +990,7 @@
     }
 
     function normalizePage(page) {
-      if (keyViewAllowed === false && ["accounts", "users"].includes(page)) return "runtime";
+      if (keyViewAllowed === false && page === "accounts") return "runtime";
       return ["runtime", "accounts", "users"].includes(page) ? page : "runtime";
     }
 
@@ -995,6 +1000,7 @@
     }
 
     function setActivePage(page, options = {}) {
+      clearRevealedToken();
       activePage = normalizePage(page);
       document.querySelectorAll(".page").forEach((pageElement) => {
         pageElement.hidden = pageElement.dataset.page !== activePage;
@@ -1241,6 +1247,7 @@
         }
       });
       if (response.status === 401) {
+        clearRevealedToken();
         window.location.href = "/login";
         throw new Error("unauthorized");
       }
@@ -1250,7 +1257,9 @@
           const data = JSON.parse(detail);
           detail = data.detail || detail;
         } catch (_) {}
-        throw new Error(`${response.status} ${detail}`);
+        const error = new Error(`${response.status} ${typeof detail === "object" ? detail.message : detail}`);
+        error.detail = detail;
+        throw error;
       }
 
       const contentType = response.headers.get("content-type") || "";
@@ -1261,14 +1270,14 @@
     function applySessionPermissions(session) {
       keyViewAllowed = !!session.can_view_keys;
       document.querySelectorAll("[data-page-nav]").forEach((button) => {
-        button.hidden = !keyViewAllowed && ["accounts", "users"].includes(button.dataset.pageNav);
+        button.hidden = !keyViewAllowed && button.dataset.pageNav === "accounts";
+        if (button.dataset.pageNav === "users") button.textContent = session.can_manage_auth ? "用户与 Token" : "我的 Token";
       });
+      qs("usersTitle").textContent = session.can_manage_auth ? "用户与 Token" : "我的 Token";
+      qs("adminTools").hidden = !session.can_manage_auth;
       if (!keyViewAllowed) {
-        authConfigCache = null;
-        qs("authConfig").innerHTML = "未授予查看 Key 权限";
-        qs("accountsStatus").innerHTML = "未授予查看账号列表权限";
-        qs("adminTools").hidden = true;
-        if (["accounts", "users"].includes(activePage)) setActivePage("runtime");
+        qs("accountsStatus").textContent = "未授予查看账号列表权限";
+        if (activePage === "accounts") setActivePage("runtime");
       }
     }
 
@@ -1300,6 +1309,7 @@
       else if (status !== "all") params.set("status", status);
       const search = qs("jobSearch").value.trim();
       if (search) params.set("q", search);
+      if (jobOwnerFilter !== null) params.set("owner", jobOwnerFilter);
       return params;
     }
 
@@ -1430,6 +1440,7 @@
     }
 
     function renderAuthConfig(data) {
+      clearRevealedToken();
       authConfigCache = data;
       const relayTokens = data.relay_tokens || [];
       const kaggleKeys = data.kaggle_keys || [];
@@ -1442,22 +1453,27 @@
           </div>
           <div class="muted">模式：${escapeHtml(data.mode)}</div>
           <div class="muted">Principal：${escapeHtml(data.principal_id || "-")}</div>
-          <div class="muted">允许 Key：${escapeHtml(formatAllowed(data.allowed_kaggle_key_ids))}</div>
+          ${data.can_view_keys ? `<div class="muted">允许 Key：${escapeHtml(formatAllowed(data.allowed_kaggle_key_ids))}</div>` : ""}
         </div>
         <div class="summary-row">
-          <div class="summary-title"><span>Relay Principals</span><span class="pill neutral">${relayTokens.length}</span></div>
+          <div class="summary-title"><span>${data.can_manage_auth ? "用户列表" : "我的凭据"}</span><span class="pill neutral">${relayTokens.length}</span></div>
           ${relayTokens.map((token) => `
             <div class="muted">
               <strong>${escapeHtml(token.id)}</strong>
               ${token.current ? '<span class="pill ok">当前</span>' : ""}
               ${token.management ? '<span class="pill warn">管理密钥</span>' : ""}
-              <br />允许：${escapeHtml(formatAllowed(token.allowed_kaggle_key_ids))}
-              <br />查看 Key：${token.can_view_keys ? "允许" : "未授予"}
+              ${data.can_view_keys ? `<br />允许：${escapeHtml(formatAllowed(token.allowed_kaggle_key_ids))}<br />查看 Key：${token.can_view_keys ? "允许" : "未授予"}` : ""}
               ${data.can_manage_auth && !token.management ? `<button class="light" type="button" data-toggle-key-view="${escapeHtml(token.id)}" data-key-view="${token.can_view_keys ? "false" : "true"}">${token.can_view_keys ? "撤销查看 Key" : "授予查看 Key"}</button>` : ""}
+              ${!token.management && data.mode !== "legacy" ? `
+                <button class="light" type="button" data-reveal-token="${escapeHtml(token.id)}">查看 Token</button>
+                <button class="light" type="button" data-copy-token="${escapeHtml(token.id)}">复制 Token</button>
+                ${data.can_manage_auth ? `<button class="light" type="button" data-delete-user="${escapeHtml(token.id)}">删除用户</button>` : ""}
+              ` : ""}
+
             </div>
           `).join("") || '<div class="muted">无</div>'}
         </div>
-        <div class="summary-row">
+        <div class="summary-row" ${data.can_view_keys ? "" : "hidden"}>
           <div class="summary-title"><span>Kaggle Keys</span><span class="pill neutral">${kaggleKeys.length}</span></div>
           ${kaggleKeys.map((key) => `
             <div class="muted">
@@ -1475,6 +1491,11 @@
         </div>
       `;
 
+      const secretBox = document.createElement("div");
+      secretBox.id = "revealedTokenBox";
+      secretBox.hidden = true;
+      secretBox.innerHTML = '<label>Relay Token（60 秒后自动隐藏）<input id="revealedTokenValue" type="text" readonly autocomplete="off" spellcheck="false" /></label><button class="light" type="button" data-hide-token>隐藏 Token</button>';
+      qs("authConfig").appendChild(secretBox);
       const select = qs("accountKeySelect");
       select.innerHTML = kaggleKeys.filter((key) => key.enabled !== false).map((key) => {
         const label = `${key.id || "legacy"}${key.username ? " (" + key.username + ")" : ""}`;
@@ -1860,13 +1881,14 @@
         qs("relayTokenForm").reset();
         qs("newRelayAllowedKeys").disabled = false;
         qs("newRelayToken").type = "password";
-        formMessage("relayTokenMessage", "用户已保存；请记录刚才填写的 token，后端不会再次显示");
+        formMessage("relayTokenMessage", "用户已保存；管理员和用户本人可在此页面查看、复制 Token");
       } catch (error) {
         formMessage("relayTokenMessage", error.message || String(error), true);
       }
     }
 
     async function logout() {
+      clearRevealedToken();
       await fetch("/v1/ui/logout", {
         method: "POST",
         credentials: "same-origin"
@@ -1899,7 +1921,92 @@
       }
     }
 
+    function clearRevealedToken() {
+      ++tokenDisplayVersion;
+      clearTimeout(tokenHideTimer);
+      tokenHideTimer = null;
+      const input = document.getElementById("revealedTokenValue");
+      const box = document.getElementById("revealedTokenBox");
+      if (input) input.value = "";
+      if (box) box.hidden = true;
+    }
+
+    async function revealUserToken(id, copy = false) {
+      clearRevealedToken();
+      const version = tokenDisplayVersion;
+      formMessage("userActionMessage", "");
+      try {
+        const data = await api(`/v1/auth/relay-tokens/${encodeURIComponent(id)}/reveal`, {method: "POST", cache: "no-store"});
+        if (version !== tokenDisplayVersion || activePage !== "users") return;
+        const input = qs("revealedTokenValue");
+        input.value = data.token;
+        data.token = "";
+        qs("revealedTokenBox").hidden = false;
+        tokenHideTimer = setTimeout(clearRevealedToken, 60000);
+        if (copy) {
+          try {
+            await navigator.clipboard.writeText(input.value);
+            if (version === tokenDisplayVersion) formMessage("userActionMessage", "Token 已复制");
+          } catch (_) {
+            if (version !== tokenDisplayVersion) return;
+            input.focus();
+            input.select();
+            formMessage("userActionMessage", "自动复制失败，请在下方手动复制 Token", true);
+          }
+        }
+      } catch (_) {
+        if (version === tokenDisplayVersion) formMessage("userActionMessage", "无法读取 Token，请刷新页面后重试", true);
+      }
+    }
+
+    async function deleteRelayUser(id) {
+      clearRevealedToken();
+      if (!confirm(`删除用户「${id}」？\n凭据和登录会话将失效，历史任务与结果保留，用户 ID 不可复用。`)) return;
+      try {
+        await api(`/v1/auth/relay-tokens/${encodeURIComponent(id)}`, {method: "DELETE"});
+        await loadAuthConfig();
+        formMessage("userActionMessage", `用户「${id}」已删除`);
+      } catch (error) {
+        if (error.detail?.code === "user_has_active_jobs") {
+          formMessage("userActionMessage", `用户还有 ${error.detail.active_job_count} 个未结束任务，暂时不能删除。`, true);
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "light";
+          button.textContent = "查看该用户任务";
+          button.dataset.userJobs = id;
+          qs("userActionMessage").appendChild(button);
+        } else formMessage("userActionMessage", error.message || "删除失败", true);
+      }
+    }
+
+    function filterUserJobs(id) {
+      jobOwnerFilter = id;
+      qs("ownerFilterLabel").textContent = id === null ? "" : `用户：${id}`;
+      qs("ownerFilterLabel").hidden = id === null;
+      qs("clearOwnerFilter").hidden = id === null;
+      qs("jobSearch").value = "";
+      qs("statusSelect").value = "all";
+      setActivePage("runtime");
+      return loadRuntimeData();
+    }
+
     document.addEventListener("click", (event) => {
+      const reveal = event.target.closest("[data-reveal-token], [data-copy-token]");
+      if (reveal) {
+        revealUserToken(reveal.dataset.revealToken ?? reveal.dataset.copyToken, reveal.dataset.copyToken !== undefined);
+        return;
+      }
+      if (event.target.closest("[data-hide-token]")) { clearRevealedToken(); return; }
+      const deletion = event.target.closest("[data-delete-user]");
+      if (deletion && !deletion.disabled) {
+        deletion.disabled = true;
+        deleteRelayUser(deletion.dataset.deleteUser).finally(() => { deletion.disabled = false; });
+        return;
+      }
+      const jobs = event.target.closest("[data-user-jobs]");
+      if (jobs) { filterUserJobs(jobs.dataset.userJobs).catch(console.error); return; }
+      if (event.target.closest("#clearOwnerFilter")) { filterUserJobs(null).catch(console.error); return; }
+
       const keyViewButton = event.target.closest("[data-toggle-key-view]");
       if (keyViewButton && !keyViewButton.disabled) {
         keyViewButton.disabled = true;
@@ -1962,6 +2069,7 @@
         loadAll().catch(console.error);
       });
     });
+    window.addEventListener("pagehide", clearRevealedToken);
     window.addEventListener("hashchange", () => {
       setActivePage(pageFromHash(), {updateHash: false});
       loadAll().catch(console.error);

@@ -146,6 +146,7 @@ async def require_auth(
     settings: Settings = Depends(get_settings),
     auth_store: AuthStore = Depends(get_auth_store),
 ) -> RelayPrincipal:
+    auth_store = request.app.state.auth_store
     token = bearer_token(authorization)
     if token:
         limiter = request.app.state.auth_failure_limiter
@@ -167,6 +168,17 @@ async def require_auth(
             raise HTTPException(status_code=403, detail="same-origin request required")
         return principal
     raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def current_request_principal(request: Request) -> RelayPrincipal:
+    """Recheck credentials under the caller's mutation lock, after admission waits."""
+    store = request.app.state.auth_store
+    token = bearer_token(request.headers.get("authorization", ""))
+    principal = (store.authenticate_token(token) if token else
+                 authenticate_ui_session(request, request.app.state.settings, store))
+    if principal is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return principal
 
 
 def selection_error(exc: AuthSelectionError) -> HTTPException:
@@ -707,7 +719,6 @@ def validate_and_write_auth_config(path: Path, data: dict, admin_token: str = ""
         os.chmod(tmp_path, 0o600)
         new_store = AuthStore.from_file(tmp_path, admin_token=admin_token)
         os.replace(tmp_path, path)
-        os.chmod(path, 0o600)
         return new_store
     except AuthConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -826,6 +837,8 @@ def add_relay_token_config(settings: Settings, principal: RelayPrincipal, payloa
 
     with AUTH_CONFIG_LOCK:
         data = read_auth_config(path)
+        if token_id in data.get("retired_relay_token_ids", []):
+            raise HTTPException(status_code=409, detail="retired relay token id cannot be reused")
         if any(str(item.get("id", "")).strip() == token_id for item in data["relay_tokens"] if isinstance(item, dict)):
             raise HTTPException(status_code=409, detail="relay token id already exists")
         if any(str(item.get("token", "")).strip() == token for item in data["relay_tokens"] if isinstance(item, dict)):
@@ -1686,8 +1699,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = add_kaggle_key_config(settings, principal, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            new_store = add_kaggle_key_config(settings, principal, payload)
+            request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
 
     @app.patch("/v1/auth/kaggle-keys/{kaggle_key_id}")
@@ -1699,7 +1714,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        with request.app.state.storage_budget.lock:
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
             new_store = update_kaggle_key_config(settings, principal, kaggle_key_id, payload)
             request.app.state.auth_store = new_store
         request.app.state.scheduler_event.set()
@@ -1713,8 +1729,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = add_relay_token_config(settings, principal, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            new_store = add_relay_token_config(settings, principal, payload)
+            request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
 
     @app.patch("/v1/auth/relay-tokens/{token_id}")
@@ -1725,9 +1743,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings: Settings = Depends(get_settings),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = update_relay_token_permissions(settings, principal, token_id, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            new_store = update_relay_token_permissions(settings, principal, token_id, payload)
+            request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
+
+    @app.post("/v1/auth/relay-tokens/{token_id}/reveal")
+    def reveal_relay_token(
+        token_id: str, request: Request,
+        _principal: RelayPrincipal = Depends(require_auth),
+    ) -> Response:
+        with AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            if not principal.management_admin and principal.id != token_id:
+                raise HTTPException(status_code=403, detail="cannot view another user's token")
+            store = request.app.state.auth_store
+            target = next(((value, owner) for value, owner in store._tokens if owner.id == token_id), None)
+            if target is None:
+                raise HTTPException(status_code=404, detail="relay token id not found")
+            value, owner = target
+            if owner.management_admin or owner.legacy:
+                raise HTTPException(status_code=403, detail="management and legacy credentials cannot be revealed")
+            return JSONResponse({"id": token_id, "token": value}, headers={"Cache-Control": "no-store"})
+
+    @app.delete("/v1/auth/relay-tokens/{token_id}", status_code=204)
+    def delete_relay_token(
+        token_id: str, request: Request,
+        settings: Settings = Depends(get_settings), db: RelayDb = Depends(get_db),
+        _principal: RelayPrincipal = Depends(require_auth),
+    ) -> Response:
+        # The admission lock precedes the config lock everywhere they are combined.
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            path = require_config_admin(settings, principal)
+            target = next((owner for _, owner in request.app.state.auth_store._tokens if owner.id == token_id), None)
+            if target is None:
+                raise HTTPException(status_code=404, detail="relay token id not found")
+            if target.management_admin or target.legacy:
+                raise HTTPException(status_code=403, detail="management credentials cannot be deleted")
+            counts = db.job_status_counts(relay_token_id=token_id)
+            active_count = sum(count for status, count in counts.items() if status not in TERMINAL_JOB_STATUSES)
+            if active_count:
+                raise HTTPException(status_code=409, detail={
+                    "code": "user_has_active_jobs", "active_job_count": active_count,
+                    "message": "用户还有未结束任务，暂时不能删除",
+                })
+            data = read_auth_config(path)
+            data["relay_tokens"] = [item for item in data["relay_tokens"] if str(item.get("id", "")).strip() != token_id]
+            data["retired_relay_token_ids"] = sorted(set(data.get("retired_relay_token_ids", [])) | {token_id})
+            request.app.state.auth_store = validate_and_write_auth_config(path, data, settings.admin_token)
+        return Response(status_code=204)
 
     @app.get("/v1/kaggle/account")
     def kaggle_account(
@@ -1797,6 +1863,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=413, detail="archive has too many chunks; use a larger chunk size")
         budget = request.app.state.storage_budget
         with budget.lock:
+            principal = current_request_principal(request)
+            if request.app.state.auth_store is not auth_store:
+                raise HTTPException(status_code=409, detail="auth configuration changed; retry job creation")
             kaggle_key_id = least_loaded_key(db, auth_store, candidates)
             credentials = auth_store.credentials_for(kaggle_key_id)
             dataset_ref, kernel_ref = final_job_refs(
@@ -1844,12 +1913,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         active: bool = Query(default=False),
         status: list[str] | None = Query(default=None),
         q: str = Query(default="", max_length=200),
+        owner: str | None = Query(default=None),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> list[JobResponse]:
         key_filter = None if principal.allow_all_keys else set(auth_store.allowed_key_ids(principal))
         owner_filter = None if auth_store.legacy or principal.allow_all_keys else principal.id
+        if owner is not None:
+            if not principal.management_admin:
+                raise HTTPException(status_code=403, detail="admin permission is required")
+            owner_filter = owner
         status_filter = status_filter_for_list(status, active)
         jobs = db.list_jobs(
             kaggle_key_ids=key_filter,
