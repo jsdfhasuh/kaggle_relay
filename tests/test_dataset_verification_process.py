@@ -128,6 +128,38 @@ def test_content_deadline_is_also_enforced(tmp_path):
                   publication=3, content=.3)
 
 
+def test_retry_deadline_also_bounds_content_phase(tmp_path):
+    adapter = KaggleAdapter(Settings(api_token="", storage_dir=tmp_path), lambda _: None)
+    payload = json.dumps({"operation": "verify_dataset_content", "publication_timeout_seconds": 20,
+                          "transfer_timeout_seconds": 20, "verification_retry_timeout_seconds": .3})
+    code = 'import time; print(\'RELAY_VERIFY_EVENT={"phase":"content"}\',flush=True); time.sleep(30)'
+    with pytest.raises(DatasetVerificationError, match="retry_exhausted"):
+        adapter._run_command([sys.executable, "-u", "-c", code], input_text=payload)
+
+
+def test_real_child_preserves_transport_and_retry_after(tmp_path):
+    adapter = KaggleAdapter(Settings(api_token="", storage_dir=tmp_path), lambda _: None)
+    code = '''
+import requests
+from app.kaggle_adapter import KaggleAdapter
+from app.kaggle_sdk import main
+def verify(self, **kwargs):
+    response = requests.Response()
+    response.status_code = 429
+    response.headers['Retry-After'] = '75'
+    raise requests.HTTPError('rate limited', response=response)
+KaggleAdapter.verify_dataset_content = verify
+raise SystemExit(main())
+'''
+    payload = {"operation": "verify_dataset_content", "arguments": {}, "storage_dir": str(tmp_path),
+               "kaggle_cmd": "kaggle", "command_timeout_seconds": 5, "transfer_timeout_seconds": 5,
+               "publication_timeout_seconds": 5}
+    with pytest.raises(DatasetVerificationError) as error:
+        adapter._run_command([sys.executable, "-u", "-c", code], input_text=json.dumps(payload))
+    assert error.value.category == "http" and error.value.http_status == 429
+    assert error.value.retry_after == 75
+
+
 def test_wait_forwards_file_verification_progress(tmp_path, monkeypatch):
     api, adapter, dataset, logs = fallback_fixture(tmp_path, monkeypatch)
     adapter.wait_dataset("owner/data", upload_receipt=DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset)))

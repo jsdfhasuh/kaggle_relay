@@ -6,6 +6,7 @@ from typing import Callable
 
 from app.archive import ArchiveError, require_file
 from app.database import RelayDb
+from app.dataset_verification_process import DatasetVerificationError
 from app.dinov2_artifacts import ARTIFACT_CONTRACT as DINO_CONTRACT, IDENTITY_FIELDS
 from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT, CONTRACT_V2 as DINO251_V2, CONTRACTS as DINO251_CONTRACTS
 from app.auth_config import AuthStore
@@ -690,6 +691,9 @@ def process_job(
                 intent = None
             integrity_failure = any(code in str(exc) for code in (
                 "payload_", "identity rejected", "intent_scope_or_content_mismatch", "frozen content changed"))
+            if isinstance(exc, DatasetVerificationError):
+                integrity_failure = exc.category == "integrity" or (
+                    exc.category == "fatal" and integrity_failure)
             if intent and (intent["state"] == "unknown" or
                            (intent["state"] == "accepted" and not integrity_failure)):
                 message = "dataset_upload_outcome_unknown: original candidate retained; " + redact_secrets(str(exc))
