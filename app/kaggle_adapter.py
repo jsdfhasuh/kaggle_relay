@@ -27,6 +27,7 @@ from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
 from app.payload_contract import verify_upload_archive
+from app.dataset_file_verification import archive_url_missing, verify_version_files
 from app.upload_intent import content_digest, intent_path, read_intent, write_intent
 
 
@@ -356,7 +357,8 @@ class KaggleAdapter:
             check_space=transfer,
         )
 
-    def _run_command(self, cmd, *, cwd=None, check=True, timeout=None, input_text=None, check_space=False):
+    def _run_command(self, cmd, *, cwd=None, check=True, timeout=None, input_text=None, check_space=False,
+                     cancel_check=None):
         self._check_interrupted()
         env = self._env()
         budget = getattr(self.settings, "_storage_budget", None) if check_space else None
@@ -368,9 +370,9 @@ class KaggleAdapter:
         with tempfile.TemporaryDirectory(prefix="relay-kaggle-config-") as config_dir:
             if self.credentials and not self.credentials.config_dir:
                 env["KAGGLE_CONFIG_DIR"] = config_dir
-            return self._communicate(cmd, env, cwd, check, timeout, input_text, budget)
+            return self._communicate(cmd, env, cwd, check, timeout, input_text, budget, cancel_check)
 
-    def _communicate(self, cmd, env, cwd, check, timeout, input_text, budget=None):
+    def _communicate(self, cmd, env, cwd, check, timeout, input_text, budget=None, cancel_check=None):
         sdk_result = input_text is not None
         process_group = os.name == "posix" and not self._sdk_in_process
         process = subprocess.Popen(
@@ -397,6 +399,8 @@ class KaggleAdapter:
                 except subprocess.TimeoutExpired:
                     input_text = None
                     self._check_interrupted()
+                    if cancel_check is not None:
+                        cancel_check()
                     if budget:
                         budget.check_free()
                     if time.monotonic() >= deadline:
@@ -432,6 +436,7 @@ class KaggleAdapter:
                      else self.settings.command_timeout_seconds),
             input_text=json.dumps(payload),
             check_space=operation in {"p6_download", "upload_dataset", "verify_dataset_content", "probe_username_write_access"},
+            cancel_check=self.dataset_cancel_check if operation == "verify_dataset_content" else None,
         )
         for line in reversed(result.stdout.splitlines()):
             if line.startswith("RELAY_SDK_RESULT="):
@@ -894,6 +899,8 @@ class KaggleAdapter:
         if not self._sdk_in_process:
             return self._sdk_call("verify_dataset_content", dataset_ref=dataset_ref, version_number=version_number,
                                   dataset_dir=str(dataset_dir), content_sha256=content_sha256)
+        if type(version_number) is not int or version_number <= 0:
+            raise KaggleAdapterError("Dataset exact version must be a positive integer")
         if content_digest(dataset_dir) != content_sha256:
             raise KaggleAdapterError("Dataset frozen content changed")
         with self._temporary_kaggle_env():
@@ -904,12 +911,24 @@ class KaggleAdapter:
             if not identity["identity_verified"]:
                 raise KaggleAdapterError("Kaggle owner identity rejected")
             with tempfile.TemporaryDirectory(prefix="relay-version-check-") as directory:
-                api.dataset_download_files(f"{dataset_ref}/{version_number}", path=directory,
-                                           force=True, quiet=True, unzip=False)
-                paths = list(Path(directory).iterdir())
-                if len(paths) != 1 or not paths[0].is_file() or paths[0].is_symlink():
-                    raise KaggleAdapterError("Dataset version archive missing")
-                verify_upload_archive(dataset_dir, paths[0])
+                try:
+                    api.dataset_download_files(f"{dataset_ref}/{version_number}", path=directory,
+                                               force=True, quiet=True, unzip=False)
+                except Exception as exc:
+                    if not archive_url_missing(exc):
+                        raise
+                    self.log(f"Dataset version {version_number}: archive URL unavailable; "
+                             "checking exact-version file contents")
+                    def check():
+                        self._check_interrupted()
+                        if self.dataset_cancel_check is not None:
+                            self.dataset_cancel_check()
+                    verify_version_files(api, dataset_ref, version_number, dataset_dir, check, self.log)
+                else:
+                    paths = list(Path(directory).iterdir())
+                    if len(paths) != 1 or not paths[0].is_file() or paths[0].is_symlink():
+                        raise KaggleAdapterError("Dataset version archive missing")
+                    verify_upload_archive(dataset_dir, paths[0])
                 if content_digest(dataset_dir) != content_sha256:
                     raise KaggleAdapterError("Dataset frozen content changed during verification")
         return True

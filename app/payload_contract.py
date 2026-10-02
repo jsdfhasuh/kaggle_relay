@@ -1,6 +1,6 @@
 """Byte verification for Kaggle's preserved and expanded payload layouts.
 
-Kept identical in the Relay repository; no Kaggle SDK or application imports.
+Shared layout rules for archive and individual-file checks; no Kaggle SDK imports.
 """
 import hashlib
 import io
@@ -62,27 +62,53 @@ def verify_payload_archive(payload_path, downloaded_path):
                 if file_digest(stream) != file_digest(original):
                     raise ValueError("payload_digest_mismatch")
             return
-        with zipfile.ZipFile(payload_path) as original:
-            members = zip_members(original)
-            expected = _archive_inventory(original, members)
-            for runtime_path, max_files in ((RUNTIME_PATH, 32), ("model_source/p6_runtime/runtime.zip", 128)):
-                if runtime_path in members and runtime_path not in actual:
-                    runtime = members[runtime_path]
-                    if runtime.file_size > MAX_RUNTIME_BYTES:
-                        raise ValueError("runtime_expansion_limit")
-                    with zipfile.ZipFile(io.BytesIO(original.read(runtime))) as package:
-                        sources = zip_members(package)
-                        if len(sources) > max_files or sum(i.file_size for i in sources.values()) > MAX_RUNTIME_BYTES:
-                            raise ValueError("runtime_expansion_limit")
-                        expanded = _archive_inventory(package, sources)
-                    del expected[runtime_path]
-                    prefix = runtime_path[:-4] + "/"
-                    for name, value in expanded.items():
-                        target = prefix + name
-                        if target in expected:
-                            raise ValueError("payload_path_conflict")
-                        expected[target] = value
+        expected = _expanded_payload_inventory(payload_path, actual)
         _verify_inventory(remote, actual, expected)
+
+
+def _expanded_payload_inventory(payload_path, actual_names):
+    with zipfile.ZipFile(payload_path) as original:
+        members = zip_members(original)
+        expected = _archive_inventory(original, members)
+        for runtime_path, max_files in ((RUNTIME_PATH, 32), ("model_source/p6_runtime/runtime.zip", 128)):
+            if runtime_path in members and runtime_path not in actual_names:
+                runtime = members[runtime_path]
+                if runtime.file_size > MAX_RUNTIME_BYTES:
+                    raise ValueError("runtime_expansion_limit")
+                with zipfile.ZipFile(io.BytesIO(original.read(runtime))) as package:
+                    sources = zip_members(package)
+                    if len(sources) > max_files or sum(i.file_size for i in sources.values()) > MAX_RUNTIME_BYTES:
+                        raise ValueError("runtime_expansion_limit")
+                    expanded = _archive_inventory(package, sources)
+                del expected[runtime_path]
+                prefix = runtime_path[:-4] + "/"
+                for name, value in expanded.items():
+                    target = prefix + name
+                    if target in expected:
+                        raise ValueError("payload_path_conflict")
+                    expected[target] = value
+    return expected
+
+
+def upload_content_inventory(dataset_dir, actual_names):
+    """Expected sizes and SHA-256 values for the existing accepted layouts."""
+    root = Path(dataset_dir)
+    payload = root / "payload.zip"
+    if payload.is_symlink() or root.is_symlink():
+        raise ValueError("payload_unsafe_member")
+    if payload.is_file():
+        if "payload.zip" in actual_names:
+            with payload.open("rb") as stream:
+                return {"payload.zip": (payload.stat().st_size, file_digest(stream))}
+        return _expanded_payload_inventory(payload, actual_names)
+    expected = {}
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("payload_unsafe_member")
+        if path.is_file() and path.name != "dataset-metadata.json":
+            with path.open("rb") as stream:
+                expected[path.relative_to(root).as_posix()] = (path.stat().st_size, file_digest(stream))
+    return expected
 
 
 def _verify_inventory(remote, actual, expected):
