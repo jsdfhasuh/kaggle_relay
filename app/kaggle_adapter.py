@@ -957,6 +957,7 @@ class KaggleAdapter:
             finally:
                 self.log = original_log
         visibility_grace = max(0, int(permission_grace_seconds or 0))
+        publication_grace = max(visibility_grace, self.settings.dataset_status_permission_grace_seconds)
         expected_version_number = getattr(
             upload_receipt,
             "expected_version_number",
@@ -980,7 +981,15 @@ class KaggleAdapter:
                 except Exception as exc:
                     detail = redact_secrets(str(exc))
                     elapsed = time.time() - start
-                    if any(code in detail.lower() for code in ("403", "404", "forbidden", "not found")):
+                    if "dataset_version_not_ready: " in detail:
+                        report("publishing", f"Dataset exact version {expected_version_number} is still publishing; "
+                               "waiting before full verification: " + detail[-1200:])
+                        if elapsed >= publication_grace:
+                            raise KaggleAdapterError(
+                                f"Dataset exact version {expected_version_number} publication verification timed out "
+                                f"after {publication_grace}s; payload_publication_timeout: " + detail[-1200:]
+                            ) from exc
+                    elif any(code in detail.lower() for code in ("403", "404", "forbidden", "not found")):
                         report("permission", "Dataset exact candidate is not yet accessible: " + detail[-500:])
                         if visibility_grace <= 0 or elapsed > visibility_grace:
                             raise

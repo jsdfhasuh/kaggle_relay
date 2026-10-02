@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from app.dataset_file_verification import archive_url_missing, version_file_inventory
-from app.kaggle_adapter import DatasetUploadReceipt, KaggleAdapterInterrupted
+from app.kaggle_adapter import DatasetUploadReceipt, KaggleAdapterInterrupted, KaggleAdapterError
 from app.payload_contract import RUNTIME_PATH
 from app.upload_intent import content_digest
 from test_a3_content_identity import fixture_adapter, zip_bytes
@@ -220,6 +220,94 @@ def test_wait_uses_fallback_without_new_upload(tmp_path, monkeypatch):
     receipt = DatasetUploadReceipt(7, (("file.txt", 8),), str(dataset), content_digest(dataset))
     assert '"current_version_number": 7' in adapter.wait_dataset("owner/data", upload_receipt=receipt)
     assert api.uploads == api.status_calls == 0
+
+
+@pytest.mark.parametrize("pending", ["missing", "extra", "size", "empty", "changed"])
+@pytest.mark.parametrize("sdk_boundary", [False, True])
+def test_publishing_listing_waits_then_hashes_same_version(tmp_path, monkeypatch, pending, sdk_boundary):
+    api, adapter, dataset, logs = fallback_fixture(tmp_path, monkeypatch)
+    if pending == "missing":
+        api.files = {"other.txt": b"original"}
+    elif pending == "extra":
+        api.files["extra.txt"] = b"x"
+    elif pending == "size":
+        api.files["file.txt"] = b"short"
+    else:
+        def change(result):
+            if pending == "empty":
+                result.files = []
+            elif api.list_calls == 2:
+                result.files.append(SimpleNamespace(name="extra.txt", total_bytes=1))
+            return result
+        api.list_hook = change
+    verify = adapter.verify_dataset_content
+    if sdk_boundary:
+        def subprocess_error(*args):
+            try:
+                return verify(*args)
+            except ValueError as exc:
+                raise KaggleAdapterError(f"Kaggle command failed: 1\nKaggle SDK operation failed: {exc}") from exc
+        adapter.verify_dataset_content = subprocess_error
+    waits = []
+    def settle(seconds):
+        waits.append(seconds)
+        api.files = {"file.txt": b"original"}
+        api.list_hook = None
+    adapter._sleep = settle
+    receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
+    assert '"current_version_number": 7' in adapter.wait_dataset("owner/data", upload_receipt=receipt)
+    assert len(waits) == 1
+    assert api.downloads == ["owner/data/7"] * 2
+    assert all(r["dataset_version_number"] == 7 for r in api.requests)
+    assert api.requests[-1]["file_name"] == "file.txt"
+    assert api.uploads == api.status_calls == 0
+    assert any("still publishing" in msg for msg in logs)
+
+
+def test_permanent_listing_mismatch_times_out_with_diagnostics(tmp_path, monkeypatch):
+    api, adapter, dataset, logs = fallback_fixture(tmp_path, monkeypatch)
+    api.files = {"other.txt": b"original"}
+    adapter.settings.dataset_status_permission_grace_seconds = 2
+    clock = [0]
+    monkeypatch.setattr("app.kaggle_adapter.time.time", lambda: clock[0])
+    adapter._sleep = lambda _: clock.__setitem__(0, clock[0] + 2)
+    receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
+    with pytest.raises(KaggleAdapterError, match="payload_publication_timeout") as error:
+        adapter.wait_dataset("owner/data", upload_receipt=receipt)
+    assert "file.txt" in str(error.value) and "other.txt" in str(error.value)
+    assert len(api.downloads) == 2 and not api.requests and api.uploads == 0
+    assert not any("bytes verified" in msg for msg in logs)
+
+
+@pytest.mark.parametrize("failure", ["digest", "unsafe", "stream_size"])
+def test_hard_integrity_failure_does_not_enter_publication_wait(tmp_path, monkeypatch, failure):
+    api, adapter, dataset, _ = fallback_fixture(tmp_path, monkeypatch)
+    if failure == "digest":
+        api.files["file.txt"] = b"tampered"
+    elif failure == "unsafe":
+        api.files = {"../file.txt": b"original"}
+    else:
+        api.stream_hook = lambda: setattr(api.streams[-1], "data", b"short")
+    adapter._sleep = lambda _: pytest.fail("integrity failures must not wait")
+    receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
+    with pytest.raises(ValueError, match="payload_"):
+        adapter.wait_dataset("owner/data", upload_receipt=receipt)
+    assert len(api.downloads) == 1 and api.uploads == 0
+
+
+def test_publication_wait_remains_cancellable(tmp_path, monkeypatch):
+    api, adapter, dataset, _ = fallback_fixture(tmp_path, monkeypatch)
+    api.files = {"other.txt": b"original"}
+    cancelled = [False]
+    def check():
+        if cancelled[0]:
+            raise KaggleAdapterInterrupted("cancelled")
+    adapter.dataset_cancel_check = check
+    adapter._sleep = lambda _: cancelled.__setitem__(0, True)
+    receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
+    with pytest.raises(KaggleAdapterInterrupted):
+        adapter.wait_dataset("owner/data", upload_receipt=receipt)
+    assert len(api.downloads) == 1 and api.uploads == 0
 
 
 def test_sdk_process_cancel_is_checked_while_waiting_for_files(tmp_path, monkeypatch):

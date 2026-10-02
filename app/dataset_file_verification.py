@@ -1,9 +1,17 @@
 """Verify an immutable Dataset version when Kaggle cannot serve its ZIP."""
 
 import hashlib
+import json
 from contextlib import closing
 
 from app.payload_contract import upload_content_inventory
+
+
+class DatasetVersionNotReady(ValueError):
+    """The exact version's listing may still be publishing; never authorizes use."""
+
+    def __init__(self, detail):
+        super().__init__("dataset_version_not_ready: " + detail)
 
 
 def archive_url_missing(exc: Exception) -> bool:
@@ -48,7 +56,7 @@ def version_file_inventory(api, target_ref: str, check) -> dict[str, int]:
             raise ValueError("payload_file_listing_pagination_loop")
         tokens.add(token)
     if not inventory:
-        raise ValueError("payload_file_listing_empty")
+        raise DatasetVersionNotReady("payload_file_listing_empty")
     return inventory
 
 
@@ -64,9 +72,18 @@ def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir
     actual = version_file_inventory(api, target_ref, check)
     expected = upload_content_inventory(dataset_dir, actual)
     if set(actual) != set(expected):
-        raise ValueError("payload_inventory_mismatch")
-    if any(actual[name] != value[0] for name, value in expected.items()):
-        raise ValueError("payload_size_mismatch")
+        missing, extra = sorted(set(expected) - set(actual)), sorted(set(actual) - set(expected))
+        raise DatasetVersionNotReady("payload_inventory_mismatch " + json.dumps({
+            "version": version_number, "expected_files": len(expected), "actual_files": len(actual),
+            "missing_count": len(missing), "unexpected_count": len(extra),
+            "missing_sample": missing[:3], "unexpected_sample": extra[:3],
+        }))
+    wrong_sizes = [name for name, value in expected.items() if actual[name] != value[0]]
+    if wrong_sizes:
+        raise DatasetVersionNotReady("payload_size_mismatch " + json.dumps({
+            "version": version_number, "count": len(wrong_sizes),
+            "sample": [(name, expected[name][0], actual[name]) for name in sorted(wrong_sizes)[:3]],
+        }))
     total = sum(actual.values())
     verified_bytes = 0
     log(f"Dataset version {version_number}: verifying {len(expected)} files ({total} bytes) individually")
@@ -97,4 +114,4 @@ def verify_version_files(api, dataset_ref: str, version_number: int, dataset_dir
                     f"{verified_bytes}/{total} bytes")
     # Recheck the complete inventory before accepting the verification result.
     if version_file_inventory(api, target_ref, check) != actual:
-        raise ValueError("payload_file_listing_changed")
+        raise DatasetVersionNotReady("payload_file_listing_changed")
