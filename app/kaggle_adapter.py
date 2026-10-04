@@ -75,6 +75,30 @@ class KaggleAdapterInterrupted(RuntimeError):
     pass
 
 
+class KernelStatusUnavailable(KaggleAdapterError):
+    """The submitted Kernel has no authoritative terminal observation yet."""
+
+
+class KernelStatusQueryError(KernelStatusUnavailable):
+    def __init__(self, message: str, *, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
+
+
+def transient_kernel_query_output(output: str) -> bool:
+    text = output.lower()
+    if any(word in text for word in ("unauthorized", "forbidden", "not found", "sslerror",
+                                     "certificate_verify_failed", "permission denied")):
+        return False
+    if re.search(r"\b(?:401|403|404)\b", text):
+        return False
+    return any(word in text for word in (
+        "connecttimeouterror", "readtimeouterror", "connectionerror", "newconnectionerror",
+        "connectionreseterror", "remotedisconnected", "nameresolutionerror",
+        "connection to api.kaggle.com timed out", "temporary failure in name resolution",
+    )) or bool(re.search(r"\b(?:408|429|500|502|503|504)\s+(?:client|server)\s+error\b", text))
+
+
 class DatasetUploadUnknown(KaggleAdapterError):
     """The durable candidate must be reconciled, never uploaded again."""
 
@@ -1203,18 +1227,50 @@ class KaggleAdapter:
         return self._run(["kernels", "push", "-p", str(kernel_dir)]).stdout
 
     def kernel_status(self, kernel_ref: str) -> str:
-        result = self._run(["kernels", "status", kernel_ref], check=False)
+        try:
+            result = self._run(["kernels", "status", kernel_ref], check=False)
+        except TimeoutError as exc:
+            raise KernelStatusQueryError("Kernel status query timed out", transient=True) from exc
         output = result.stdout.strip() or f"returncode={result.returncode}"
         if result.returncode != 0:
-            raise KaggleAdapterError(f"Kernel status failed:\n{output}")
+            raise KernelStatusQueryError(
+                f"Kernel status failed:\n{output}", transient=transient_kernel_query_output(output),
+            )
         return output
 
     def wait_kernel(self, kernel_ref: str, progress_callback: Callable[[dict], None]) -> str:
-        start = time.time()
+        deadline = time.monotonic() + self.settings.kernel_max_wait_seconds
         last_progress_key = None
+        query_failures = 0
+        output = "Kernel terminal status has not been observed"
         while True:
-            output = self.kernel_status(kernel_ref)
-            logs = self._run(["kernels", "logs", kernel_ref], check=False).stdout
+            self._check_interrupted()
+            if time.monotonic() >= deadline:
+                raise KernelStatusUnavailable(f"Kernel monitoring deadline exceeded; retained original run:\n{output}")
+            try:
+                output = self.kernel_status(kernel_ref)
+            except KernelStatusQueryError as exc:
+                if not exc.transient:
+                    raise
+                query_failures += 1
+                remaining = max(0, deadline - time.monotonic())
+                if not remaining:
+                    raise KernelStatusUnavailable(str(exc)) from exc
+                delay = min(60, 5 * 2 ** min(query_failures - 1, 4), remaining)
+                self.log(f"Kernel status temporarily unavailable; retry {query_failures} in {delay:.0f}s: "
+                         + redact_secrets(str(exc)))
+                self._sleep(delay)
+                continue
+            if query_failures:
+                self.log("Kernel status query recovered; continuing original run")
+                query_failures = 0
+            # Logs are supplementary; a log-fetch error is not a training failure.
+            try:
+                log_result = self._run(["kernels", "logs", kernel_ref], check=False)
+                logs = log_result.stdout if log_result.returncode == 0 else ""
+            except TimeoutError:
+                self.log("Kernel log query timed out; preserving last training progress")
+                logs = ""
             progress_events = parse_training_progress_logs(logs)
             if progress_events:
                 progress = progress_events[-1]
@@ -1227,9 +1283,7 @@ class KaggleAdapter:
                 return output
             if any(word in status_text for word in ["error", "failed", "failure", "cancel"]):
                 raise KaggleAdapterError(f"Kernel failed:\n{output}")
-            if time.time() - start > self.settings.kernel_max_wait_seconds:
-                raise TimeoutError(f"Kernel wait timed out:\n{output}")
-            self._sleep(self.settings.kernel_poll_seconds)
+            self._sleep(min(self.settings.kernel_poll_seconds, max(0, deadline - time.monotonic())))
 
     def download_output(
         self,

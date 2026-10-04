@@ -52,6 +52,56 @@ def make_settings(tmp_path: Path, worker_count: int = 1) -> Settings:
     )
 
 
+@pytest.mark.parametrize("cancel_requested", [False, True])
+def test_kernel_query_unknown_is_nonterminal_and_resumes_without_submission(tmp_path, monkeypatch, cancel_requested):
+    from app.kaggle_adapter import KernelStatusUnavailable
+    from app.main import mark_worker_exception
+
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    calls = []
+
+    class FakeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def require_identity(self, _owner):
+            return {"identity_verified": True}
+
+        def wait_kernel(self, kernel_ref, _callback):
+            calls.append(kernel_ref)
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+    with TestClient(app) as client:
+        job_id = seed_job(app, "cancel_requested" if cancel_requested else "waiting_kernel", progress=79)
+        if cancel_requested:
+            app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="user canceled")
+        mark_worker_exception(app.state.db, job_id, KernelStatusUnavailable("connect timeout"))
+        retained = app.state.db.get_job(job_id)
+        assert retained["status"] == ("cancel_requested" if cancel_requested else "waiting_kernel")
+        assert retained["progress"] == 79
+        assert retained["completed_at"] is None
+        assert retained["error"].startswith("kernel_status_unknown:")
+        response = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        assert response.status_code == 200
+        final = wait_for_status(client, job_id, {"canceled" if cancel_requested else "complete"})
+        assert final["can_download"] is True
+        assert final["error"] == ""
+        assert len(app.state.db.list_jobs()) == 1
+    assert calls == ["demo/kernel"]
+
+
 def make_auth_config_settings(tmp_path: Path, config: dict) -> Settings:
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(json.dumps(config), encoding="utf-8")
@@ -1956,7 +2006,7 @@ def test_wait_kernel_keeps_patchcore_terminal_failure_event(tmp_path, monkeypatc
     monkeypatch.setattr(
         adapter,
         "_run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=next(log_outputs)),
     )
     monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
     callbacks = []
@@ -1999,7 +2049,7 @@ def test_wait_kernel_keeps_yolo_epoch_deduplication(tmp_path, monkeypatch):
     monkeypatch.setattr(
         adapter,
         "_run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=next(log_outputs)),
     )
     monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
     callbacks = []
@@ -2043,7 +2093,7 @@ def test_wait_kernel_coalesces_patchcore_history_to_latest_event(tmp_path, monke
     monkeypatch.setattr(
         adapter,
         "_run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=next(log_outputs)),
     )
     monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
     callbacks = []

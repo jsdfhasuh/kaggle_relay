@@ -16,6 +16,7 @@ from app.kaggle_adapter import (
     DatasetUploadReceipt,
     KaggleAdapter,
     KaggleAdapterInterrupted,
+    KernelStatusUnavailable,
     is_ready_kaggle_status,
     parse_kaggle_dataset_status,
 )
@@ -418,12 +419,19 @@ def finish_kernel_job(
         "waiting_kernel",
         lambda job: {
             "progress": max(float(job.get("progress") or 0), 60),
+            "error": "",
         },
     )
     kernel_ref = str(current.get("kernel_ref") or "")
     if not kernel_ref:
         raise RuntimeError(f"job {job_id} is missing kernel_ref")
-    kernel_status = adapter.wait_kernel(kernel_ref, progress_callback)
+    try:
+        kernel_status = adapter.wait_kernel(kernel_ref, progress_callback)
+    except KernelStatusUnavailable as exc:
+        current = latest_job()
+        if str(current.get("status")) not in TERMINAL_JOB_STATUSES:
+            db.update_job(job_id, error="kernel_status_unknown: " + redact_secrets(str(exc)))
+        raise
     current = latest_job()
     db.update_job(job_id, kernel_status=kernel_status, progress=max(float(current.get("progress") or 0), 82))
 
@@ -676,6 +684,8 @@ def process_job(
             push_output = adapter.push_kernel(kernel_dir)
             log(push_output)
         finish_kernel_job(settings, db, job_id, adapter)
+    except KernelStatusUnavailable as exc:
+        db.append_log(job_id, "kernel_status_unknown: " + redact_secrets(str(exc)))
     except KaggleAdapterInterrupted as exc:
         db.append_log(job_id, redact_secrets(str(exc)))
     except JobCanceled as exc:

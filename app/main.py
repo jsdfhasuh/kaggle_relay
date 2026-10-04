@@ -34,7 +34,7 @@ from app.capacity import CapacityError, StorageBudget
 from app.quota_cache import QuotaCache
 from app.scheduler import awaiting_assignment, eligible_accounts, scheduler_loop
 from app.database import RelayDb
-from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted
+from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted, KernelStatusUnavailable
 from app.upload_intent import intent_path, read_intent
 from app.schemas import (
     ChunkResponse,
@@ -1259,6 +1259,12 @@ async def upload_body(request: Request, idle_seconds: int):
 
 def mark_worker_exception(db: RelayDb, job_id: str, exc: Exception) -> None:
     message = redact_secrets(str(exc))
+    if isinstance(exc, KernelStatusUnavailable):
+        job = db.get_job(job_id)
+        if job and job.get("status") not in TERMINAL_JOB_STATUSES:
+            db.update_job(job_id, error="kernel_status_unknown: " + message)
+        db.append_log(job_id, "kernel_status_unknown: " + message)
+        return
     db.append_log(job_id, f"worker action failed: {message}")
     job = db.get_job(job_id)
     if job and job.get("status") not in TERMINAL_JOB_STATUSES:
@@ -2068,6 +2074,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
             reject_expired_upload(db, job)
+            if (job["status"] in {"waiting_kernel", "cancel_requested"}
+                    and str(job.get("error", "")).startswith("kernel_status_unknown:")):
+                if job_id not in request.app.state.active_job_ids:
+                    db.update_job(job_id, error="")
+                    request.app.state.queue.put_nowait({
+                        "action": "resume_kernel", "job_id": job_id,
+                        "final_status": "canceled" if job.get("cancel_requested_at") else None,
+                    })
+                return job_response(db, job_id, settings.retention_hours)
             if (job["status"] == "waiting_dataset"
                     and str(job.get("error", "")).startswith("dataset_upload_outcome_unknown:")):
                 dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
