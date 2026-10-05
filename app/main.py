@@ -34,7 +34,8 @@ from app.capacity import CapacityError, StorageBudget
 from app.quota_cache import QuotaCache
 from app.scheduler import awaiting_assignment, eligible_accounts, scheduler_loop
 from app.database import RelayDb
-from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted
+from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted, KernelStatusUnavailable
+from app.upload_intent import intent_path, read_intent
 from app.schemas import (
     ChunkResponse,
     CreateKaggleKeyRequest,
@@ -145,6 +146,7 @@ async def require_auth(
     settings: Settings = Depends(get_settings),
     auth_store: AuthStore = Depends(get_auth_store),
 ) -> RelayPrincipal:
+    auth_store = request.app.state.auth_store
     token = bearer_token(authorization)
     if token:
         limiter = request.app.state.auth_failure_limiter
@@ -166,6 +168,17 @@ async def require_auth(
             raise HTTPException(status_code=403, detail="same-origin request required")
         return principal
     raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def current_request_principal(request: Request) -> RelayPrincipal:
+    """Recheck credentials under the caller's mutation lock, after admission waits."""
+    store = request.app.state.auth_store
+    token = bearer_token(request.headers.get("authorization", ""))
+    principal = (store.authenticate_token(token) if token else
+                 authenticate_ui_session(request, request.app.state.settings, store))
+    if principal is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return principal
 
 
 def selection_error(exc: AuthSelectionError) -> HTTPException:
@@ -272,6 +285,17 @@ def artifact_download_metadata(job: dict, retention_hours: int = 168) -> dict:
 
     metadata["can_download"] = True
     metadata["artifact_size"] = stat.st_size
+    if job.get('artifact_contract') in {'patchcore_dinov2_251_onnx_v1', 'patchcore_dinov2_251_onnx_v2'}:
+        from app.dinov2_251_artifacts import read_json, IDENTITY_FIELDS
+        try:
+            receipt = read_json(artifact_path.with_suffix('.receipt.json'))
+            if (receipt.get('job_id') != job['job_id'] or receipt.get('archive_size') != stat.st_size
+                    or any(receipt.get('identity', {}).get(k) != job.get(k) for k in IDENTITY_FIELDS)):
+                raise ValueError('P6 receipt does not bind authenticated job')
+            metadata['result_receipt'] = receipt
+        except (OSError, ValueError):
+            metadata.update(can_download=False, download_unavailable_code='receipt_invalid',
+                            download_unavailable_reason='verified P6 result receipt missing or invalid')
     if job.get("completed_at") is not None:
         metadata["artifact_expires_at"] = job["completed_at"] + retention_hours * 3600
     return metadata
@@ -326,6 +350,7 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
                 **dataset_download_metadata(job, db.path.parent / "jobs"),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
+                "max_parallel_uploads": getattr(db, "max_parallel_uploads_per_user", 8),
             },
             db.accepted_chunks(job_id),
             db.recent_logs(job_id),
@@ -495,16 +520,27 @@ def quota_key_candidates(
 
     lookups = {}
     cache = getattr(settings, "_quota_cache", None)
+
+    def verified_quota(adapter, owner):
+        adapter.require_identity(owner)
+        return {**adapter.quota(), "identity_verified": True}
+
     if cache:
         for key_id in key_ids:
             credentials = auth_store.credentials_for(key_id)
             adapter = KaggleAdapter(settings, lambda _message: None, credentials=credentials)
-            lookups[key_id] = cache.submit((credentials, settings.kaggle_cmd), adapter.quota)
+            lookups[key_id] = cache.submit(
+                ("verified_identity", credentials, settings.kaggle_cmd),
+                lambda adapter=adapter, owner=credentials.username: verified_quota(adapter, owner))
     for key_id in key_ids:
         try:
             credentials = auth_store.credentials_for(key_id)
             quota = (lookups[key_id].result() if cache else
-                     KaggleAdapter(settings, lambda _message: None, credentials=credentials).quota())
+                     verified_quota(KaggleAdapter(settings, lambda _message: None, credentials=credentials),
+                                    credentials.username))
+            if not quota.get("identity_verified"):
+                unavailable.append(f"{key_id}: owner identity unverified")
+                continue
             remaining = quota_remaining_hours(quota)
         except Exception as exc:
             unavailable.append(f"{key_id}: {redact_secrets(str(exc))[-300:]}")
@@ -683,7 +719,6 @@ def validate_and_write_auth_config(path: Path, data: dict, admin_token: str = ""
         os.chmod(tmp_path, 0o600)
         new_store = AuthStore.from_file(tmp_path, admin_token=admin_token)
         os.replace(tmp_path, path)
-        os.chmod(path, 0o600)
         return new_store
     except AuthConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -802,6 +837,8 @@ def add_relay_token_config(settings: Settings, principal: RelayPrincipal, payloa
 
     with AUTH_CONFIG_LOCK:
         data = read_auth_config(path)
+        if token_id in data.get("retired_relay_token_ids", []):
+            raise HTTPException(status_code=409, detail="retired relay token id cannot be reused")
         if any(str(item.get("id", "")).strip() == token_id for item in data["relay_tokens"] if isinstance(item, dict)):
             raise HTTPException(status_code=409, detail="relay token id already exists")
         if any(str(item.get("token", "")).strip() == token for item in data["relay_tokens"] if isinstance(item, dict)):
@@ -1136,6 +1173,18 @@ def recover_job_after_restart(
         return {"action": "resume_kernel", "job_id": job_id}
 
     if status in {"uploading_dataset", "waiting_dataset"}:
+        dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
+        try:
+            intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+        except (OSError, ValueError) as exc:
+            fail_recovered_job(db, job_id, f"upload intent invalid; original record retained: {exc}")
+            return None
+        if intent and intent["state"] in {"unknown", "accepted"}:
+            append_internal_log(db, job_id, "restart recovery: verify original Dataset candidate without reupload")
+            if not db.update_job_if_status(job_id, {status}, require_not_canceled=True,
+                                           status="queued", error=""):
+                return None
+            return {"action": "process", "job_id": job_id}
         fail_recovered_job(
             db,
             job_id,
@@ -1210,6 +1259,12 @@ async def upload_body(request: Request, idle_seconds: int):
 
 def mark_worker_exception(db: RelayDb, job_id: str, exc: Exception) -> None:
     message = redact_secrets(str(exc))
+    if isinstance(exc, KernelStatusUnavailable):
+        job = db.get_job(job_id)
+        if job and job.get("status") not in TERMINAL_JOB_STATUSES:
+            db.update_job(job_id, error="kernel_status_unknown: " + message)
+        db.append_log(job_id, "kernel_status_unknown: " + message)
+        return
     db.append_log(job_id, f"worker action failed: {message}")
     job = db.get_job(job_id)
     if job and job.get("status") not in TERMINAL_JOB_STATUSES:
@@ -1497,6 +1552,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.db = RelayDb(settings.db_path)
     app.state.db.max_logs_per_job = settings.max_logs_per_job
+    app.state.db.max_parallel_uploads_per_user = min(settings.max_parallel_uploads, settings.max_parallel_uploads_per_user)
     app.state.db.receiving_retention_hours = settings.receiving_retention_hours
     app.state.db.receiving_timeout_hours = settings.receiving_timeout_hours
     app.state.storage_budget = StorageBudget(settings, app.state.db)
@@ -1649,8 +1705,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = add_kaggle_key_config(settings, principal, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            new_store = add_kaggle_key_config(settings, principal, payload)
+            request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
 
     @app.patch("/v1/auth/kaggle-keys/{kaggle_key_id}")
@@ -1662,7 +1720,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        with request.app.state.storage_budget.lock:
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
             new_store = update_kaggle_key_config(settings, principal, kaggle_key_id, payload)
             request.app.state.auth_store = new_store
         request.app.state.scheduler_event.set()
@@ -1676,8 +1735,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = add_relay_token_config(settings, principal, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            new_store = add_relay_token_config(settings, principal, payload)
+            request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
 
     @app.patch("/v1/auth/relay-tokens/{token_id}")
@@ -1688,9 +1749,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings: Settings = Depends(get_settings),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> dict:
-        new_store = update_relay_token_permissions(settings, principal, token_id, payload)
-        request.app.state.auth_store = new_store
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            new_store = update_relay_token_permissions(settings, principal, token_id, payload)
+            request.app.state.auth_store = new_store
         return auth_config_summary(new_store, principal)
+
+    @app.post("/v1/auth/relay-tokens/{token_id}/reveal")
+    def reveal_relay_token(
+        token_id: str, request: Request,
+        _principal: RelayPrincipal = Depends(require_auth),
+    ) -> Response:
+        with AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            if not principal.management_admin and principal.id != token_id:
+                raise HTTPException(status_code=403, detail="cannot view another user's token")
+            store = request.app.state.auth_store
+            target = next(((value, owner) for value, owner in store._tokens if owner.id == token_id), None)
+            if target is None:
+                raise HTTPException(status_code=404, detail="relay token id not found")
+            value, owner = target
+            if owner.management_admin or owner.legacy:
+                raise HTTPException(status_code=403, detail="management and legacy credentials cannot be revealed")
+            return JSONResponse({"id": token_id, "token": value}, headers={"Cache-Control": "no-store"})
+
+    @app.delete("/v1/auth/relay-tokens/{token_id}", status_code=204)
+    def delete_relay_token(
+        token_id: str, request: Request,
+        settings: Settings = Depends(get_settings), db: RelayDb = Depends(get_db),
+        _principal: RelayPrincipal = Depends(require_auth),
+    ) -> Response:
+        # The admission lock precedes the config lock everywhere they are combined.
+        with request.app.state.storage_budget.lock, AUTH_CONFIG_LOCK:
+            principal = current_request_principal(request)
+            path = require_config_admin(settings, principal)
+            target = next((owner for _, owner in request.app.state.auth_store._tokens if owner.id == token_id), None)
+            if target is None:
+                raise HTTPException(status_code=404, detail="relay token id not found")
+            if target.management_admin or target.legacy:
+                raise HTTPException(status_code=403, detail="management credentials cannot be deleted")
+            counts = db.job_status_counts(relay_token_id=token_id)
+            active_count = sum(count for status, count in counts.items() if status not in TERMINAL_JOB_STATUSES)
+            if active_count:
+                raise HTTPException(status_code=409, detail={
+                    "code": "user_has_active_jobs", "active_job_count": active_count,
+                    "message": "用户还有未结束任务，暂时不能删除",
+                })
+            data = read_auth_config(path)
+            data["relay_tokens"] = [item for item in data["relay_tokens"] if str(item.get("id", "")).strip() != token_id]
+            data["retired_relay_token_ids"] = sorted(set(data.get("retired_relay_token_ids", [])) | {token_id})
+            request.app.state.auth_store = validate_and_write_auth_config(path, data, settings.admin_token)
+        return Response(status_code=204)
 
     @app.get("/v1/kaggle/account")
     def kaggle_account(
@@ -1760,6 +1869,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=413, detail="archive has too many chunks; use a larger chunk size")
         budget = request.app.state.storage_budget
         with budget.lock:
+            principal = current_request_principal(request)
+            if request.app.state.auth_store is not auth_store:
+                raise HTTPException(status_code=409, detail="auth configuration changed; retry job creation")
             kaggle_key_id = least_loaded_key(db, auth_store, candidates)
             credentials = auth_store.credentials_for(kaggle_key_id)
             dataset_ref, kernel_ref = final_job_refs(
@@ -1807,12 +1919,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         active: bool = Query(default=False),
         status: list[str] | None = Query(default=None),
         q: str = Query(default="", max_length=200),
+        owner: str | None = Query(default=None),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
         principal: RelayPrincipal = Depends(require_auth),
     ) -> list[JobResponse]:
         key_filter = None if principal.allow_all_keys else set(auth_store.allowed_key_ids(principal))
         owner_filter = None if auth_store.legacy or principal.allow_all_keys else principal.id
+        if owner is not None:
+            if not principal.management_admin:
+                raise HTTPException(status_code=403, detail="admin permission is required")
+            owner_filter = owner
         status_filter = status_filter_for_list(status, active)
         jobs = db.list_jobs(
             kaggle_key_ids=key_filter,
@@ -1876,7 +1993,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             chunk_dir.mkdir(parents=True, exist_ok=True)
             tmp_path = chunk_dir / f"{index}.{uuid.uuid4().hex}.tmp"
             state = request.app.state
-            if state.upload_count >= settings.max_parallel_uploads or state.user_uploads.get(principal.id, 0) >= 4:
+            if state.upload_count >= settings.max_parallel_uploads or state.user_uploads.get(principal.id, 0) >= settings.max_parallel_uploads_per_user:
                 raise HTTPException(status_code=429, detail="upload slots are busy; retry this chunk", headers={"Retry-After": "1"})
             try:
                 state.storage_budget.check_free(x_chunk_size)
@@ -1957,6 +2074,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with job_submission_lock(request.app, job_id):
             job = get_authorized_job(db, job_id, principal, auth_store)
             reject_expired_upload(db, job)
+            if (job["status"] in {"waiting_kernel", "cancel_requested"}
+                    and str(job.get("error", "")).startswith("kernel_status_unknown:")):
+                if job_id not in request.app.state.active_job_ids:
+                    db.update_job(job_id, error="")
+                    request.app.state.queue.put_nowait({
+                        "action": "resume_kernel", "job_id": job_id,
+                        "final_status": "canceled" if job.get("cancel_requested_at") else None,
+                    })
+                return job_response(db, job_id, settings.retention_hours)
+            if (job["status"] == "waiting_dataset"
+                    and str(job.get("error", "")).startswith("dataset_upload_outcome_unknown:")):
+                dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
+                try:
+                    intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail="upload intent invalid; retained for review") from exc
+                if not intent or intent["state"] not in {"unknown", "accepted"}:
+                    raise HTTPException(status_code=409, detail="original upload candidate unavailable")
+                if db.update_job_if_status(job_id, {"waiting_dataset"}, require_not_canceled=True,
+                                           status="queued", error=""):
+                    request.app.state.queue.put_nowait({"action": "process", "job_id": job_id})
+                return job_response(db, job_id, settings.retention_hours)
             if job["status"] != "receiving":
                 return job_response(db, job_id, settings.retention_hours)
 

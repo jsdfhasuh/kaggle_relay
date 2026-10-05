@@ -6,7 +6,9 @@ from typing import Callable
 
 from app.archive import ArchiveError, require_file
 from app.database import RelayDb
+from app.dataset_verification_process import DatasetVerificationError
 from app.dinov2_artifacts import ARTIFACT_CONTRACT as DINO_CONTRACT, IDENTITY_FIELDS
+from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT, CONTRACT_V2 as DINO251_V2, CONTRACTS as DINO251_CONTRACTS
 from app.auth_config import AuthStore
 from app.gpu_policy import apply_yolo_gpu_policy
 from app.dino_threshold_policy import apply_dino_threshold_policy
@@ -14,10 +16,12 @@ from app.kaggle_adapter import (
     DatasetUploadReceipt,
     KaggleAdapter,
     KaggleAdapterInterrupted,
+    KernelStatusUnavailable,
     is_ready_kaggle_status,
     parse_kaggle_dataset_status,
 )
 from app.security import redact_secrets
+from app.upload_intent import content_digest, intent_path, read_intent
 
 TERMINAL_JOB_STATUSES = {"complete", "failed", "canceled"}
 _DATASET_SUBMISSION_LOCKS: dict[str, list] = {}
@@ -415,12 +419,19 @@ def finish_kernel_job(
         "waiting_kernel",
         lambda job: {
             "progress": max(float(job.get("progress") or 0), 60),
+            "error": "",
         },
     )
     kernel_ref = str(current.get("kernel_ref") or "")
     if not kernel_ref:
         raise RuntimeError(f"job {job_id} is missing kernel_ref")
-    kernel_status = adapter.wait_kernel(kernel_ref, progress_callback)
+    try:
+        kernel_status = adapter.wait_kernel(kernel_ref, progress_callback)
+    except KernelStatusUnavailable as exc:
+        current = latest_job()
+        if str(current.get("status")) not in TERMINAL_JOB_STATUSES:
+            db.update_job(job_id, error="kernel_status_unknown: " + redact_secrets(str(exc)))
+        raise
     current = latest_job()
     db.update_job(job_id, kernel_status=kernel_status, progress=max(float(current.get("progress") or 0), 82))
 
@@ -431,21 +442,43 @@ def finish_kernel_job(
         },
     )
     artifact_contract = str(current.get("artifact_contract") or "yolo")
-    output = adapter.download_output(
-        kernel_ref,
-        paths["output_dir"],
-        artifact_contract=artifact_contract,
-    )
-    log(output)
+    if artifact_contract in DINO251_CONTRACTS:
+        output_observation = adapter.p6_download(kernel_ref, paths['output_dir'], paths['kernel_dir'])
+        log('P6 exact-version output downloaded')
+    else:
+        output = adapter.download_output(
+            kernel_ref,
+            paths["output_dir"],
+            artifact_contract=artifact_contract,
+        )
+        log(output)
     packaging_options = {}
-    if artifact_contract == DINO_CONTRACT:
+    if artifact_contract in {DINO_CONTRACT, *DINO251_CONTRACTS}:
         packaging_options["expected_identity"] = {key: current.get(key) for key in IDENTITY_FIELDS}
-    adapter.package_artifacts(
+    if artifact_contract in DINO251_CONTRACTS:
+        from app.dinov2_251_artifacts import read_json, plain, canonical_hash
+        task = read_json(plain(paths['kernel_dir'], 'p6_task.json'))
+        if any(task.get('identity', {}).get(k) != current.get(k) for k in IDENTITY_FIELDS):
+            raise ValueError('P6 frozen submission identity mismatch')
+        expected_format = 'dino_cloud_task_p6_v2' if artifact_contract == DINO251_V2 else 'dino_cloud_task_p6_v1'
+        if task.get('format') != expected_format:
+            raise ValueError('P6 task/artifact version mismatch')
+        packaging_options['expected_task_sha256'] = canonical_hash(task)
+    receipt = adapter.package_artifacts(
         paths["output_dir"],
         paths["artifact_zip"],
         artifact_contract=artifact_contract,
         **packaging_options,
     )
+    if artifact_contract in DINO251_CONTRACTS:
+        receipt.update(job_id=job_id, kernel_ref=kernel_ref, dataset_ref=current['dataset_ref'],
+                       kernel_version=output_observation['kernel_version'],
+                       source_sha256=output_observation['source_sha256'],
+                       dataset_sources=output_observation['dataset_sources'],
+                       observed_dataset_sources=output_observation['observed_dataset_sources'],
+                       dataset_binding_method=output_observation['dataset_binding_method'])
+        from app.upload_intent import write_intent
+        write_intent(paths['artifact_zip'].with_suffix('.receipt.json'), receipt)
     db.finalize_job(
         job_id,
         final_status or "complete",
@@ -519,6 +552,8 @@ def process_job(
 
     try:
         credentials = auth_store.credentials_for(kaggle_key_id) if auth_store else None
+        from app.dinov2_training_policy import validate_training_request
+        validate_training_request(kernel_dir, str(job.get('artifact_contract') or 'yolo'))
         adapter = KaggleAdapter(settings, log, credentials=credentials)
         adapter.dataset_cancel_check = stop_if_cancel_requested
         shutdown_event = getattr(settings, "_shutdown_event", None)
@@ -526,13 +561,27 @@ def process_job(
             adapter.shutdown_event = shutdown_event
         with dataset_submission_lock(job["dataset_ref"], shutdown_event):
             stop_if_cancel_requested()
+            if job["kernel_ref"].split("/")[0] != job["dataset_ref"].split("/")[0]:
+                raise ValueError("Dataset and Kernel owner binding mismatch")
+            adapter.require_identity(job["dataset_ref"].split("/")[0])
             dataset_cache = get_ready_dataset_cache(
                 db,
                 job["dataset_ref"],
                 job["payload_hash"],
                 kaggle_key_id=kaggle_key_id,
             )
+            saved_intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+            if saved_intent is not None:
+                # Even a valid shared cache cannot replace this run's candidate.
+                dataset_cache = None
             if dataset_cache:
+                # A cache hit may omit this job's dataset upload. Revalidate the
+                # original cache source, never synthesize an unbound inventory.
+                cached_source = dataset_dir
+                if not cached_source.is_dir():
+                    cached_source = job_paths(settings, dataset_cache["source_job_id"])["dataset_dir"]
+                if not cached_source.is_dir():
+                    raise ValueError("Cached Dataset source unavailable for byte verification")
                 validate_kernel_payload(
                     kernel_dir,
                     job["kernel_ref"],
@@ -549,6 +598,8 @@ def process_job(
                     ),
                     upload_receipt=DatasetUploadReceipt(
                         expected_version_number=cached_version_number,
+                        dataset_dir=str(cached_source),
+                        content_sha256=content_digest(cached_source),
                     ),
                 )
                 pin_kernel_dataset_version(
@@ -567,7 +618,7 @@ def process_job(
                     job["kernel_ref"],
                     credentials,
                 )
-                transition_before_submission({"queued"}, "uploading_dataset", 20)
+                transition_before_submission({"queued", "uploading_dataset", "waiting_dataset"}, "uploading_dataset", 20)
                 upload_receipt = adapter.upload_dataset(
                     dataset_dir,
                     job["dataset_ref"],
@@ -633,6 +684,8 @@ def process_job(
             push_output = adapter.push_kernel(kernel_dir)
             log(push_output)
         finish_kernel_job(settings, db, job_id, adapter)
+    except KernelStatusUnavailable as exc:
+        db.append_log(job_id, "kernel_status_unknown: " + redact_secrets(str(exc)))
     except KaggleAdapterInterrupted as exc:
         db.append_log(job_id, redact_secrets(str(exc)))
     except JobCanceled as exc:
@@ -641,6 +694,22 @@ def process_job(
         db.append_log(job_id, message)
     except Exception as exc:
         current = latest_job()
+        if current.get("status") in {"uploading_dataset", "waiting_dataset"}:
+            try:
+                intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+            except (OSError, ValueError):
+                intent = None
+            integrity_failure = any(code in str(exc) for code in (
+                "payload_", "identity rejected", "intent_scope_or_content_mismatch", "frozen content changed"))
+            if isinstance(exc, DatasetVerificationError):
+                integrity_failure = exc.category == "integrity" or (
+                    exc.category == "fatal" and integrity_failure)
+            if intent and (intent["state"] == "unknown" or
+                           (intent["state"] == "accepted" and not integrity_failure)):
+                message = "dataset_upload_outcome_unknown: original candidate retained; " + redact_secrets(str(exc))
+                db.update_job(job_id, status="waiting_dataset", error=message)
+                db.append_log(job_id, message)
+                return
         message = structured_kernel_failure_error(current.get("kernel_status")) or str(exc)
         message = redact_secrets(message)
         db.finalize_job(job_id, "failed", progress=0, error=message)

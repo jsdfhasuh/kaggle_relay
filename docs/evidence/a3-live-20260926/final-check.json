@@ -1,0 +1,54 @@
+{
+  "old_job_bindings_unchanged": true,
+  "only_auth_change": "mhb.username: mhb -> mhbggzh",
+  "active_jobs": [],
+  "image": "sha256:9407698980c337cad6dbf15042d29e13326b911a7e5a8a9a30a0bc5532510dad",
+  "artifact_archives": [],
+  "original_output_records": [
+    {
+      "path": "kaggle_output/artifacts/BoxPR_curve.png",
+      "size": 74022,
+      "sha256": "4b262dd9d1c0ad467bacf9da99d29ff9e29b7d3402e0c65a0ac0ff854f78f964"
+    },
+    {
+      "path": "kaggle_output/artifacts/BoxF1_curve.png",
+      "size": 66686,
+      "sha256": "796b70abb55e8dd62c0f9a1a9a18663a5320c15a66a81d55336c67c5b9518aae"
+    },
+    {
+      "path": "kaggle_output/artifacts/BoxP_curve.png",
+      "size": 81847,
+      "sha256": "04d870555022bee5ce9109b7f05556d78a27be162edab72903eafe24dc93c23e"
+    },
+    {
+      "path": "kaggle_output/runs/yolo-w0-61742b06_test/BoxPR_curve.png",
+      "size": 73610,
+      "sha256": "2ecd6d79da609a4c9f2da8d26113810ac9705faff6aa299a96494584185bdde7"
+    },
+    {
+      "path": "kaggle_output/runs/yolo-w0-61742b06_test/BoxF1_curve.png",
+      "size": 66640,
+      "sha256": "7ea1fe00607daefba942024ed60fd82520fd8978c67d7bd5c2257de6579ed9d1"
+    },
+    {
+      "path": "kaggle_output/runs/yolo-w0-61742b06_test/BoxP_curve.png",
+      "size": 81998,
+      "sha256": "f0d48bdbcff871cc019f21dd5c2913ee369a6ff2e2e61267c1d998e6ee114118"
+    },
+    {
+      "path": "kaggle_output/runs/yolo-w0-61742b06/BoxPR_curve.png",
+      "size": 74022,
+      "sha256": "4b262dd9d1c0ad467bacf9da99d29ff9e29b7d3402e0c65a0ac0ff854f78f964"
+    },
+    {
+      "path": "kaggle_output/runs/yolo-w0-61742b06/BoxF1_curve.png",
+      "size": 66686,
+      "sha256": "796b70abb55e8dd62c0f9a1a9a18663a5320c15a66a81d55336c67c5b9518aae"
+    },
+    {
+      "path": "kaggle_output/runs/yolo-w0-61742b06/BoxP_curve.png",
+      "size": 81847,
+      "sha256": "04d870555022bee5ce9109b7f05556d78a27be162edab72903eafe24dc93c23e"
+    }
+  ]
+}

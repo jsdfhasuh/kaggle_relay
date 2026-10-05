@@ -1,0 +1,27 @@
+{
+  "source_sha": "3d86a267f1aab650b08153d161e735bf78af5a79",
+  "previous_sha": "cf6d710bdaf5e08f2b2ca067f8e8b9b60b232c24",
+  "image": "kaggle-relay-reviewed:3d86a26-20261002t145356z",
+  "image_id": "sha256:d609abab653a2eb13aa2a4910e0b4eded5aea0a74871ddc5afd5aecb5b579274",
+  "old_image": "kaggle-relay-reviewed:cf6d710-20261002t135823z",
+  "rollback_image": "kaggle-relay-reviewed:cf6d710-auth-compatible-20261002t145356z",
+  "backup": "/docker_volume/kaggle_relay-deploy-backups/user-token-20261002T145356Z",
+  "health": "PASS",
+  "before": {
+    "counts": {
+      "canceled": 33,
+      "complete": 139,
+      "failed": 110
+    },
+    "jobs_sha256": "329b94ddad033c3c27579eb5b0cb7666f4bd69b7158902e121dc1a209145de37"
+  },
+  "after": {
+    "counts": {
+      "canceled": 33,
+      "complete": 139,
+      "failed": 110
+    },
+    "jobs_sha256": "329b94ddad033c3c27579eb5b0cb7666f4bd69b7158902e121dc1a209145de37"
+  },
+  "source_matches_container": true
+}

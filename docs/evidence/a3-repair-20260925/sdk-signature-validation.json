@@ -1,0 +1,41 @@
+{
+  "base": "2529a12d1caa5ca77e2eb1313ee15a1522f346b8",
+  "sdk_version": "2.2.4",
+  "python_version": "3.11.16",
+  "runs": {
+    "before": {
+      "passed": 2,
+      "failed": [
+        "tests.test_a3_content_identity::test_identity_reports_authentication_source_and_rejects_wrong_owner[legacy_api_key-validated_basic_principal]",
+        "tests.test_a3_content_identity::test_legacy_key_validates_authenticated_request_before_upload",
+        "tests.test_a3_content_identity::test_legacy_key_failures_block_worker_without_remote_mutation[invalid_key_401]",
+        "tests.test_a3_content_identity::test_legacy_key_failures_block_worker_without_remote_mutation[forbidden_403]",
+        "tests.test_a3_content_identity::test_legacy_key_failures_block_worker_without_remote_mutation[wrong_owner]"
+      ],
+      "skipped": [],
+      "exit_code": 1,
+      "junit_sha256": "d419451b0513c5d82fc0c281d0ba5f31cd767b4e329972f67cebb55f68a87b28"
+    },
+    "after": {
+      "passed": 336,
+      "failed": [],
+      "skipped": [
+        {
+          "test": "tests.test_concurrency::test_timeout_kills_descendants_after_group_leader_exits",
+          "reason": "POSIX process groups"
+        },
+        {
+          "test": "tests.test_dino_image_policy::test_fork_workers_inherit_decoder",
+          "reason": "Kaggle Linux fork test"
+        }
+      ],
+      "exit_code": 0,
+      "junit_sha256": "428752b8c2a9d6bdb1c63460386151ed01ef80968e3db675a8bb58ae91c7c43f"
+    }
+  },
+  "NOT_RUN": [
+    "live Key authentication",
+    "cloud jobs",
+    "deployment"
+  ]
+}

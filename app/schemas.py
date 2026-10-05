@@ -35,7 +35,7 @@ class CreateJobRequest(BaseModel):
     identity_sha256: str = ""
     run_id: str = ""
     run_identity_sha256: str = ""
-    artifact_contract: Literal["", "yolo", "patchcore", "patchcore_dinov2_v3"] = ""
+    artifact_contract: Literal["", "yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"] = ""
 
     @model_validator(mode="after")
     def validate_frozen_identity(self):
@@ -58,7 +58,7 @@ class CreateJobRequest(BaseModel):
         artifact_contract = str(self.artifact_contract or "").strip().lower()
         if not artifact_contract:
             artifact_contract = "patchcore" if all(values.values()) else "yolo"
-        if artifact_contract in {"patchcore", "patchcore_dinov2_v3"} and not all(values.values()):
+        if artifact_contract in {"patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"} and not all(values.values()):
             raise ValueError(
                 "PatchCore artifact contract requires all frozen identity fields"
             )
@@ -91,7 +91,8 @@ class JobResponse(BaseModel):
     identity_sha256: str = ""
     run_id: str = ""
     run_identity_sha256: str = ""
-    artifact_contract: Literal["yolo", "patchcore", "patchcore_dinov2_v3"] = "yolo"
+    artifact_contract: Literal["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"] = "yolo"
+    result_receipt: dict[str, Any] = Field(default_factory=dict)
     callback_enabled: bool = False
     created_at: float
     updated_at: float
@@ -116,7 +117,7 @@ class JobResponse(BaseModel):
     kernel_size: int = 0
     dataset_archive_sha256: str = ""
     kernel_archive_sha256: str = ""
-    max_parallel_uploads: int = 4
+    max_parallel_uploads: int = 8
     recent_logs: list[str] = []
 
 
@@ -147,7 +148,9 @@ class HealthResponse(BaseModel):
     version: str
     storage_dir: str
     free_bytes: int
-    artifact_contracts: list[str] = Field(default_factory=lambda: ["yolo", "patchcore", "patchcore_dinov2_v3"])
+    artifact_contracts: list[str] = Field(default_factory=lambda: ["yolo", "patchcore", "patchcore_dinov2_v3", "patchcore_dinov2_251_onnx_v1", "patchcore_dinov2_251_onnx_v2"])
+    training_profiles: list[str] = Field(default_factory=lambda: [
+        'dino_cuda_features_cpu_coreset_v1', 'dino_cuda_host_torch210_cu128_cpu_coreset_v2'])
 
 
 class UiLoginRequest(BaseModel):

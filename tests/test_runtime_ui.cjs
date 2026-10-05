@@ -141,9 +141,10 @@ test('key permission hides navigation and prevents direct page selection', () =>
   ui.applySessionPermissions({can_view_keys: false});
   assert.equal(buttons[0].hidden, false);
   assert.equal(buttons[1].hidden, true);
-  assert.equal(buttons[2].hidden, true);
+  assert.equal(buttons[2].hidden, false);
+  assert.equal(buttons[2].textContent, '我的 Token');
   assert.equal(ui.normalizePage('accounts'), 'runtime');
-  assert.equal(ui.normalizePage('users'), 'runtime');
+  assert.equal(ui.normalizePage('users'), 'users');
   ui.applySessionPermissions({can_view_keys: true});
   assert.equal(buttons[1].hidden, false);
   assert.equal(ui.normalizePage('accounts'), 'accounts');
@@ -152,4 +153,96 @@ test('key permission hides navigation and prevents direct page selection', () =>
 test('receiving deadline errors have a clear failure summary', () => {
   const ui = page();
   assert.equal(ui.failureSummary({status: 'failed', error: 'upload timed out: incomplete after 3 hours from job creation; submit a new job'}).title, '上传接收超时');
+});
+
+function tokenPage() {
+  const ui = page();
+  vm.runInContext('activePage = "users"', ui);
+  const timers = [];
+  ui.setTimeout = (fn, delay) => { timers.push({fn, delay}); return timers.length; };
+  ui.clearTimeout = () => {};
+  ui.document.createElement = () => ({dataset: {}});
+  ui.qs('userActionMessage').appendChild = item => { ui.actionButton = item; };
+  ui.qs('revealedTokenValue').focus = () => {};
+  ui.qs('revealedTokenValue').select = () => { ui.selected = true; };
+  return {ui, timers};
+}
+
+test('reveal and copy are explicit and clear after 60 seconds', async () => {
+  const {ui, timers} = tokenPage();
+  let copied, request;
+  ui.navigator = {clipboard: {writeText: async value => { copied = value; }}};
+  ui.api = async (url, options) => { request = {url, options}; return {token: 'fixture-secret'}; };
+  await ui.revealUserToken('user/a', true);
+  assert.equal(request.url, '/v1/auth/relay-tokens/user%2Fa/reveal');
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.cache, 'no-store');
+  assert.equal(copied, 'fixture-secret');
+  assert.equal(ui.qs('revealedTokenValue').value, 'fixture-secret');
+  assert.equal(timers[0].delay, 60000);
+  timers[0].fn();
+  assert.equal(ui.qs('revealedTokenValue').value, '');
+  assert.equal(ui.qs('revealedTokenBox').hidden, true);
+});
+
+test('failed clipboard offers manual selection; hiding clears the secret', async () => {
+  const {ui} = tokenPage();
+  ui.navigator = {};
+  ui.api = async () => ({token: 'manual-secret'});
+  await ui.revealUserToken('user-a', true);
+  assert.equal(ui.selected, true);
+  assert.match(ui.qs('userActionMessage').textContent, /手动复制/);
+  ui.clearRevealedToken();
+  assert.equal(ui.qs('revealedTokenValue').value, '');
+});
+
+test('late reveal responses cannot repopulate after navigation, hide, or logout', async () => {
+  const {ui} = tokenPage();
+  let finish;
+  ui.api = () => new Promise(resolve => { finish = resolve; });
+  const pending = ui.revealUserToken('user-a');
+  ui.clearRevealedToken();
+  finish({token: 'late-secret'});
+  await pending;
+  assert.equal(ui.qs('revealedTokenValue').value, '');
+  assert.equal(ui.qs('revealedTokenBox').hidden, true);
+  assert.match(html, /async function logout\(\) \{\s+clearRevealedToken\(\)/);
+  assert.match(html, /function setActivePage[^]*?clearRevealedToken\(\)/);
+  assert.match(html, /pagehide", clearRevealedToken/);
+});
+
+test('cancel deletion makes no request; conflict exposes exact owner task link', async () => {
+  const {ui} = tokenPage();
+  let calls = 0;
+  ui.confirm = () => false;
+  ui.api = async () => { ++calls; };
+  await ui.deleteRelayUser('user-a');
+  assert.equal(calls, 0);
+  ui.confirm = () => true;
+  ui.api = async () => { throw {detail: {code: 'user_has_active_jobs', active_job_count: 3}}; };
+  await ui.deleteRelayUser('user-a');
+  assert.match(ui.qs('userActionMessage').textContent, /3 个未结束任务/);
+  assert.equal(ui.actionButton.dataset.userJobs, 'user-a');
+  ui.setActivePage = () => {};
+  ui.loadRuntimeData = async () => {};
+  await ui.filterUserJobs('user-a');
+  assert.equal(ui.jobListParams().get('owner'), 'user-a');
+  await ui.filterUserJobs(null);
+  assert.equal(ui.jobListParams().has('owner'), false);
+});
+
+test('successful deletion reloads users and rendering contains no raw token', async () => {
+  const {ui} = tokenPage();
+  ui.confirm = () => true;
+  let refreshed = false;
+  ui.api = async () => {};
+  ui.loadAuthConfig = async () => { refreshed = true; };
+  await ui.deleteRelayUser('user-a');
+  assert.equal(refreshed, true);
+  assert.match(ui.qs('userActionMessage').textContent, /已删除/);
+  ui.qs('authConfig').appendChild = () => {};
+  ui.renderAuthConfig({mode: 'multi_key', can_manage_auth: false, relay_tokens: [{id: 'user-a', current: true, token: 'never-render'}]});
+  assert.match(ui.qs('authConfig').innerHTML, /查看 Token/);
+  assert.doesNotMatch(ui.qs('authConfig').innerHTML, /never-render|data-delete-user/);
+  assert.equal(ui.qs('revealedTokenValue').value, '');
 });

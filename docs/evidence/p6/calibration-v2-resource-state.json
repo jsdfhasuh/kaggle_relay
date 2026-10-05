@@ -1,0 +1,15 @@
+{
+  "auth_method": "ACCESS_TOKEN",
+  "owner": "jsdfhasuh",
+  "authenticated_request": "PASS",
+  "unrelated_kernel_status": "KernelWorkerStatus.RUNNING",
+  "observed_at": "2026-09-28T01:52:05.144762+00:00",
+  "authorization": "GRANTED",
+  "new_task_limit": 2,
+  "new_tasks_started": 0,
+  "unrelated_kernel_ref_sha256": "129ad2a14d5f5c870f7957b9e5a5e685abfa83825f5d27cd53aa5a3b1ae46f1b",
+  "sandbox_source": "e0147930c4523342c2f4403b400f632133510ff1",
+  "sandbox_container": "exited",
+  "deployment_guard": "BLOCKED_ACTIVE_UNRELATED_TASK",
+  "production_changed": false
+}

@@ -1,0 +1,43 @@
+{
+  "checked_at": "2026-10-03T00:35:49.810767+08:00",
+  "source_sha": "0c62e77acd082626042e652b8fb34302a9b670c5",
+  "client_sha": "ca784a532eded32363ff2c083c8f14ecc99af8d7",
+  "image": "kaggle-relay-reviewed:0c62e77-20261002t163305z",
+  "image_id": "sha256:9183c18789b838718c6a3852fe31abbcaa45cb49345743a2b4b8f62e9b11d337",
+  "restart_count": 0,
+  "backup": "/docker_volume/kaggle_relay-deploy-backups/dataset-retry-20261002T163305Z",
+  "rollback_script": "/docker_volume/kaggle_relay-deploy-backups/dataset-retry-20261002T163305Z/rollback.sh",
+  "validation": {
+    "relay_windows": {
+      "passed": 503,
+      "skipped": 3
+    },
+    "relay_linux_targeted": {
+      "passed": 144
+    },
+    "desktop_targeted": {
+      "passed": 59
+    },
+    "authenticated_internal_health": 200,
+    "authenticated_public_health": 200
+  },
+  "job": {
+    "job_id": "a268f8663c384c2a89ec99e12f34f060",
+    "status": "waiting_kernel",
+    "progress": 61.25,
+    "error": "",
+    "exact_version_10_verified": true,
+    "kernel_push_commands": 1,
+    "kernel_version_1_accepted": true,
+    "identity_bindings_unchanged": true
+  },
+  "unrelated_jobs_unchanged": true,
+  "upload_intents_unchanged": true,
+  "archives_match_original": {
+    "dataset": true,
+    "kernel": true
+  },
+  "runtime_source_matches": true,
+  "completed_training_acceptance": "NOT_RUN",
+  "packaged_desktop_release": "NOT_RUN"
+}

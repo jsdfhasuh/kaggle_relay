@@ -52,6 +52,56 @@ def make_settings(tmp_path: Path, worker_count: int = 1) -> Settings:
     )
 
 
+@pytest.mark.parametrize("cancel_requested", [False, True])
+def test_kernel_query_unknown_is_nonterminal_and_resumes_without_submission(tmp_path, monkeypatch, cancel_requested):
+    from app.kaggle_adapter import KernelStatusUnavailable
+    from app.main import mark_worker_exception
+
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    calls = []
+
+    class FakeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def require_identity(self, _owner):
+            return {"identity_verified": True}
+
+        def wait_kernel(self, kernel_ref, _callback):
+            calls.append(kernel_ref)
+            return "complete"
+
+        def download_output(self, _kernel_ref, output_dir, artifact_contract="yolo"):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "best.pt").write_bytes(b"pt")
+            return "downloaded"
+
+        def package_artifacts(self, output_dir, artifact_zip, artifact_contract="yolo"):
+            artifact_zip.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.write(output_dir / "best.pt", "best.pt")
+
+    monkeypatch.setattr("app.worker.KaggleAdapter", FakeAdapter)
+    with TestClient(app) as client:
+        job_id = seed_job(app, "cancel_requested" if cancel_requested else "waiting_kernel", progress=79)
+        if cancel_requested:
+            app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="user canceled")
+        mark_worker_exception(app.state.db, job_id, KernelStatusUnavailable("connect timeout"))
+        retained = app.state.db.get_job(job_id)
+        assert retained["status"] == ("cancel_requested" if cancel_requested else "waiting_kernel")
+        assert retained["progress"] == 79
+        assert retained["completed_at"] is None
+        assert retained["error"].startswith("kernel_status_unknown:")
+        response = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        assert response.status_code == 200
+        final = wait_for_status(client, job_id, {"canceled" if cancel_requested else "complete"})
+        assert final["can_download"] is True
+        assert final["error"] == ""
+        assert len(app.state.db.list_jobs()) == 1
+    assert calls == ["demo/kernel"]
+
+
 def make_auth_config_settings(tmp_path: Path, config: dict) -> Settings:
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(json.dumps(config), encoding="utf-8")
@@ -630,6 +680,9 @@ def test_multi_key_token_auto_selects_key_and_enforces_job_access(tmp_path, monk
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -835,6 +888,9 @@ def test_create_job_auto_selects_available_kaggle_key_by_quota(tmp_path, monkeyp
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -879,6 +935,9 @@ def test_create_job_falls_back_and_rewrites_refs_when_owner_quota_is_exhausted(t
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -925,6 +984,9 @@ def test_create_job_falls_back_and_rewrites_refs_when_owner_has_no_key(tmp_path,
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -968,6 +1030,9 @@ def test_create_job_returns_conflict_when_all_allowed_key_quotas_are_exhausted(t
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1003,6 +1068,9 @@ def test_kaggle_account_respects_token_key_permissions(tmp_path, monkeypatch):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1055,6 +1123,9 @@ def test_kaggle_accounts_lists_only_accessible_keys(tmp_path, monkeypatch):
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1089,6 +1160,9 @@ def test_kaggle_account_probe_respects_token_key_permissions(tmp_path, monkeypat
     app = create_app(make_auth_config_settings(tmp_path, multi_key_auth_config()))
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             self.credentials = credentials
 
@@ -1154,12 +1228,113 @@ def test_chunk_bodies_are_received_concurrently(tmp_path):
             assert [r.status_code for r in responses] == [200] * 4
             current = (await client.get(f"/v1/jobs/{job_id}", headers=auth_headers())).json()
             assert current["accepted_chunks"]["dataset"] == [0, 1, 2, 3]
-            assert current["max_parallel_uploads"] == 4
+            assert current["max_parallel_uploads"] == 8
             assert current["chunk_size"] == 8
             assert current["dataset_archive_sha256"] == app.state.db.get_job(job_id)["dataset_archive_sha256"]
 
     asyncio.run(scenario())
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+@pytest.mark.parametrize("global_limit,user_limit", [(40, 8), (3, 8), (40, 2)])
+def test_upload_limit_shared_across_jobs_and_released(tmp_path, global_limit, user_limit):
+    settings = make_settings(tmp_path)
+    settings.max_parallel_uploads = global_limit
+    settings.max_parallel_uploads_per_user = user_limit
+    app = create_app(settings)
+    jobs = [seed_job(app, "receiving"), seed_job(app, "receiving")]
+    limit = min(global_limit, user_limit)
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        started = 0
+
+        async def body():
+            nonlocal started
+            started += 1
+            if started == limit:
+                entered.set()
+            yield b"1234"
+            await release.wait()
+            yield b"5678"
+
+        headers = auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(), "X-Chunk-Size": "8"})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            pending = [asyncio.create_task(client.put(
+                f"/v1/jobs/{jobs[i % 2]}/archives/dataset/chunks/{i}", headers=headers, content=body(),
+            )) for i in range(limit)]
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                assert app.state.upload_count == limit
+                rejected = await client.put(f"/v1/jobs/{jobs[1]}/archives/dataset/chunks/{limit}",
+                                            headers=headers, content=b"12345678")
+                assert rejected.status_code == 429
+                assert rejected.headers["Retry-After"] == "1"
+                current = (await client.get(f"/v1/jobs/{jobs[0]}", headers=auth_headers())).json()
+                assert current["max_parallel_uploads"] == limit
+            finally:
+                release.set()
+                responses = await asyncio.gather(*pending)
+            assert all(r.status_code == 200 for r in responses)
+            assert app.state.upload_count == 0
+            assert not app.state.user_uploads
+            resumed = await client.put(f"/v1/jobs/{jobs[1]}/archives/dataset/chunks/{limit}",
+                                       headers=headers, content=b"12345678")
+            assert resumed.status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_upload_user_limit_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAY_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setenv("RELAY_MAX_PARALLEL_UPLOADS_PER_USER", "4")
+    assert Settings.from_env().max_parallel_uploads_per_user == 4
+    with pytest.raises(ValueError):
+        Settings(api_token="test", storage_dir=tmp_path, max_parallel_uploads_per_user=0)
+
+
+def test_upload_limits_isolate_users_but_share_global_budget(tmp_path):
+    settings = make_auth_config_settings(tmp_path, multi_key_auth_config())
+    settings.max_parallel_uploads = 9
+    app = create_app(settings)
+    jobs = [seed_job(app, "receiving"), seed_job(app, "receiving")]
+    for job, user, key in zip(jobs, ("user-a", "user-b"), ("ka", "kb")):
+        app.state.db.update_job(job, relay_token_id=user, kaggle_key_id=key)
+
+    async def scenario():
+        ready, release = asyncio.Event(), asyncio.Event()
+        started = 0
+
+        async def body():
+            nonlocal started
+            started += 1
+            if started == 9:
+                ready.set()
+            yield b"1234"
+            await release.wait()
+            yield b"5678"
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            def put(user, index, content):
+                headers = auth_headers({"X-Chunk-Sha256": hashlib.sha256(b"12345678").hexdigest(),
+                                        "X-Chunk-Size": "8"}, token=f"user-{'a' if user == 0 else 'b'}-token")
+                return client.put(f"/v1/jobs/{jobs[user]}/archives/dataset/chunks/{index}",
+                                  headers=headers, content=content)
+
+            pending = [asyncio.create_task(put(0, i, body())) for i in range(8)]
+            pending.append(asyncio.create_task(put(1, 0, body())))
+            try:
+                await asyncio.wait_for(ready.wait(), 5)
+                assert app.state.user_uploads == {"user-a": 8, "user-b": 1}
+                assert (await put(1, 1, b"12345678")).status_code == 429
+            finally:
+                release.set()
+                results = await asyncio.gather(*pending)
+            assert all(r.status_code == 200 for r in results)
+            assert app.state.upload_count == 0
+            assert not app.state.user_uploads
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("action,chunk_status", [("cancel", 409), ("delete", 200), ("complete", 200)])
@@ -1831,7 +2006,7 @@ def test_wait_kernel_keeps_patchcore_terminal_failure_event(tmp_path, monkeypatc
     monkeypatch.setattr(
         adapter,
         "_run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=next(log_outputs)),
     )
     monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
     callbacks = []
@@ -1874,7 +2049,7 @@ def test_wait_kernel_keeps_yolo_epoch_deduplication(tmp_path, monkeypatch):
     monkeypatch.setattr(
         adapter,
         "_run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=next(log_outputs)),
     )
     monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
     callbacks = []
@@ -1918,7 +2093,7 @@ def test_wait_kernel_coalesces_patchcore_history_to_latest_event(tmp_path, monke
     monkeypatch.setattr(
         adapter,
         "_run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=next(log_outputs)),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=next(log_outputs)),
     )
     monkeypatch.setattr("app.kaggle_adapter.time.sleep", lambda _seconds: None)
     callbacks = []
@@ -1955,6 +2130,9 @@ def test_worker_prefers_structured_patchcore_kernel_failure(tmp_path, monkeypatc
     }
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2003,6 +2181,7 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     app = create_app(settings)
+    (settings.jobs_dir / "previous/extracted/dataset").mkdir(parents=True)
 
     with TestClient(app) as client:
         app.state.db.upsert_dataset_cache(
@@ -2024,6 +2203,9 @@ def test_worker_reuses_dataset_cache_without_upload(tmp_path, monkeypatch):
         }
 
         class FakeAdapter:
+            def require_identity(self, owner):
+                return {"identity_verified": True}
+
             def __init__(self, _settings, _log, credentials=None):
                 pass
 
@@ -2096,9 +2278,13 @@ def test_worker_restricts_gpu_before_push_preserving_upload(tmp_path, monkeypatc
     monkeypatch.setattr("app.main.process_job", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     app = create_app(settings)
+    (settings.jobs_dir / "previous/extracted/dataset").mkdir(parents=True)
     calls = {"upload": 0, "push": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2166,6 +2352,9 @@ def test_worker_passes_upload_receipt_to_dataset_wait(tmp_path, monkeypatch):
     calls = {"receipt": None, "waited": False, "pushed_after_wait": False}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2242,6 +2431,9 @@ def test_workers_serialize_shared_dataset_until_kernel_push(tmp_path, monkeypatc
     calls_lock = threading.Lock()
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2322,6 +2514,9 @@ def test_worker_uses_job_bound_kaggle_credentials(tmp_path, monkeypatch):
     captured = {}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             captured["id"] = credentials.id
             captured["username"] = credentials.username
@@ -2387,6 +2582,9 @@ def test_worker_cancels_queued_job_before_kaggle_push(tmp_path, monkeypatch):
     calls = {"upload_dataset": 0, "push_kernel": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2437,6 +2635,9 @@ def test_worker_does_not_resurrect_cancel_during_upload_transition(tmp_path, mon
     calls = {"upload_dataset": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2500,6 +2701,9 @@ def test_worker_cancels_during_dataset_polling_without_kernel_push(tmp_path, mon
     calls = {"poll": 0, "push": 0}
 
     class PollingAdapter(KaggleAdapter):
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def upload_dataset(self, *_args, **_kwargs):
             return None
 
@@ -2530,6 +2734,9 @@ def test_worker_downloads_artifacts_and_marks_canceled_after_kernel_stop(tmp_pat
     app = create_app(settings)
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2620,6 +2827,9 @@ def test_finish_kernel_job_does_not_overwrite_concurrent_cancel(tmp_path, monkey
     monkeypatch.setattr(db, "update_job", monitored_update)
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def wait_kernel(self, _kernel_ref, progress_callback):
             state["armed"] = True
             progress_callback({"epoch": 1, "epochs": 2, "remote_progress": 50})
@@ -2653,6 +2863,9 @@ def test_startup_recovery_resumes_kernel_finish_without_upload_or_push(tmp_path,
     calls = {"upload_dataset": 0, "push_kernel": 0, "wait_kernel": 0}
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2715,6 +2928,9 @@ def test_startup_recovery_cancel_requested_before_submission_goes_canceled(tmp_p
     app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, *_args, **_kwargs):
             raise AssertionError("Kaggle should not be called for unsubmitted cancel")
 
@@ -2734,6 +2950,9 @@ def test_startup_recovery_cancel_requested_after_submission_finishes_canceled(tm
     app.state.db.update_job(job_id, cancel_requested_at=time.time(), cancel_reason="cancel requested")
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, _settings, _log, credentials=None):
             pass
 
@@ -2935,6 +3154,9 @@ def test_startup_recovery_skips_terminal_and_receiving_jobs(tmp_path, monkeypatc
     receiving_id = seed_job(app, "receiving", progress=0)
 
     class FakeAdapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, *_args, **_kwargs):
             raise AssertionError("terminal and receiving jobs should not recover")
 
@@ -3576,12 +3798,21 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
     with zipfile.ZipFile(payload_zip, "w") as archive:
         archive.writestr("data.yaml", b"data")
         archive.writestr("model_source/best.pt", b"pt")
-    (tmp_path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "dataset-metadata.json").write_text('{"id":"demo/data"}', encoding="utf-8")
     calls = []
 
     class FakeKaggleApi:
+        config_values = {"username": "demo", "auth_method": "access_token"}
+
+        def dataset_download_files(self, *args, **kwargs):
+            raise AssertionError("upload-only test must not download")
+
         def authenticate(self):
             pass
+
+        def dataset_list(self, mine=False, page=1):
+            assert mine is True and page == 1
+            return [SimpleNamespace(ref="demo/data")]
 
         def dataset_status(self, _dataset_ref, format=None):
             if format == "json":
@@ -3590,6 +3821,7 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
 
         def dataset_create_version(self, dataset_dir, update_message, **kwargs):
             calls.append((dataset_dir, update_message, kwargs))
+            return SimpleNamespace(status="ok", error="")
 
     kaggle_api_module = importlib.import_module(
         "kaggle.api.kaggle_api_extended"
@@ -3600,7 +3832,9 @@ def test_upload_dataset_returns_expected_version_and_payload_inventory(
 
     receipt = adapter.upload_dataset(tmp_path, "demo/data", "update files")
 
+    from app.upload_intent import content_digest
     assert receipt == DatasetUploadReceipt(
+        dataset_dir=str(tmp_path.absolute()), content_sha256=content_digest(tmp_path),
         expected_version_number=4,
         expected_files=(
             ("data.yaml", 4),
@@ -3615,12 +3849,21 @@ def test_upload_dataset_fails_when_existing_version_is_unavailable(
     tmp_path,
     monkeypatch,
 ):
-    (tmp_path / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "dataset-metadata.json").write_text('{"id":"demo/data"}', encoding="utf-8")
     upload_called = False
 
     class FakeKaggleApi:
+        config_values = {"username": "demo", "auth_method": "access_token"}
+
+        def dataset_download_files(self, *args, **kwargs):
+            raise AssertionError("upload-only test must not download")
+
         def authenticate(self):
             pass
+
+        def dataset_list(self, mine=False, page=1):
+            assert mine is True and page == 1
+            return [SimpleNamespace(ref="demo/data")]
 
         def dataset_status(self, _dataset_ref, format=None):
             if format == "json":

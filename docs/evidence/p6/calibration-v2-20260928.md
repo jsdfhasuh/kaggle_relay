@@ -1,0 +1,51 @@
+# P6 v2 deployment calibration transport preparation
+
+Baseline: `66e76912adc7fabf3c9ef234573c0bde8330eedc`, branch `codex/p6-dino-cloud-onnx`. Local and origin matched and the feature worktree was clean before changes. Original repository README dirty change is preserved.
+
+Add independent `patchcore_dinov2_251_onnx_v2` / `dino_cloud_result_p6_v2` dispatch through schema, DB preservation, exact-Kernel download, packaging and authenticated receipt. V1/old DINO/CNN/YOLO remain supported by their existing rules. V2 transport requires corresponding task/deployment versions, frozen ONNX deployment calibration bound to actual graph/threshold and Linux producer scope. Training-side candidate threshold and all cloud reference files are separately inventoried. The shared artifact validator is byte-identical to application's `anomaly_func/dinov2_transport.py`.
+
+Validation: `.venv/Scripts/python.exe -m pytest tests/test_dinov2_p6.py tests/test_dinov2_artifacts.py tests/test_relay_api.py -q` -> **161 PASS**, exit 0. Includes v2 schema/DB reopen and version-mismatched partial-result rejection. These are protocol fixtures, not real cloud/model qualification.
+
+`scripts/p6_calibration_sandbox.py` prepares the explicit existing-sandbox update path. Default is read-only; `--apply` requires fresh user authorization. It requires the exact reviewed SHA/branch, clean source, a stopped sandbox and no account/sandbox active tasks; backs up restricted state/private config; keeps old image/container; builds with network disabled against the existing image; and checks running file hashes and actual image. It never updates production. `--help` was run (exit 0); deployment was **NOT_RUN**.
+
+Read-only Oracle observation: test container stopped, actual source `52bdd1db952aa863af7d171b72e173e6f74c4d47`, image `sha256:ab344299bda2c6a073170b3173613b9acdf9bf09dcdc096d52f1c74ef1c3da07`. Production stayed running at `e8255b5665c113f8be74359ef3cbad8369d98049`, image `sha256:07bfc8f35deb099802edacde3751bbf1cb8551032d4a703ece27fef02f194fe8`, clean. The prior test account had one unrelated waiting Kernel in production; no task was canceled or changed.
+
+The app's two retained 129×768 model local replays passed new deployment labels and numeric checks, while retaining old-label FAIL. This does **not** establish Linux-cloud v2 calibration or successful Relay-v2 cloud reception. Both require the newly authorized two-route serial batch. No new cloud task, test-service restart, dependency installation or production operation has been performed in this preparation.
+
+After authorization, prefer one Relay and one direct task, same original-role 4 train/3 val/2 test sample set and existing Small weights. Reuse the runs for recovery, receipt, registered target validation and fresh-process prediction. Preserve original v1 failed runs and all original artifacts. P6 overall qualification remains pending.
+
+Implementation revisions prepared for review (not deployed): application `cefb7d79f8be5d28821f367c373d446a6c496feb`; Relay `3fe98a1e73185a572cd41a761349f195b3ca238f`. The final app local build preflight used this committed application version.
+
+## Authorized, waiting for idle account
+
+The user subsequently authorized exactly the prepared two-task serial scope and isolated sandbox update/start, conditional on the existing account having no unrelated active task. At 2026-09-28 09:52 +08:00 the application's real credential wrapper verified ACCESS_TOKEN identity `jsdfhasuh` and the unrelated Kernel was still RUNNING. No production job was canceled or changed.
+
+The clean stopped sandbox source was fast-forwarded to authorized `e0147930c4523342c2f4403b400f632133510ff1`; the prior container/image were not rebuilt or started. `python3 scripts/p6_calibration_sandbox.py --revision e0147930c4523342c2f4403b400f632133510ff1` (read-only) exited 1 at the active-account guard before any backup/build/container operation. This is expected safety behavior, not a new calibration failure. Two local acceptance projects are ready, new cloud-task usage is 0/2, and real v2 deployment/reception remains NOT_RUN. The existing authorization remains valid once the account becomes idle.
+
+## Subsequent explicit cjq selection and real Relay success
+
+The user selected `cjq`. Actual token introspection verified configured/authenticated owner `iiiitsme`; complete paginated Kernel inventory found seven terminal Kernels before submission. No production settings or unrelated jobs changed. The isolated test auth/state/private config were backed up before limiting its test token to `cjq`; historical account entries and task bindings were retained.
+
+`60379f01b7eb33af02c0b6122265c571b79b457a` replaces the hardcoded first-account deploy guard with a required explicit account ID and guards all configured aliases of that owner. Four focused tests passed. The stopped clean sandbox was synchronized, built with network disabled against its retained base, and started with `--account-id cjq --apply`. Actual image: `sha256:6f20d86df17e55b87d57d1051ffd2db7d06bfff93c7f23e4b65cea8d224ac38f`; every running app Python file matched source hashes. Python 3.11.16 / Kaggle SDK 2.2.4, health PASS. Old image/container/state remain available for rollback.
+
+Real Relay job `91051fc90b1b42a4a7c686b92b4fd654`, run `63481d2e-20de-4f7d-9dbc-a88c91d03aa0`, completed against Dataset `iiiitsme/relay-live-001-anomaly-74126b2a0695/1` and Kernel `iiiitsme/relay-live-001-relay-live-0-20260928-100742-7e5aac` version 1. Initial exact-candidate readbacks returned 403 then 404; the same candidate later passed byte verification without a second create/version. The platform detached and resumed the same run/job in a new process.
+
+Cloud v2 training, calibration, complete ONNX export, independent verification and formal frozen-graph publication passed. The authenticated v2 receipt and all 39 result files passed reception and registration. Windows no-Torch verification passed eight inputs (all three original calibration images included), with zero deployment-chain tensor/score/map differences relative to frozen Linux references. Old PyTorch-label comparison remains FAIL, not rewritten as an old-contract pass. This is a 129×768-bank, CPU/BASIC, batch1 experimental qualification, not business-quality or release qualification.
+
+The app fixed a v2 worker snapshot omission found by the first registered load (`5a640b1`); registered inference and fresh-process reopen then passed using the same received graph. A separate direct attempt hit Windows SDK cache MAX_PATH before Kernel submission. App `24c9c1d` repairs/probes that cache path; the original unknown upload intent is retained. Direct acceptance is still incomplete pending separately requested replacement-run authorization. No server workaround, production change, additional Kernel or threshold adjustment was used.
+
+Detailed redacted evidence lives in the application branch at `docs/evidence/patchcore-p6/calibration-v2-20260928/live-cjq.md` and its JSON companions. Deployment code revision, application execution revisions and later evidence commits are recorded separately.
+
+Final inventory: eight cjq Kernels, no active Kernel; the Relay test Kernel is COMPLETE and no direct test Kernel exists. After confirming zero active sandbox jobs, the test container was stopped. Its state/results and all rollback materials remain retained. Production stayed running on unchanged image `sha256:07bfc8f35deb099802edacde3751bbf1cb8551032d4a703ece27fef02f194fe8`. Free server space: 42,620,854,272 bytes. The original local Relay README modification was preserved. A replacement direct run has not started and needs the requested additional authorization.
+
+## Authorized replacement direct run completed; P6 closing batch
+
+The user subsequently granted exactly one replacement direct acceptance run, using cjq and the same images/weights. Application execution stayed at `231fbd5a445e29ce1aebf447bca5af4e8eb0818a`; no further product code, Relay deployment or local environment change was needed. The isolated Relay stayed stopped at actual runtime source `60379f0` throughout this direct run.
+
+Direct run `44019894-c70a-447c-906a-247033ecc3c4`, local job `f09fab7c-1fdc-42b6-be3f-36f451a7568e`, completed using `iiiitsme/direct-live-002-anomaly-74126b2a0695/1` and Kernel `iiiitsme/direct-live-002-direct-live-20260928-112933-f9b47e` version 1. Immediate post-upload readback initially returned 403 (run exit 1); actual platform `resume --resume-upload` subsequently verified the original candidate without reupload/version creation, submitted the Kernel once, and detached (exit 0). Another process used the platform resume entry to receive/register the complete result (exit 0).
+
+Direct cloud training/formal ONNX, Windows no-Torch qualification, registered RGB inference and new-process reopen/replay all PASS. All three original val images and eight total verification inputs passed the new deployment decision contract; Windows tensor/score/map differences from frozen Linux public-RGB references were zero. Old PyTorch-label FAIL remains separately reported. Both successful routes have 129×768 banks, 88,897,624-byte full graph sets, and three distinct training/candidate/deployment threshold records. The ordinary deployment packages contain no validation images.
+
+Final account inventory after the replacement: nine Kernels, zero active, both new successful Kernel versions COMPLETE, original failed direct Kernel absent. Three local runs across explicit authorizations produced only two actual cloud Kernels. The original unknown upload intent remains byte-identical; successful direct staging was cleaned through the platform. Production remained running on the unchanged image and the test sandbox remained exited. No further cloud task, release, main merge or P7 work is authorized by this result.
+
+The application stage report is `docs/evidence/patchcore-p6/calibration-v2-20260928/stage-complete-cjq.md`, with `direct-live-cjq-replacement.json` and `cjq-final-closure.json`. Recommend scoped P6 v2 normal-quantile CPU/BASIC batch1 pathway acceptance for review, not business quality, old-label equivalence, other profiles or desktop release qualification. All earlier pending/failure observations above remain chronological evidence.

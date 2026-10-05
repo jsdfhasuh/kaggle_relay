@@ -84,6 +84,7 @@ class Settings:
     max_archive_bytes: int = 8 * 1024**3
     min_free_bytes: int = 5 * 1024**3
     max_parallel_uploads: int = 40
+    max_parallel_uploads_per_user: int = 8
     upload_idle_seconds: int = 60
     auth_failure_limit: int = DEFAULT_AUTH_FAILURE_LIMIT
     auth_failure_window_seconds: int = DEFAULT_AUTH_FAILURE_WINDOW_SECONDS
@@ -109,6 +110,7 @@ class Settings:
             "max_active_jobs_per_user",
             "max_archive_bytes",
             "max_parallel_uploads",
+            "max_parallel_uploads_per_user",
             "upload_idle_seconds",
             "auth_failure_limit",
             "auth_failure_window_seconds",
@@ -172,6 +174,7 @@ class Settings:
             max_archive_bytes=_read_positive_int("RELAY_MAX_ARCHIVE_BYTES", 8 * 1024**3),
             min_free_bytes=int(os.environ.get("RELAY_MIN_FREE_BYTES", 5 * 1024**3)),
             max_parallel_uploads=_read_positive_int("RELAY_MAX_PARALLEL_UPLOADS", 40),
+            max_parallel_uploads_per_user=_read_positive_int("RELAY_MAX_PARALLEL_UPLOADS_PER_USER", 8),
             upload_idle_seconds=_read_positive_int("RELAY_UPLOAD_IDLE_SECONDS", 60),
             auth_failure_limit=_read_positive_int(
                 "RELAY_AUTH_FAILURE_LIMIT",

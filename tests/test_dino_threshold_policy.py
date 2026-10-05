@@ -200,9 +200,13 @@ def test_worker_applies_policy_before_push_without_changing_frozen_upload(tmp_pa
     monkeypatch.setattr("app.main.process_job", lambda *a, **kw: None)
     monkeypatch.setattr("app.worker.finish_kernel_job", lambda *a, **kw: None)
     app = create_app(settings)
+    (settings.jobs_dir / "previous/extracted/dataset").mkdir(parents=True)
     calls = []
 
     class Adapter:
+        def require_identity(self, owner):
+            return {"identity_verified": True}
+
         def __init__(self, *args, **kwargs):
             pass
 

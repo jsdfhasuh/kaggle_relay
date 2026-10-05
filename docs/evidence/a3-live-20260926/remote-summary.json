@@ -1,0 +1,69 @@
+{
+  "jobs": [
+    {
+      "job_id": "0c4dae77ba3043b08e5582e0583a08c4",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/yolo-w0-detect-730716a64536",
+      "kernel_ref": "jsdfhasuh/yolo-w0-yolo-w0-61742b06-tr-20260926-081229-dd0850",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": {
+        "state": "accepted",
+        "version_number": 2,
+        "content_sha256": "4ae30a05f192f87636eae2d5f7fbd64619f7581ceeb1d62996e0f3317321bb2b",
+        "operation": "version",
+        "auth_method": "access_token",
+        "identity_source": "token_introspection"
+      },
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "remote_inventory_count": 338,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/yolo_train.py"
+      ],
+      "kernel_version_observed": 1,
+      "numbered_pull_http": 403,
+      "kernel_source_sha256": "34837a79e9c381974ecc82df40e656716d763bffb5d0372744f758e99258c0db",
+      "submitted_source_sha256": "34837a79e9c381974ecc82df40e656716d763bffb5d0372744f758e99258c0db",
+      "source_bytes_match": true,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/yolo-w0-detect-730716a64536/2"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    },
+    {
+      "job_id": "59ebab0d18db4cd9843a644286367550",
+      "status": "failed",
+      "dataset_ref": "jsdfhasuh/cnn-quantile-w0-anomaly-e63e9fc61242",
+      "kernel_ref": "jsdfhasuh/cnn-quantile-w0-cnn-quantil-20260926-081812-bc1142",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": null,
+      "dataset_bytes_verified": false,
+      "kernel_versions_in_log": [],
+      "push_command_count": 0,
+      "dataset_status_http_code": 403,
+      "exact_dataset_in_mine_search": false,
+      "exact_kernel_in_mine_search": false,
+      "dataset_mutation_log_count": 0
+    }
+  ],
+  "active_jobs": []
+}

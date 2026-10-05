@@ -1,0 +1,301 @@
+{
+  "jobs": [
+    {
+      "job_id": "6f56c95c859146e9b9c66573bd05bada",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/yolo-w0-detect-730716a64536",
+      "kernel_ref": "jsdfhasuh/yolo-w0-yolo-w0-dfe73d45-tr-20260926-091351-ed30de",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": null,
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "exact_dataset_version": 2,
+      "cache_reused": true,
+      "remote_inventory_count": 338,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/yolo_train.py"
+      ],
+      "kernel_version_observed": 1,
+      "kernel_source_sha256": "37ce3f962dce91743e4703c75dd48afe504d83dd2e37e055da988d8d10856ff0",
+      "submitted_source_sha256": "37ce3f962dce91743e4703c75dd48afe504d83dd2e37e055da988d8d10856ff0",
+      "source_bytes_match": true,
+      "source_lf_normalized_match": true,
+      "submitted_crlf_count": 0,
+      "remote_crlf_count": 0,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/yolo-w0-detect-730716a64536/2"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    },
+    {
+      "job_id": "55ced6caa73845b290191d4bfeb276e1",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/cnn-quantile-w0-anomaly-e63e9fc61242",
+      "kernel_ref": "jsdfhasuh/cnn-quantile-w0-cnn-quantil-20260926-091934-a75cc5",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": {
+        "state": "accepted",
+        "version_number": 1,
+        "content_sha256": "7ba218104c75cd48a3a8228c2a2613beb06a35a46029e4a42e41de007879e7e2",
+        "operation": "create",
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "existence_basis": "authenticated_mine_inventory"
+      },
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "exact_dataset_version": 1,
+      "cache_reused": false,
+      "remote_inventory_count": 31,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/patchcore_train.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/environment.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/score_contract.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/training_progress.py"
+      ],
+      "kernel_version_observed": 1,
+      "kernel_source_sha256": "5f2937073b6d7d66f107ab128ec26b39944d562b31a40bc126b8803b935baf16",
+      "submitted_source_sha256": "2f83a0e9420fc003e5f82e6d145f679b6c8cd6a1241e079ec1e44e294ba8a9eb",
+      "source_bytes_match": false,
+      "source_lf_normalized_match": true,
+      "submitted_crlf_count": 217,
+      "remote_crlf_count": 0,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/cnn-quantile-w0-anomaly-e63e9fc61242/1"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    },
+    {
+      "job_id": "7885fd31467d4f96885ede8cca287572",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/yolo-w2-detect-730716a64536",
+      "kernel_ref": "jsdfhasuh/yolo-w2-yolo-w2-6f6f22be-tr-20260926-092402-5ad5cb",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": {
+        "state": "accepted",
+        "version_number": 1,
+        "content_sha256": "4ae30a05f192f87636eae2d5f7fbd64619f7581ceeb1d62996e0f3317321bb2b",
+        "operation": "create",
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "existence_basis": "authenticated_mine_inventory"
+      },
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "exact_dataset_version": 1,
+      "cache_reused": false,
+      "remote_inventory_count": 338,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/yolo_train.py"
+      ],
+      "kernel_version_observed": 1,
+      "kernel_source_sha256": "ca75ec9b7ca8f4f91a65663b9b4f6dd51e28946c54399643500d76a057660f38",
+      "submitted_source_sha256": "ca75ec9b7ca8f4f91a65663b9b4f6dd51e28946c54399643500d76a057660f38",
+      "source_bytes_match": true,
+      "source_lf_normalized_match": true,
+      "submitted_crlf_count": 0,
+      "remote_crlf_count": 0,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/yolo-w2-detect-730716a64536/1"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    },
+    {
+      "job_id": "fcb66e776c5646f88ce681b1cca9bef6",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/cnn-quantile-w2-anomaly-e63e9fc61242",
+      "kernel_ref": "jsdfhasuh/cnn-quantile-w2-cnn-quantil-20260926-093016-124d59",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": {
+        "state": "accepted",
+        "version_number": 1,
+        "content_sha256": "4c7d9a905676e697d8cd664f40867cb7e72c0cfab182df8fb085de2caed1647b",
+        "operation": "create",
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "existence_basis": "authenticated_mine_inventory"
+      },
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "exact_dataset_version": 1,
+      "cache_reused": false,
+      "remote_inventory_count": 31,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/patchcore_train.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/environment.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/score_contract.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/training_progress.py"
+      ],
+      "kernel_version_observed": 1,
+      "kernel_source_sha256": "85597fe00f0538234d836ab962556144c236533cd0be6da2bf9c4f0c25e8a280",
+      "submitted_source_sha256": "cac52cf45f5dddaa9b6dfe29d87834541cda1d3843104706ae3c7ae57c1d0367",
+      "source_bytes_match": false,
+      "source_lf_normalized_match": true,
+      "submitted_crlf_count": 217,
+      "remote_crlf_count": 0,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/cnn-quantile-w2-anomaly-e63e9fc61242/1"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    },
+    {
+      "job_id": "ef7b680ee4374eaf91b8fbc5ae693654",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/cnn-f1-w0-anomaly-7494673af514",
+      "kernel_ref": "jsdfhasuh/cnn-f1-w0-cnn-f1-w0-6ab8d5e-20260926-093536-d10dcb",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": {
+        "state": "accepted",
+        "version_number": 1,
+        "content_sha256": "03a33570c64cc7c6b9c6cf26e7dfcb8183bd0eab113648fd3c908cf363a70ae4",
+        "operation": "create",
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "existence_basis": "authenticated_mine_inventory"
+      },
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "exact_dataset_version": 1,
+      "cache_reused": false,
+      "remote_inventory_count": 35,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/patchcore_train.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/environment.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/score_contract.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/training_progress.py"
+      ],
+      "kernel_version_observed": 1,
+      "kernel_source_sha256": "0ec260a6174d37108fdb4de665053c4e71c88b8b2ea4c5384d024c35bb9ffbe8",
+      "submitted_source_sha256": "c00d870b0972fc7eb4348a4b67426cd8f3183f5e77833de32b0c6689d2434d36",
+      "source_bytes_match": false,
+      "source_lf_normalized_match": true,
+      "submitted_crlf_count": 217,
+      "remote_crlf_count": 0,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/cnn-f1-w0-anomaly-7494673af514/1"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    },
+    {
+      "job_id": "5070d13eeb064916b8469087db6d7abd",
+      "status": "complete",
+      "dataset_ref": "jsdfhasuh/cnn-f1-w2-anomaly-7494673af514",
+      "kernel_ref": "jsdfhasuh/cnn-f1-w2-cnn-f1-w2-e3fefb1-20260926-094153-533938",
+      "owner_consistent": true,
+      "identity": {
+        "identity_verified": true,
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "identity_error": ""
+      },
+      "intent": {
+        "state": "accepted",
+        "version_number": 1,
+        "content_sha256": "4ce993f2fc0e3df7340c2a8211785b1f8fe459409743fec881d1847234c8b50b",
+        "operation": "create",
+        "auth_method": "access_token",
+        "identity_source": "token_introspection",
+        "existence_basis": "authenticated_mine_inventory"
+      },
+      "dataset_bytes_verified": true,
+      "kernel_versions_in_log": [
+        1
+      ],
+      "push_command_count": 1,
+      "exact_dataset_version": 1,
+      "cache_reused": false,
+      "remote_inventory_count": 35,
+      "remote_has_runtime_zip": false,
+      "expanded_runtime_files": [
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/config.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/patchcore_train.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/__init__.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/environment.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/score_contract.py",
+        "model_source/kaggle_runtime/runtime/kaggle_runtime/support/training_progress.py"
+      ],
+      "kernel_version_observed": 1,
+      "kernel_source_sha256": "45d737d6d1f11c468636e3a9080fa5a83207fd1b43c2379787c07e2da84a9e48",
+      "submitted_source_sha256": "448f4c102272ce9b05b374d4a891ded869a1f4ab1d5aedda6b3ffe52ba4e19f7",
+      "source_bytes_match": false,
+      "source_lf_normalized_match": true,
+      "submitted_crlf_count": 217,
+      "remote_crlf_count": 0,
+      "is_private": true,
+      "dataset_sources": [
+        "jsdfhasuh/cnn-f1-w2-anomaly-7494673af514/1"
+      ],
+      "actual_kernel_status": "KernelWorkerStatus.COMPLETE"
+    }
+  ],
+  "active_jobs": []
+}

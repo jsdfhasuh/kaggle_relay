@@ -1,0 +1,13 @@
+{
+  "admin_reveal": "PASS",
+  "self_reveal_without_key_permission": "PASS",
+  "cross_user_and_cross_origin_denied": "PASS",
+  "delete": "PASS",
+  "old_cookie_and_bearer_401": "PASS",
+  "retired_id_409": "PASS",
+  "public_health": "PASS",
+  "unchanged_real_users_and_accounts": "PASS",
+  "config_reload_revocation": "PASS",
+  "test_user_cleaned": true,
+  "training_submitted": false
+}
