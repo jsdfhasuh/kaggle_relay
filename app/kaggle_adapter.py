@@ -27,6 +27,7 @@ from app.dinov2_251_artifacts import CONTRACT as DINO251_CONTRACT, CONTRACT_V2 a
 from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
+from app.stop_reason import classify_stop_reason, provider_state
 from app.payload_contract import verify_upload_archive
 from app.dataset_file_verification import archive_url_missing, verify_version_files
 from app.dataset_verification_process import DatasetVerificationError, run_verification, verification_error
@@ -1240,21 +1241,35 @@ class KaggleAdapter:
 
     def wait_kernel(self, kernel_ref: str, progress_callback: Callable[[dict], None]) -> str:
         deadline = time.monotonic() + self.settings.kernel_max_wait_seconds
+        self.last_stop_details = {}
         last_progress_key = None
         query_failures = 0
         output = "Kernel terminal status has not been observed"
         while True:
             self._check_interrupted()
             if time.monotonic() >= deadline:
+                self.last_stop_details = {
+                    "reason": "monitoring_timeout", "source": "relay", "confidence": "unknown",
+                    "provider_status": provider_state(output),
+                    "message": "Relay monitoring deadline exceeded; the original run is retained and its terminal state is unknown.",
+                }
                 raise KernelStatusUnavailable(f"Kernel monitoring deadline exceeded; retained original run:\n{output}")
             try:
                 output = self.kernel_status(kernel_ref)
             except KernelStatusQueryError as exc:
                 if not exc.transient:
+                    self.last_stop_details = {
+                        "reason": "status_unavailable", "source": "relay", "confidence": "unknown",
+                        "message": redact_secrets(str(exc))[-2000:],
+                    }
                     raise
                 query_failures += 1
                 remaining = max(0, deadline - time.monotonic())
                 if not remaining:
+                    self.last_stop_details = {
+                        "reason": "monitoring_timeout", "source": "relay", "confidence": "unknown",
+                        "message": "Relay status-query retry budget exhausted; training termination is unconfirmed.",
+                    }
                     raise KernelStatusUnavailable(str(exc)) from exc
                 delay = min(60, 5 * 2 ** min(query_failures - 1, 4), remaining)
                 self.log(f"Kernel status temporarily unavailable; retry {query_failures} in {delay:.0f}s: "
@@ -1278,10 +1293,12 @@ class KaggleAdapter:
                 if key != last_progress_key:
                     last_progress_key = key
                     progress_callback(progress)
-            status_text = output.lower()
-            if any(word in status_text for word in ["complete", "succeeded", "success"]):
+            state = provider_state(output)
+            if state in {"COMPLETE", "COMPLETED", "SUCCEEDED", "SUCCESS"}:
+                self.last_stop_details = classify_stop_reason(output, logs)
                 return output
-            if any(word in status_text for word in ["error", "failed", "failure", "cancel"]):
+            if state in {"ERROR", "FAILED", "FAILURE", "CANCELED", "CANCELLED", "CANCEL_ACKNOWLEDGED"}:
+                self.last_stop_details = classify_stop_reason(output, logs)
                 raise KaggleAdapterError(f"Kernel failed:\n{output}")
             self._sleep(min(self.settings.kernel_poll_seconds, max(0, deadline - time.monotonic())))
 

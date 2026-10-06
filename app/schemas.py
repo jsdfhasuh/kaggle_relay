@@ -84,6 +84,7 @@ class JobResponse(BaseModel):
     progress: float
     dataset_status: str = ""
     kernel_status: str = ""
+    stop_details: dict[str, Any] = Field(default_factory=dict)
     kaggle_output: str = ""
     error: str = ""
     payload_hash: str = ""

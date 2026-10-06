@@ -784,6 +784,7 @@
             <div id="detailEmpty" class="muted">选择任务后显示状态、产物、日志和完整 JSON。</div>
             <div id="detailContent" hidden>
               <div id="detailSummary" class="detail-grid"></div>
+              <div id="detailStop" class="detail-block" hidden></div>
               <div id="detailError" class="detail-block" hidden></div>
               <div class="detail-block">
                 <h3>最近日志</h3>
@@ -1186,6 +1187,78 @@
         : {title: raw || "未提供失败原因，请查看日志", suggestion: "", recognized: false};
     }
 
+    function stopDetails(job) {
+      const details = job.stop_details;
+      return details && typeof details === "object" && !Array.isArray(details) && Object.keys(details).length
+        ? details : null;
+    }
+
+    function stopReasonLabel(reason) {
+      const labels = {
+        training_stopped: "训练已结束，等待 Kaggle 收尾",
+        early_stopping: "提前停止（非训练失败）",
+        epochs_completed: "达到设定训练轮数",
+        time_budget: "达到训练时间预算",
+        completed_unknown: "已完成，具体停止原因未知",
+        provider_canceled: "Kaggle 已取消运行",
+        provider_failed: "Kaggle 执行失败（训练停止原因另列）",
+        user_canceled: "用户取消",
+        training_failed: "训练失败",
+        monitoring_timeout: "Relay 监控等待超时（训练结果未确认）",
+        status_unavailable: "暂时无法获取状态（训练结果未确认）",
+        relay_failed: "Relay 处理失败（不代表训练失败）"
+      };
+      return Object.hasOwn(labels, reason) ? labels[reason] : "停止原因未知";
+    }
+
+    function renderStopDetails(job) {
+      const details = stopDetails(job);
+      if (!details) return "";
+      const lines = [`停止原因：${stopReasonLabel(details.reason)}`];
+      const levels = {
+          training_stopped: "训练停止记录",
+        early_stopping: "训练停止记录", epochs_completed: "训练停止记录", time_budget: "训练停止记录",
+        training_failed: "训练停止记录", completed_unknown: "Kaggle 平台状态",
+        provider_canceled: "Kaggle 平台状态", provider_failed: "Kaggle 平台状态",
+        user_canceled: "用户取消记录", relay_failed: "Relay 处理结果",
+        monitoring_timeout: "Relay 监控结果", status_unavailable: "Relay 监控结果"
+      };
+      lines.push(`观测层级：${Object.hasOwn(levels, details.reason) ? levels[details.reason] : "未知"}`);
+      if (details.training_reason) lines.push(`训练停止原因：${stopReasonLabel(details.training_reason)}`);
+      if ([details.reason, details.training_reason].includes("early_stopping")) {
+        lines.push("提前停止表示连续若干轮验证指标未改善而正常结束训练；patience 控制等待轮数，不控制最佳权重保存，也不保证后续产物处理成功。");
+      }
+      if (details.reason === "provider_canceled") {
+        lines.push("平台取消状态本身不能确定取消原因。");
+      }
+      if (details.reason === "provider_failed") {
+        lines.push("平台执行失败不等于训练阶段失败；训练可能已正常结束，后续导出等阶段的错误需结合原始错误和日志确认。");
+      }
+      if (["monitoring_timeout", "status_unavailable"].includes(details.reason)) {
+        lines.push("这是 Relay 的监控结果，不能据此判断训练已停止或失败。");
+      }
+      if (details.suspected_reason) {
+        lines.push(details.suspected_reason === "time_limit"
+          ? "疑似原因：达到 Kaggle 运行时限（推测，未确认）。"
+          : `疑似原因（推测，未确认）：${details.suspected_reason}`);
+      }
+      if (details.message) lines.push(`记录说明：${details.message}`);
+      const sources = {training_log: "训练日志", provider: "Kaggle 平台", provider_status: "Kaggle 平台状态",
+        relay: "Relay", relay_and_provider: "Relay 与 Kaggle 平台"};
+      const confidence = {confirmed: "已确认", inferred: "推测，未确认", suspected: "疑似，未确认", unknown: "未知"};
+      lines.push(`依据来源：${Object.hasOwn(sources, details.source) ? sources[details.source] : details.source || "未提供"}`);
+      lines.push(`确定程度：${Object.hasOwn(confidence, details.confidence) ? confidence[details.confidence] : "未知"}`);
+      if (details.provider_status) lines.push(`Kaggle 原始状态：${details.provider_status}`);
+      for (const [key, label] of [["epoch", "已回报轮次"], ["epochs", "设定总轮数"],
+        ["best_epoch", "最佳轮次"], ["patience", "早停等待轮数"]]) {
+        if (Number.isSafeInteger(details[key]) && details[key] >= 0) lines.push(`${label}：${details[key]}`);
+      }
+      if (typeof details.elapsed_seconds === "number" && Number.isFinite(details.elapsed_seconds) && details.elapsed_seconds >= 0) {
+        lines.push(`已用时间：${details.elapsed_seconds} 秒`);
+      }
+      return `<h3>停止详情</h3>${lines.map(line => `<div class="muted wrap">${escapeHtml(line)}</div>`).join("")}`;
+    }
+
     function renderProgress(job) {
       const progress = jobProgress(job);
       return `${progress.text ? `<div class="job-note small">${escapeHtml(progress.text)}</div>` : ""}
@@ -1218,6 +1291,7 @@
             <td class="status-cell">
               ${statusPill(job.status, jobProgress(job).stage)}
               ${renderProgress(job)}
+              ${stopDetails(job) ? `<div class="job-note muted small">停止记录：${escapeHtml(stopReasonLabel(job.stop_details.reason))}</div>` : ""}
               ${job.error || job.status === "failed" ? `<div class="job-note job-error small" title="${escapeHtml(job.error)}">${escapeHtml(failureSummary(job).title)}</div>` : ""}
               ${job.queue_reason ? `<div class="job-note muted small" title="${escapeHtml(job.queue_reason)}">${escapeHtml(job.queue_reason)}</div>` : ""}
             </td>
@@ -1398,6 +1472,10 @@
           <div class="metric-value">${escapeHtml(fmtTimestamp(data.updated_at))}</div>
         </div>
       `;
+
+      const stopBox = qs("detailStop");
+      stopBox.innerHTML = renderStopDetails(data);
+      stopBox.hidden = !stopBox.innerHTML;
 
       const errorBox = qs("detailError");
       const cancelText = data.cancel_requested

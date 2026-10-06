@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -432,6 +433,19 @@ def finish_kernel_job(
         if str(current.get("status")) not in TERMINAL_JOB_STATUSES:
             db.update_job(job_id, error="kernel_status_unknown: " + redact_secrets(str(exc)))
         raise
+    finally:
+        try:
+            details = getattr(adapter, "last_stop_details", None)
+            if isinstance(details, dict) and details:
+                current = latest_job()
+                details = dict(details)
+                if details.get("reason") == "provider_canceled" and job_cancel_requested(current):
+                    details.update(reason="user_canceled", source="relay_and_provider",
+                                   message="Relay cancellation was requested and Kaggle confirmed cancellation.")
+                db.record_stop_details(job_id, details)
+        except Exception as diagnostic_error:
+            logging.getLogger(__name__).warning("Stop details could not be stored for %s (%s)",
+                                                job_id, type(diagnostic_error).__name__)
     current = latest_job()
     db.update_job(job_id, kernel_status=kernel_status, progress=max(float(current.get("progress") or 0), 82))
 
