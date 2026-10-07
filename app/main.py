@@ -35,6 +35,7 @@ from app.quota_cache import QuotaCache
 from app.scheduler import awaiting_assignment, eligible_accounts, scheduler_loop
 from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted, KernelStatusUnavailable
+from app.stop_reason import classify_stop_reason
 from app.upload_intent import intent_path, read_intent
 from app.schemas import (
     ChunkResponse,
@@ -916,6 +917,20 @@ def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest)
     clean_message = redact_secrets(callback_log_message(data))[-8000:]
     if clean_message:
         db.append_log(job["job_id"], clean_message)
+    if payload.event_type == "training_stop":
+        details = classify_stop_reason("RUNNING", clean_message)
+        if details.get("training_reason"):
+            details.update(reason="training_stopped", source="runtime", confidence="confirmed",
+                           provider_status="UNKNOWN",
+                           message="The runtime reported training ended; Kaggle completion and artifact delivery are still pending.")
+            try:
+                db.record_stop_details(job["job_id"], details,
+                                       expected_statuses={"pushing_kernel", "waiting_kernel", "cancel_requested",
+                                                          "downloading_output", "complete", "failed", "canceled"})
+            except Exception as diagnostic_error:
+                LOGGER.warning("Stop callback details could not be stored for %s (%s)",
+                               job["job_id"], type(diagnostic_error).__name__)
+        return
     for _attempt in range(5):
         current = db.get_job(job["job_id"])
         if not current:
@@ -960,6 +975,10 @@ def request_job_cancel(db: RelayDb, job: dict) -> None:
                 {
                     "status": "canceled",
                     "error": "canceled before submission",
+                    "stop_details": json.dumps({
+                        "reason": "user_canceled", "source": "relay", "confidence": "confirmed",
+                        "message": "Canceled by user before Kaggle submission; training did not start.",
+                    }),
                 }
             )
         else:

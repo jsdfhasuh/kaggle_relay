@@ -96,6 +96,7 @@ class RelayDb:
                 """
             )
             self._ensure_column(conn, "jobs", "callback_token_sha256", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "stop_details", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "jobs", "dataset_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "identity_sha256", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "run_id", "TEXT NOT NULL DEFAULT ''")
@@ -532,6 +533,18 @@ class RelayDb:
             **values,
         }
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT stop_details, status, cancel_requested_at FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row and row["status"] not in {"complete", "failed", "canceled"} and row["stop_details"] in {"", "{}"}:
+                canceled = row["cancel_requested_at"] is not None or row["status"] == "cancel_requested"
+                outcome = "canceled" if canceled else preferred_status
+                reason = {"complete": "completed_unknown", "failed": "relay_failed", "canceled": "user_canceled"}[outcome]
+                details = {"reason": reason, "source": "relay", "confidence": "unknown",
+                           "message": "Relay processing ended; a specific training stop reason was not observed."}
+                conn.execute("UPDATE jobs SET stop_details = ? WHERE job_id = ?",
+                             (json.dumps(details), job_id))
+                conn.execute("INSERT INTO logs (job_id, created_at, message) VALUES (?, ?, ?)",
+                             (job_id, stamp, "STOP_DETAILS " + json.dumps(details)))
             conn.execute(
                 f"""
                 UPDATE jobs
@@ -552,6 +565,65 @@ class RelayDb:
                 (job_id,),
             ).fetchone()
         return str(row["status"]) if row else None
+
+    def record_stop_details(self, job_id: str, details: dict, *, expected_statuses=None) -> None:
+        """Persist the observation separately from progress and artifact processing."""
+        from app.security import redact_secrets
+
+        stamp = now_ts()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT stop_details FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                return
+            try:
+                previous = json.loads(row["stop_details"] or "{}")
+            except (TypeError, ValueError):
+                previous = {}
+            if not isinstance(previous, dict):
+                previous = {}
+            details = dict(details)
+            training_reasons = {"early_stopping", "epochs_completed", "time_budget"}
+            if (details.get("reason") == "training_stopped" and previous
+                    and previous.get("reason") not in {"training_stopped", "unknown", "monitoring_timeout", "status_unavailable"}):
+                # Late runtime evidence can enrich, but never replace, an outcome.
+                incoming = details
+                details = dict(previous)
+                if incoming.get("training_reason") in training_reasons:
+                    details.setdefault("training_reason", incoming["training_reason"])
+                    for field in ("epoch", "epochs", "best_epoch", "patience", "elapsed_seconds"):
+                        if field in incoming:
+                            details.setdefault(field, incoming[field])
+            training = previous.get("training_reason") or previous.get("reason")
+            incoming_training = details.get("training_reason") or details.get("reason")
+            if training in training_reasons and incoming_training == training:
+                for field in ("epoch", "epochs", "best_epoch", "patience", "elapsed_seconds"):
+                    if field in previous:
+                        details.setdefault(field, previous[field])
+            if training in training_reasons and not details.get("training_reason") and details.get("reason") not in training_reasons:
+                # A later log-fetch failure must not erase a received runtime stop.
+                details["training_reason"] = training
+                for field in ("epoch", "epochs", "best_epoch", "patience", "elapsed_seconds"):
+                    if field in previous:
+                        details.setdefault(field, previous[field])
+                if (details.get("reason") == "completed_unknown" and previous.get("confidence") == "confirmed"
+                        and previous.get("source") in {"runtime", "logs"}):
+                    details.update(reason=training, source=previous["source"], confidence="confirmed",
+                                   message="Kaggle completed; the previously recorded training stop reason is retained.")
+            encoded = redact_secrets(json.dumps(details, ensure_ascii=False, sort_keys=True))
+            if row["stop_details"] == encoded:
+                return
+            query = "UPDATE jobs SET stop_details = ?, updated_at = ? WHERE job_id = ?"
+            params = [encoded, stamp, job_id]
+            if expected_statuses is not None:
+                if not expected_statuses:
+                    return
+                query += " AND status IN (" + ",".join("?" for _ in expected_statuses) + ")"
+                params.extend(sorted(expected_statuses))
+            if not conn.execute(query, params).rowcount:
+                return
+            conn.execute("INSERT INTO logs (job_id, created_at, message) VALUES (?, ?, ?)",
+                         (job_id, stamp, "STOP_DETAILS " + encoded))
 
     def add_chunk(
         self,
@@ -813,6 +885,11 @@ class RelayDb:
     @staticmethod
     def to_response(job: dict[str, Any], accepted_chunks: dict[str, list[int]], logs: list[str]) -> dict[str, Any]:
         response = dict(job)
+        try:
+            details = json.loads(response.get("stop_details") or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        response["stop_details"] = details if isinstance(details, dict) else {}
         response["accepted_chunks"] = accepted_chunks
         response["recent_logs"] = logs
         return response

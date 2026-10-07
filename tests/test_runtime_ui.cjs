@@ -120,6 +120,115 @@ test('in-progress filter excludes queued jobs, and search remains server-side', 
   assert.equal(ui.jobListParams().get('status'), 'queued');
 });
 
+test('stop details explain early stopping and preserve separate artifact errors', () => {
+  const ui = page();
+  ui.renderDetail({job_id: 'early-stop', status: 'failed', error: 'artifact file is missing',
+    stop_details: {reason: 'relay_failed', training_reason: 'early_stopping', source: 'training_log',
+      confidence: 'confirmed', message: 'No improvement for 200 epochs', provider_status: 'COMPLETE',
+      epoch: 473, epochs: 500, best_epoch: 273, patience: 200, elapsed_seconds: 42000}});
+  const stop = ui.qs('detailStop');
+  assert.equal(stop.hidden, false);
+  for (const value of ['训练停止原因：提前停止（非训练失败）', '不控制最佳权重保存',
+    '依据来源：训练日志', '确定程度：已确认', 'Kaggle 原始状态：COMPLETE',
+    '已回报轮次：473', '设定总轮数：500', '最佳轮次：273', '早停等待轮数：200',
+    '已用时间：42000 秒', 'No improvement for 200 epochs']) assert.ok(stop.innerHTML.includes(value), value);
+  assert.equal(ui.qs('detailError').hidden, false);
+  assert.match(ui.qs('detailError').innerHTML, /artifact file is missing/);
+  assert.doesNotMatch(stop.innerHTML, /artifact file is missing/);
+  assert.match(ui.qs('detailSummary').innerHTML, /失败/);
+});
+
+test('all stop reasons have conservative Chinese labels in details and list', () => {
+  const ui = page();
+  const expected = {
+    early_stopping: '提前停止（非训练失败）', epochs_completed: '达到设定训练轮数',
+    time_budget: '达到训练时间预算', completed_unknown: '已完成，具体停止原因未知',
+    provider_canceled: 'Kaggle 已取消运行', user_canceled: '用户取消', training_failed: '训练失败',
+    provider_failed: 'Kaggle 执行失败（训练停止原因另列）',
+    monitoring_timeout: 'Relay 监控等待超时（训练结果未确认）',
+    status_unavailable: '暂时无法获取状态（训练结果未确认）', relay_failed: 'Relay 处理失败（不代表训练失败）',
+  };
+  for (const [reason, label] of Object.entries(expected)) {
+    const job = {job_id: reason, status: 'complete', stop_details: {reason}};
+    ui.renderDetail(job);
+    ui.renderJobs([job]);
+    assert.ok(ui.qs('detailStop').innerHTML.includes(`停止原因：${label}`));
+    assert.ok(ui.qs('jobsBody').innerHTML.includes(`停止记录：${label}`));
+    assert.equal(ui.qs('detailError').hidden, true);
+  }
+});
+
+test('time limit is only a suspicion and cancellation alone supplies no cause', () => {
+  const ui = page();
+  const job = {job_id: 'canceled', status: 'failed', stop_details: {reason: 'provider_canceled',
+    source: 'provider_status', confidence: 'inferred', provider_status: 'CANCEL_ACKNOWLEDGED',
+    suspected_reason: 'time_limit'}};
+  ui.renderDetail(job);
+  assert.match(ui.qs('detailStop').innerHTML, /疑似原因：达到 Kaggle 运行时限（推测，未确认）/);
+  assert.match(ui.qs('detailStop').innerHTML, /确定程度：推测，未确认/);
+  assert.match(ui.qs('detailStop').innerHTML, /平台取消状态本身不能确定取消原因/);
+  delete job.stop_details.suspected_reason;
+  ui.renderDetail(job);
+  assert.doesNotMatch(ui.qs('detailStop').innerHTML, /运行时限/);
+  for (const reason of ['monitoring_timeout', 'status_unavailable']) {
+    ui.renderDetail({...job, stop_details: {reason}});
+    assert.match(ui.qs('detailStop').innerHTML, /不能据此判断训练已停止或失败/);
+    assert.match(ui.qs('detailStop').innerHTML, /观测层级：Relay 监控结果/);
+  }
+});
+
+test('provider failure after training retains the training stop reason and export error', () => {
+  const ui = page();
+  ui.renderDetail({job_id: 'export-failed', status: 'failed', error: 'ONNX export failed',
+    stop_details: {reason: 'provider_failed', training_reason: 'epochs_completed',
+      provider_status: 'ERROR', confidence: 'confirmed', source: 'provider_status'}});
+  const content = ui.qs('detailStop').innerHTML;
+  assert.match(content, /停止原因：Kaggle 执行失败（训练停止原因另列）/);
+  assert.match(content, /训练停止原因：达到设定训练轮数/);
+  assert.match(content, /观测层级：Kaggle 平台状态/);
+  assert.match(content, /平台执行失败不等于训练阶段失败/);
+  assert.match(content, /Kaggle 原始状态：ERROR/);
+  assert.match(ui.qs('detailError').innerHTML, /ONNX export failed/);
+  assert.doesNotMatch(content, /ONNX export failed|训练停止原因：训练失败/);
+});
+
+test('missing or malformed stop details clear previous content without inventing reasons', () => {
+  const ui = page();
+  for (const stop_details of [undefined, null, {}, [], 'early_stopping', 1]) {
+    ui.renderDetail({job_id: 'previous', stop_details: {reason: 'early_stopping'}});
+    ui.renderDetail({job_id: 'older', status: 'complete', stop_details});
+    assert.equal(ui.qs('detailStop').hidden, true);
+    assert.equal(ui.qs('detailStop').innerHTML, '');
+    ui.renderJobs([{job_id: 'older', status: 'complete', stop_details}]);
+    assert.doesNotMatch(ui.qs('jobsBody').innerHTML, /停止记录/);
+  }
+  for (const reason of ['new_reason', '__proto__', 'constructor', undefined]) {
+    ui.renderDetail({job_id: 'unknown', stop_details: {reason, confidence: 'new_confidence',
+      source: 'constructor', epoch: null, epochs: '500', best_epoch: -1, patience: false, elapsed_seconds: Infinity}});
+    const content = ui.qs('detailStop').innerHTML;
+    assert.match(content, /停止原因：停止原因未知/);
+    assert.match(content, /确定程度：未知/);
+    assert.doesNotMatch(content, /正常结束|训练失败|运行时限|最佳轮次|已回报轮次|设定总轮数|早停等待轮数|已用时间/);
+  }
+});
+
+test('stop details escape every supplied text field and preserve zero numeric values', () => {
+  const ui = page();
+  const attack = '<img src=x onerror="alert(1)"><script>alert(1)</script>&';
+  const stop_details = Object.fromEntries(['reason', 'training_reason', 'source', 'confidence',
+    'message', 'provider_status', 'suspected_reason'].map(key => [key, attack]));
+  Object.assign(stop_details, {epoch: 0, best_epoch: 0, patience: 0, elapsed_seconds: 0});
+  ui.renderDetail({job_id: 'unsafe', status: 'failed', error: 'independent error', stop_details});
+  ui.renderJobs([{job_id: 'unsafe', status: 'failed', error: 'independent error', stop_details}]);
+  const content = ui.qs('detailStop').innerHTML;
+  assert.doesNotMatch(content + ui.qs('jobsBody').innerHTML, /<img|<script/);
+  assert.match(content, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
+  assert.match(content, /已回报轮次：0/);
+  assert.match(content, /早停等待轮数：0/);
+  assert.match(content, /已用时间：0 秒/);
+  assert.match(ui.qs('jobsBody').innerHTML, /independent error/);
+});
+
 test('overview loads uncapped counts and clears stale values on error', async () => {
   const ui = page();
   let url;
