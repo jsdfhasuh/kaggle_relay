@@ -1187,6 +1187,17 @@
         : {title: raw || "未提供失败原因，请查看日志", suggestion: "", recognized: false};
     }
 
+    function datasetRecheckText(job) {
+      if (!["waiting_dataset", "queued"].includes(job.status)) return "";
+      if (job.dataset_recheck_state === "scheduled") {
+        return `等待 Kaggle 数据集就绪；下次自动检查：${fmtTimestamp(job.dataset_recheck_at)}`;
+      }
+      if (job.dataset_recheck_state === "checking") return "正在恢复原数据集版本核验，不重复上传";
+      if (job.dataset_recheck_state === "exhausted") return "数据集自动检查已超过 24 小时，需要人工恢复";
+      if (job.dataset_recheck_state === "blocked") return "数据集自动检查已停止，需要人工检查错误原因";
+      return "";
+    }
+
     function stopDetails(job) {
       const details = job.stop_details;
       return details && typeof details === "object" && !Array.isArray(details) && Object.keys(details).length
@@ -1293,7 +1304,7 @@
               ${renderProgress(job)}
               ${stopDetails(job) ? `<div class="job-note muted small">停止记录：${escapeHtml(stopReasonLabel(job.stop_details.reason))}</div>` : ""}
               ${job.error || job.status === "failed" ? `<div class="job-note job-error small" title="${escapeHtml(job.error)}">${escapeHtml(failureSummary(job).title)}</div>` : ""}
-              ${job.queue_reason ? `<div class="job-note muted small" title="${escapeHtml(job.queue_reason)}">${escapeHtml(job.queue_reason)}</div>` : ""}
+              ${datasetRecheckText(job) || job.queue_reason ? `<div class="job-note muted small" title="${escapeHtml(job.queue_reason)}">${escapeHtml(datasetRecheckText(job) || job.queue_reason)}</div>` : ""}
             </td>
             <td class="wrap">
               <div class="mono">${escapeHtml(job.kaggle_key_id || "legacy")}</div>
@@ -1453,6 +1464,7 @@
         <div class="metric">
           <div class="metric-label">阶段与训练回报</div>
           <div>${renderProgress(data)}</div>
+          <div class="muted small">${escapeHtml(datasetRecheckText(data))}</div>
           <div class="muted small">Relay 流程进度：${Math.round(clampProgress(data.progress))}%（非训练完成比例）</div>
         </div>
         <div class="metric">

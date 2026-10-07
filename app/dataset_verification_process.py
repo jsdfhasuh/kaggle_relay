@@ -129,7 +129,8 @@ def run_verification(adapter, cmd, env, cwd, input_text, budget, cancel_check):
                 budget.check_free()
             if remaining[phase] <= 0:
                 if phase == "publication":
-                    raise DatasetVerificationError("payload_publication_timeout: Dataset publication deadline exceeded")
+                    raise DatasetVerificationError("payload_publication_timeout: Dataset publication deadline exceeded",
+                                                   "publication")
                 raise TimeoutError("Dataset content verification exceeded its transfer timeout")
             try:
                 line = lines.get(timeout=min(0.2, remaining[phase]))

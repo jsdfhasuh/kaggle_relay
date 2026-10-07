@@ -58,6 +58,16 @@ def test_retry_after_is_honored(verification):
     assert clock[0] == 75
 
 
+def test_background_check_preserves_retry_after_and_releases_worker(verification):
+    adapter, receipt, logs, clock = verification
+    adapter.verify_dataset_content = Mock(side_effect=http_error(429, "900"))
+    with pytest.raises(DatasetVerificationError) as caught:
+        adapter.wait_dataset("owner/data", upload_receipt=receipt, background=True)
+    assert caught.value.http_status == 429 and caught.value.retry_after == 900
+    assert clock[0] == 0 and adapter.verify_dataset_content.call_count == 1
+    assert adapter.verify_dataset_content.call_args.kwargs == {"archive_only": True}
+
+
 def test_retry_after_date_and_invalid_values(monkeypatch):
     monkeypatch.setattr("app.dataset_verification_process.time.time", lambda: 1000)
     assert retry_after_seconds(formatdate(1060, usegmt=True)) == 60

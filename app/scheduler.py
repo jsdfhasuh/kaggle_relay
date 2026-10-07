@@ -7,6 +7,7 @@ import logging
 from fastapi import FastAPI
 
 from app.auth_config import AuthStore
+from app.dataset_recovery import schedule_dataset_rechecks
 from app.kaggle_adapter import KaggleAdapter
 from app.security import redact_secrets
 from app.worker import rewrite_ref_owner
@@ -133,6 +134,10 @@ async def schedule_pending_jobs(app: FastAPI) -> None:
 async def scheduler_loop(app: FastAPI) -> None:
     while not app.state.shutdown_event.is_set():
         app.state.scheduler_event.clear()
+        try:
+            await schedule_dataset_rechecks(app)
+        except Exception:
+            LOGGER.exception("Dataset recheck scheduling failed; retained jobs will be retried")
         try:
             await schedule_pending_jobs(app)
         except Exception:

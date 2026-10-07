@@ -67,6 +67,7 @@ from app.worker import (
     TERMINAL_JOB_STATUSES,
     has_ready_dataset_cache,
     process_job,
+    recheck_dataset_job,
     resume_kernel_job,
     rewrite_ref_owner,
     validate_kernel_payload,
@@ -1125,7 +1126,8 @@ def recover_job_after_restart(
 
     if status == "queued":
         append_internal_log(db, job_id, "restart recovery action: requeue full process")
-        return {"action": "process", "job_id": job_id}
+        action = "recheck_dataset" if job.get("dataset_recheck_state") == "checking" else "process"
+        return {"action": action, "job_id": job_id}
 
     if status in {"waiting_kernel", "downloading_output"}:
         append_internal_log(db, job_id, "restart recovery action: resume kernel finish path")
@@ -1192,6 +1194,11 @@ def recover_job_after_restart(
         return {"action": "resume_kernel", "job_id": job_id}
 
     if status in {"uploading_dataset", "waiting_dataset"}:
+        if (status == "waiting_dataset" and job.get("dataset_recheck_state") != "checking"
+                and (job.get("dataset_recheck_state") or
+                     job.get("error", "").startswith("dataset_upload_outcome_unknown:"))):
+            append_internal_log(db, job_id, "restart recovery: preserving Dataset automatic recheck schedule")
+            return None
         dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
         try:
             intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
@@ -1203,7 +1210,8 @@ def recover_job_after_restart(
             if not db.update_job_if_status(job_id, {status}, require_not_canceled=True,
                                            status="queued", error=""):
                 return None
-            return {"action": "process", "job_id": job_id}
+            action = "recheck_dataset" if job.get("dataset_recheck_state") == "checking" else "process"
+            return {"action": action, "job_id": job_id}
         fail_recovered_job(
             db,
             job_id,
@@ -1338,7 +1346,7 @@ async def run_worker_item(app: FastAPI, item: dict) -> None:
             job_id,
             app.state.auth_store,
         )
-        operation = process_job
+        operation = recheck_dataset_job if action == "recheck_dataset" else process_job
 
     was_cancelled, operation_error = await run_thread_to_completion(
         app,
@@ -2112,8 +2120,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if not intent or intent["state"] not in {"unknown", "accepted"}:
                     raise HTTPException(status_code=409, detail="original upload candidate unavailable")
                 if db.update_job_if_status(job_id, {"waiting_dataset"}, require_not_canceled=True,
-                                           status="queued", error=""):
-                    request.app.state.queue.put_nowait({"action": "process", "job_id": job_id})
+                                           status="queued", error="", dataset_recheck_state="checking",
+                                           dataset_recheck_at=None, dataset_recheck_count=0,
+                                           dataset_recheck_started_at=time.time()):
+                    request.app.state.queue.put_nowait({"action": "recheck_dataset", "job_id": job_id})
                 return job_response(db, job_id, settings.retention_hours)
             if job["status"] != "receiving":
                 return job_response(db, job_id, settings.retention_hours)

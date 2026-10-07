@@ -15,6 +15,7 @@ from app.gpu_policy import apply_yolo_gpu_policy
 from app.dino_threshold_policy import apply_dino_threshold_policy
 from app.kaggle_adapter import (
     DatasetUploadReceipt,
+    DatasetUploadUnknown,
     KaggleAdapter,
     KaggleAdapterInterrupted,
     KernelStatusUnavailable,
@@ -516,11 +517,17 @@ def resume_kernel_job(
     finish_kernel_job(settings, db, job_id, adapter, final_status=final_status)
 
 
+def recheck_dataset_job(settings, db, job_id, auth_store=None) -> None:
+    process_job(settings, db, job_id, auth_store, retained_candidate_only=True)
+
+
 def process_job(
     settings,
     db: RelayDb,
     job_id: str,
     auth_store: AuthStore | None = None,
+    *,
+    retained_candidate_only: bool = False,
 ) -> None:
     job = db.get_job(job_id)
     if not job:
@@ -585,6 +592,12 @@ def process_job(
                 kaggle_key_id=kaggle_key_id,
             )
             saved_intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
+            if retained_candidate_only and (
+                    not saved_intent or saved_intent["state"] not in {"accepted", "unknown"}
+                    or saved_intent.get("dataset_ref") != job["dataset_ref"]
+                    or saved_intent.get("dataset_dir") != str(dataset_dir.absolute())
+                    or saved_intent.get("content_sha256") != content_digest(dataset_dir)):
+                raise ValueError("upload_intent_scope_or_content_mismatch: automatic recheck cannot upload")
             if saved_intent is not None:
                 # Even a valid shared cache cannot replace this run's candidate.
                 dataset_cache = None
@@ -632,14 +645,20 @@ def process_job(
                     job["kernel_ref"],
                     credentials,
                 )
-                transition_before_submission({"queued", "uploading_dataset", "waiting_dataset"}, "uploading_dataset", 20)
-                upload_receipt = adapter.upload_dataset(
-                    dataset_dir,
-                    job["dataset_ref"],
-                    update_message=f"update relay dataset for {job['kernel_ref']}",
-                )
-
-                transition_before_submission({"uploading_dataset"}, "waiting_dataset", 35)
+                if retained_candidate_only:
+                    upload_receipt = DatasetUploadReceipt(
+                        expected_version_number=saved_intent["version_number"],
+                        dataset_dir=str(dataset_dir.absolute()), content_sha256=saved_intent["content_sha256"],
+                    )
+                    transition_before_submission({"queued"}, "waiting_dataset", 35)
+                else:
+                    transition_before_submission({"queued", "uploading_dataset", "waiting_dataset"}, "uploading_dataset", 20)
+                    upload_receipt = adapter.upload_dataset(
+                        dataset_dir,
+                        job["dataset_ref"],
+                        update_message=f"update relay dataset for {job['kernel_ref']}",
+                    )
+                    transition_before_submission({"uploading_dataset"}, "waiting_dataset", 35)
                 wait_dataset_kwargs = {
                     "permission_grace_seconds": (
                         settings.dataset_status_permission_grace_seconds
@@ -647,11 +666,14 @@ def process_job(
                 }
                 if upload_receipt is not None:
                     wait_dataset_kwargs["upload_receipt"] = upload_receipt
+                if retained_candidate_only:
+                    wait_dataset_kwargs["background"] = True
                 dataset_status = adapter.wait_dataset(
                     job["dataset_ref"],
                     **wait_dataset_kwargs,
                 )
-                db.update_job(job_id, dataset_status=dataset_status, progress=40)
+                db.update_job(job_id, dataset_status=dataset_status, progress=40,
+                              dataset_recheck_state="", dataset_recheck_at=None, queue_reason="", error="")
                 stop_if_cancel_requested()
                 dataset_version_number = ready_dataset_version(dataset_status)
                 if upload_receipt is not None and dataset_version_number is None:
@@ -723,6 +745,12 @@ def process_job(
                 message = "dataset_upload_outcome_unknown: original candidate retained; " + redact_secrets(str(exc))
                 db.update_job(job_id, status="waiting_dataset", error=message)
                 db.append_log(job_id, message)
+                from app.dataset_recovery import block_recheck, retryable_verification, schedule_recheck
+                from app.dataset_verification_process import verification_error
+                if not integrity_failure and (retryable_verification(exc) or isinstance(exc, DatasetUploadUnknown)):
+                    schedule_recheck(db, job_id, retry_after=verification_error(exc).get("retry_after"))
+                else:
+                    block_recheck(db, job_id, "failure is not a transient publication or transport error")
                 return
         message = structured_kernel_failure_error(current.get("kernel_status")) or str(exc)
         message = redact_secrets(message)

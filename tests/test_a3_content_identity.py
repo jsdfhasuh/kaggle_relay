@@ -481,7 +481,12 @@ def test_real_worker_and_complete_recover_same_candidate_after_response_loss(tmp
     # Use a non-lifespan client so startup scanning cannot race this assertion.
     if recovery == "restart":
         item = recover_job_after_restart(adapter.settings, app.state.db, app.state.auth_store, pending)
-        assert item == {"action": "process", "job_id": job_id}
+        assert item is None
+        from app.dataset_recovery import schedule_dataset_rechecks
+        app.state.db.update_job(job_id, dataset_recheck_at=1)
+        asyncio.run(schedule_dataset_rechecks(app))
+        item = app.state.queue.get_nowait()
+        assert item == {"action": "recheck_dataset", "job_id": job_id}
         from app.main import queue_item_expected_statuses
         assert app.state.db.get_job(job_id)["status"] in queue_item_expected_statuses(item)
     else:
@@ -489,7 +494,8 @@ def test_real_worker_and_complete_recover_same_candidate_after_response_loss(tmp
         response = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers(token="test"))
         assert response.status_code == 200
     assert app.state.db.get_job(job_id)["status"] == "queued"
-    process_job(adapter.settings, app.state.db, job_id)
+    from app.worker import recheck_dataset_job
+    recheck_dataset_job(adapter.settings, app.state.db, job_id)
     assert api.uploads == 1 and api.downloads == ["owner/data/7"]
     assert len(pushes) == 1
     metadata = json.loads((paths["kernel_dir"] / "kernel-metadata.json").read_text())

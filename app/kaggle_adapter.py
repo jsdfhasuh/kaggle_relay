@@ -934,10 +934,11 @@ class KaggleAdapter:
             dataset_dir=str(Path(dataset_dir).absolute()), content_sha256=source_digest,
         )
 
-    def verify_dataset_content(self, dataset_ref, version_number, dataset_dir, content_sha256):
+    def verify_dataset_content(self, dataset_ref, version_number, dataset_dir, content_sha256, archive_only=False):
         if not self._sdk_in_process:
             return self._sdk_call("verify_dataset_content", dataset_ref=dataset_ref, version_number=version_number,
-                                  dataset_dir=str(dataset_dir), content_sha256=content_sha256)
+                                  dataset_dir=str(dataset_dir), content_sha256=content_sha256,
+                                  archive_only=archive_only)
         if type(version_number) is not int or version_number <= 0:
             raise KaggleAdapterError("Dataset exact version must be a positive integer")
         self.verification_phase("content")
@@ -968,6 +969,9 @@ class KaggleAdapter:
                 except Exception as exc:
                     if not archive_url_missing(exc):
                         raise
+                    if archive_only:
+                        raise DatasetVerificationError(
+                            "dataset_archive_not_ready: waiting for the original version archive", "publication") from exc
                     self.log(f"Dataset version {version_number}: archive URL unavailable; "
                              "checking exact-version file contents")
                     def check():
@@ -995,6 +999,7 @@ class KaggleAdapter:
         dataset_ref: str,
         permission_grace_seconds: int = 0,
         upload_receipt: DatasetUploadReceipt | None = None,
+        background: bool = False,
     ) -> str:
         start = time.time()
         last_reason, last_reason_at = None, 0.0
@@ -1047,11 +1052,14 @@ class KaggleAdapter:
                 self._publication_remaining = max(0, publication_grace - (time.monotonic() - publication_start))
                 if self._publication_remaining <= 0:
                     self._publication_remaining = None
-                    raise KaggleAdapterError("payload_publication_timeout: Dataset publication deadline exceeded; " + publication_detail)
+                    raise DatasetVerificationError(
+                        "payload_publication_timeout: Dataset publication deadline exceeded; " + publication_detail,
+                        "publication")
                 self._verification_content_seconds = 0
                 try:
                     try:
-                        self.verify_dataset_content(dataset_ref, expected_version_number, source_dir, source_digest)
+                        options = {"archive_only": True} if background else {}
+                        self.verify_dataset_content(dataset_ref, expected_version_number, source_dir, source_digest, **options)
                     finally:
                         publication_start += self._verification_content_seconds
                         self._publication_remaining = None
@@ -1061,13 +1069,18 @@ class KaggleAdapter:
                     publication_detail = detail[-1200:]
                     elapsed = time.monotonic() - publication_start
                     error = verification_error(exc)
+                    if background:
+                        # Release the worker slot; the durable scheduler controls the next attempt.
+                        raise DatasetVerificationError(detail, error["category"], error["http_status"],
+                                                       error["retry_after"]) from exc
                     if error["category"] == "publication":
                         report("publishing", f"Dataset exact version {expected_version_number} is still publishing; "
                                "waiting before full verification: " + detail[-1200:])
                         if elapsed >= publication_grace:
-                            raise KaggleAdapterError(
+                            raise DatasetVerificationError(
                                 f"Dataset exact version {expected_version_number} publication verification timed out "
-                                f"after {publication_grace}s; payload_publication_timeout: " + detail[-1200:]
+                                f"after {publication_grace}s; payload_publication_timeout: " + detail[-1200:],
+                                "publication",
                             ) from exc
                     elif error["category"] == "http" and error["http_status"] in {403, 404}:
                         report("permission", f"Dataset exact candidate is not yet accessible (HTTP {error['http_status']}): " + detail[-500:])
@@ -1084,7 +1097,7 @@ class KaggleAdapter:
                         if transient_attempts > 5 or delay >= remaining:
                             raise DatasetVerificationError(
                                 "dataset_verification_retry_exhausted: original candidate retained; " + detail[-1200:],
-                                "transport") from exc
+                                "transport", error["http_status"], error["retry_after"]) from exc
                         reason = f"HTTP {error['http_status']}" if error["http_status"] else "network"
                         self.log(f"Dataset verification retry {transient_attempts}/5 in {delay:.0f}s ({reason}); "
                                  f"original version {expected_version_number} retained; " + detail[-500:])

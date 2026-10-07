@@ -19,6 +19,16 @@ function page() {
   return context;
 }
 
+test('Dataset background rechecks show a schedule or explicit manual action', () => {
+  const ui = page();
+  const job = {status: 'waiting_dataset', dataset_recheck_state: 'scheduled', dataset_recheck_at: 1791336000};
+  assert.match(ui.datasetRecheckText(job), /下次自动检查/);
+  assert.match(ui.datasetRecheckText({...job, dataset_recheck_state: 'checking'}), /不重复上传/);
+  assert.match(ui.datasetRecheckText({...job, dataset_recheck_state: 'exhausted'}), /24 小时.*人工恢复/);
+  assert.match(ui.datasetRecheckText({...job, dataset_recheck_state: 'blocked'}), /已停止.*人工检查/);
+  assert.equal(ui.datasetRecheckText({...job, status: 'complete'}), '');
+});
+
 test('Relay 60% is never presented as training progress without a valid report', () => {
   const ui = page();
   for (const kernel_status of ['', 'running', 'KernelWorkerStatus.RUNNING', '{broken', 'null', '[]', '{}']) {

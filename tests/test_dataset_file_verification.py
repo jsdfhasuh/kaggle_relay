@@ -223,6 +223,16 @@ def test_wait_uses_fallback_without_new_upload(tmp_path, monkeypatch):
     assert api.uploads == api.status_calls == 0
 
 
+def test_background_check_waits_for_archive_without_thousands_of_file_requests(tmp_path, monkeypatch):
+    api, adapter, dataset, _ = fallback_fixture(tmp_path, monkeypatch)
+    receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
+    adapter._sleep = lambda _: pytest.fail("background check must release its worker, not sleep")
+    with pytest.raises(DatasetVerificationError, match="dataset_archive_not_ready") as caught:
+        adapter.wait_dataset("owner/data", upload_receipt=receipt, background=True)
+    assert caught.value.category == "publication"
+    assert api.uploads == 0 and api.list_calls == 0 and not api.requests
+
+
 @pytest.mark.parametrize("pending", ["missing", "extra", "size", "empty", "changed"])
 @pytest.mark.parametrize("sdk_boundary", [False, True])
 def test_publishing_listing_waits_then_hashes_same_version(tmp_path, monkeypatch, pending, sdk_boundary):
@@ -275,8 +285,9 @@ def test_permanent_listing_mismatch_times_out_with_diagnostics(tmp_path, monkeyp
     monkeypatch.setattr("app.kaggle_adapter.time.monotonic", lambda: clock[0])
     adapter._sleep = lambda _: clock.__setitem__(0, clock[0] + 2)
     receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
-    with pytest.raises(KaggleAdapterError, match="payload_publication_timeout") as error:
+    with pytest.raises(DatasetVerificationError, match="payload_publication_timeout") as error:
         adapter.wait_dataset("owner/data", upload_receipt=receipt)
+    assert error.value.category == "publication"
     assert "file.txt" in str(error.value) and "other.txt" in str(error.value)
     assert len(api.downloads) == 1 and not api.requests and api.uploads == 0
     assert not any("bytes verified" in msg for msg in logs)
