@@ -29,6 +29,40 @@ test('Dataset background rechecks show a schedule or explicit manual action', ()
   assert.equal(ui.datasetRecheckText({...job, status: 'complete'}), '');
 });
 
+test('received input and accepted upload are not requests to upload again', () => {
+  const ui = page();
+  const job = {status: 'waiting_dataset', relay_input_received: true, dataset_upload_state: 'accepted',
+    dataset_upload_required: true, dataset_recheck_state: 'scheduled', dataset_recheck_at: 1791336000,
+    dataset_verification: {version_number: 1, verified_files: 64, total_files: 1008}};
+  assert.match(ui.cachePill(job), /已上传.*待核验/);
+  assert.doesNotMatch(ui.cachePill(job), /需上传/);
+  assert.match(ui.datasetRecheckText(job), /64\/1008/);
+  assert.match(ui.datasetRecheckText(job), /无需重新上传/);
+  assert.match(ui.cachePill({...job, dataset_upload_state: '', status: 'queued'}), /输入已接收/);
+});
+
+test('only an exhausted original job offers an explicit restart; cancelling makes no request', async () => {
+  const ui = page();
+  const job = {status: 'waiting_dataset', dataset_recheck_state: 'exhausted'};
+  assert.equal(ui.canRestartDatasetRecheck(job), true);
+  for (const dataset_recheck_state of ['scheduled', 'checking', 'blocked', '']) {
+    assert.equal(ui.canRestartDatasetRecheck({...job, dataset_recheck_state}), false);
+  }
+  assert.equal(ui.canRestartDatasetRecheck({...job, cancel_requested_at: 1}), false);
+  assert.equal(ui.canRestartDatasetRecheck({...job, status: 'complete'}), false);
+  ui.confirm = () => false;
+  ui.api = () => assert.fail('cancelled restart must not send a request');
+  await ui.restartDatasetRecheck('original', {textContent: '重新开始核验', disabled: false});
+  let request;
+  ui.confirm = () => true;
+  ui.api = async (...args) => { request = args; return job; };
+  ui.renderDetail = () => {};
+  ui.loadJobs = async () => {};
+  await ui.restartDatasetRecheck('original', {textContent: '重新开始核验', disabled: false});
+  assert.equal(request[0], '/v1/jobs/original/complete?restart_recheck=true');
+  assert.equal(request[1].method, 'POST');
+});
+
 test('Relay 60% is never presented as training progress without a valid report', () => {
   const ui = page();
   for (const kernel_status of ['', 'running', 'KernelWorkerStatus.RUNNING', '{broken', 'null', '[]', '{}']) {

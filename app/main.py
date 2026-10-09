@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -37,6 +38,7 @@ from app.database import RelayDb
 from app.kaggle_adapter import KaggleAdapter, KaggleAdapterInterrupted, KernelStatusUnavailable
 from app.stop_reason import classify_stop_reason
 from app.upload_intent import intent_path, read_intent
+from app.dataset_verification_state import VerificationStore
 from app.schemas import (
     ChunkResponse,
     CreateKaggleKeyRequest,
@@ -66,6 +68,7 @@ from app.ui_auth import (
 from app.worker import (
     TERMINAL_JOB_STATUSES,
     has_ready_dataset_cache,
+    is_ready_dataset_status,
     process_job,
     recheck_dataset_job,
     resume_kernel_job,
@@ -324,6 +327,29 @@ def dataset_download_metadata(job: dict, jobs_dir: Path) -> dict:
     }
 
 
+def dataset_verification_metadata(db, job):
+    directory = db.path.parent / "jobs" / job["job_id"] / "extracted" / "dataset"
+    try:
+        intent = read_intent(intent_path(db.path.parent, directory, job["dataset_ref"]))
+        if (not intent or intent.get("dataset_ref") != job["dataset_ref"]
+                or intent.get("dataset_dir") != str(directory.absolute())):
+            return {}
+        progress = {}
+        if (db.path.parent / "dataset-verification.sqlite3").exists():
+            progress = VerificationStore(db.path.parent, initialize=False).snapshot(
+                job["dataset_ref"], intent["version_number"], directory, intent.get("content_sha256", ""))
+        if is_ready_dataset_status(str(job.get("dataset_status") or "")):
+            # Archive verification can finish after a partial file checkpoint.
+            # Do not label those partial counters as the completed method.
+            if progress.get("state") != "verified":
+                progress = {}
+            progress = {**progress, "state": "verified", "version_number": intent["version_number"]}
+        return {"dataset_upload_state": intent["state"], "dataset_verification": progress}
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        LOGGER.warning("Dataset verification metadata unavailable for %s: %s", job["job_id"], type(exc).__name__)
+        return {"dataset_verification": {"state": "checkpoint_unavailable"}}
+
+
 def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobResponse:
     job_id = job["job_id"]
     dataset_cache_hit = has_ready_dataset_cache(
@@ -352,6 +378,10 @@ def job_to_response(db: RelayDb, job: dict, retention_hours: int = 168) -> JobRe
                 **dataset_download_metadata(job, db.path.parent / "jobs"),
                 "dataset_cache_hit": dataset_cache_hit,
                 "dataset_upload_required": not dataset_cache_hit,
+                "relay_input_received": job["status"] in {
+                    "queued", "uploading_dataset", "waiting_dataset", "pushing_kernel", "waiting_kernel",
+                    "cancel_requested", "downloading_output", "complete"},
+                **dataset_verification_metadata(db, job),
                 "max_parallel_uploads": getattr(db, "max_parallel_uploads_per_user", 8),
             },
             db.accepted_chunks(job_id),
@@ -2093,6 +2123,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def complete_job(
         job_id: str,
         request: Request,
+        restart_recheck: bool = Query(False),
         settings: Settings = Depends(get_settings),
         db: RelayDb = Depends(get_db),
         auth_store: AuthStore = Depends(get_auth_store),
@@ -2112,6 +2143,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return job_response(db, job_id, settings.retention_hours)
             if (job["status"] == "waiting_dataset"
                     and str(job.get("error", "")).startswith("dataset_upload_outcome_unknown:")):
+                if job.get("dataset_recheck_state") in {"scheduled", "checking"}:
+                    return job_response(db, job_id, settings.retention_hours)
+                if job.get("dataset_recheck_state") == "blocked":
+                    raise HTTPException(status_code=409, detail="Dataset recovery requires explicit manual inspection")
+                if job.get("dataset_recheck_state") == "exhausted" and not restart_recheck:
+                    raise HTTPException(status_code=409, detail="Dataset recheck window exhausted; explicit restart_recheck=true required")
                 dataset_dir = settings.jobs_dir / job_id / "extracted" / "dataset"
                 try:
                     intent = read_intent(intent_path(settings.storage_dir, dataset_dir, job["dataset_ref"]))
@@ -2121,8 +2158,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     raise HTTPException(status_code=409, detail="original upload candidate unavailable")
                 if db.update_job_if_status(job_id, {"waiting_dataset"}, require_not_canceled=True,
                                            status="queued", error="", dataset_recheck_state="checking",
-                                           dataset_recheck_at=None, dataset_recheck_count=0,
-                                           dataset_recheck_started_at=time.time()):
+                                           dataset_recheck_at=None,
+                                           dataset_recheck_count=job.get("dataset_recheck_count", 0) + 1,
+                                           dataset_recheck_failures=0 if restart_recheck else job.get("dataset_recheck_failures", 0),
+                                           dataset_recheck_started_at=time.time() if restart_recheck else
+                                           job.get("dataset_recheck_started_at") or time.time()):
                     request.app.state.queue.put_nowait({"action": "recheck_dataset", "job_id": job_id})
                 return job_response(db, job_id, settings.retention_hours)
             if job["status"] != "receiving":

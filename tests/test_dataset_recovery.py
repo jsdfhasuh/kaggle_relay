@@ -125,7 +125,7 @@ def test_recheck_cannot_bypass_changed_account_permissions(tmp_path, case):
 def test_backoff_and_retry_after_never_retry_early(tmp_path):
     app, job_id, _ = retained_job(tmp_path)
     for count, delay in [(0, 300), (1, 600), (2, 1200), (3, 1800), (100, 1800)]:
-        app.state.db.update_job(job_id, dataset_recheck_count=count)
+        app.state.db.update_job(job_id, dataset_recheck_failures=count)
         schedule_recheck(app.state.db, job_id, now=1000)
         assert app.state.db.get_job(job_id)["dataset_recheck_at"] == 1000 + delay
     schedule_recheck(app.state.db, job_id, retry_after=3600, now=1000)
@@ -157,6 +157,98 @@ def test_manual_recovery_racing_scan_only_claims_once(tmp_path):
     response = TestClient(app).post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
     assert response.status_code == 200
     assert app.state.queue.qsize() == 1
+
+
+def test_manual_recovery_preserves_schedule_cooldown_and_window(tmp_path):
+    from fastapi.testclient import TestClient
+    app, job_id, _ = retained_job(tmp_path)
+    schedule_recheck(app.state.db, job_id, retry_after=900)
+    before = app.state.db.get_job(job_id)
+    client = TestClient(app)
+    for _ in range(3):
+        response = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers())
+        assert response.status_code == 200
+    after = app.state.db.get_job(job_id)
+    for field in ("status", "dataset_recheck_at", "dataset_recheck_started_at", "dataset_recheck_count",
+                  "dataset_recheck_failures", "error"):
+        assert after[field] == before[field]
+    assert app.state.queue.empty()
+
+
+def test_progress_batch_is_not_exponential_failure_backoff(tmp_path):
+    app, job_id, _ = retained_job(tmp_path)
+    app.state.db.update_job(job_id, dataset_recheck_count=30, dataset_recheck_failures=4)
+    schedule_recheck(app.state.db, job_id, now=1000, progress=True)
+    row = app.state.db.get_job(job_id)
+    assert row["dataset_recheck_at"] == 1015 and row["dataset_recheck_failures"] == 0
+    assert row["dataset_recheck_count"] == 30
+    schedule_recheck(app.state.db, job_id, now=1100, retry_after=900)
+    assert app.state.db.get_job(job_id)["dataset_recheck_at"] == 2000
+
+
+def test_account_cooldown_defers_scheduler_without_duplicate_queue(tmp_path, monkeypatch):
+    from app.dataset_verification_state import VerificationStore
+    app, job_id, _ = retained_job(tmp_path)
+    monkeypatch.setattr("app.dataset_recovery.time.time", lambda: 1000)
+    schedule_recheck(app.state.db, job_id, now=1000)
+    app.state.db.update_job(job_id, dataset_recheck_at=1)
+    VerificationStore(app.state.settings.storage_dir).cooldown("demo", 900)
+    scan(app)
+    assert app.state.queue.empty()
+    assert app.state.db.get_job(job_id)["dataset_recheck_at"] == 1900
+
+
+def test_exhausted_window_requires_explicit_restart(tmp_path):
+    from fastapi.testclient import TestClient
+    app, job_id, _ = retained_job(tmp_path)
+    schedule_recheck(app.state.db, job_id, retry_after=RECHECK_WINDOW_SECONDS)
+    client = TestClient(app)
+    assert client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers()).status_code == 409
+    assert app.state.queue.empty()
+    assert client.post(f"/v1/jobs/{job_id}/complete?restart_recheck=true", headers=auth_headers()).status_code == 200
+    assert app.state.queue.qsize() == 1
+
+
+def test_api_exposes_scoped_checkpoint_without_changing_upload_gate(tmp_path):
+    from app.dataset_verification_state import VerificationStore
+    app, job_id, path = retained_job(tmp_path)
+    app.state.db.update_job(job_id, dataset_status="")
+    intent = json.loads(path.read_text())
+    store = VerificationStore(app.state.settings.storage_dir)
+    directory = job_paths(app.state.settings, job_id)["dataset_dir"]
+    expected = {"file.txt": (8, "a" * 64)}
+    scope, _ = store.load("demo/data", 2, directory, intent["content_sha256"], expected)
+    store.mark_file(scope, "file.txt", expected["file.txt"])
+    response = job_response(app.state.db, job_id)
+    assert response.relay_input_received is True and response.dataset_upload_state == "accepted"
+    assert response.dataset_upload_required is True
+    assert response.dataset_verification["verified_files"] == 1
+    assert response.dataset_verification["version_number"] == 2
+
+
+def test_archive_completion_does_not_present_partial_checkpoint_as_full(tmp_path):
+    from app.dataset_verification_state import VerificationStore
+    app, job_id, path = retained_job(tmp_path)
+    intent = json.loads(path.read_text())
+    directory = job_paths(app.state.settings, job_id)["dataset_dir"]
+    store = VerificationStore(app.state.settings.storage_dir)
+    scope, _ = store.load("demo/data", 2, directory, intent["content_sha256"],
+                         {"file.txt": (8, "a" * 64), "second.txt": (2, "b" * 64)})
+    store.mark_file(scope, "file.txt", (8, "a" * 64))
+    app.state.db.update_job(job_id, dataset_status='{"status":"ready","current_version_number":2}')
+    assert job_response(app.state.db, job_id).dataset_verification == {"state": "verified", "version_number": 2}
+
+
+def test_account_cooldown_cannot_extend_exhausted_window(tmp_path, monkeypatch):
+    from app.dataset_verification_state import VerificationStore
+    app, job_id, _ = retained_job(tmp_path)
+    schedule_recheck(app.state.db, job_id, now=1000)
+    now = 1000 + RECHECK_WINDOW_SECONDS
+    monkeypatch.setattr("app.dataset_recovery.time.time", lambda: now)
+    VerificationStore(app.state.settings.storage_dir).cooldown("demo", 900)
+    scan(app)
+    assert app.state.db.get_job(job_id)["dataset_recheck_state"] == "exhausted"
+    assert app.state.queue.empty()
 
 
 @pytest.mark.parametrize("category", ["transport", "publication"])

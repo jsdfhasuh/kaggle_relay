@@ -223,14 +223,26 @@ def test_wait_uses_fallback_without_new_upload(tmp_path, monkeypatch):
     assert api.uploads == api.status_calls == 0
 
 
-def test_background_check_waits_for_archive_without_thousands_of_file_requests(tmp_path, monkeypatch):
+def test_background_check_uses_bounded_batches_and_retains_progress(tmp_path, monkeypatch):
+    from app.dataset_verification_state import FILE_BATCH_LIMIT, VerificationStore
     api, adapter, dataset, _ = fallback_fixture(tmp_path, monkeypatch)
+    (dataset / "file.txt").unlink()
+    api.files = {f"file{i:04}.txt": b"content" for i in range(FILE_BATCH_LIMIT + 2)}
+    for name, value in api.files.items():
+        (dataset / name).write_bytes(value)
     receipt = DatasetUploadReceipt(7, (), str(dataset), content_digest(dataset))
     adapter._sleep = lambda _: pytest.fail("background check must release its worker, not sleep")
-    with pytest.raises(DatasetVerificationError, match="dataset_archive_not_ready") as caught:
+    with pytest.raises(DatasetVerificationError, match="dataset_verification_batch_pending") as caught:
         adapter.wait_dataset("owner/data", upload_receipt=receipt, background=True)
-    assert caught.value.category == "publication"
-    assert api.uploads == 0 and api.list_calls == 0 and not api.requests
+    assert caught.value.category == "progress"
+    assert len(api.requests) == FILE_BATCH_LIMIT
+    store = VerificationStore(adapter.settings.storage_dir)
+    progress = store.snapshot("owner/data", 7, dataset, receipt.content_sha256)
+    assert progress["verified_files"] == FILE_BATCH_LIMIT and progress["state"] == "checking_files"
+    assert '"current_version_number": 7' in adapter.wait_dataset("owner/data", upload_receipt=receipt, background=True)
+    assert len(api.requests) == FILE_BATCH_LIMIT + 2 and api.uploads == 0
+    assert len({r["file_name"] for r in api.requests}) == len(api.requests)
+    assert store.snapshot("owner/data", 7, dataset, receipt.content_sha256)["state"] == "verified"
 
 
 @pytest.mark.parametrize("pending", ["missing", "extra", "size", "empty", "changed"])

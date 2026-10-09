@@ -101,6 +101,7 @@ class RelayDb:
             self._ensure_column(conn, "jobs", "dataset_recheck_at", "REAL")
             self._ensure_column(conn, "jobs", "dataset_recheck_started_at", "REAL")
             self._ensure_column(conn, "jobs", "dataset_recheck_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "jobs", "dataset_recheck_failures", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "jobs", "dataset_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "identity_sha256", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "run_id", "TEXT NOT NULL DEFAULT ''")

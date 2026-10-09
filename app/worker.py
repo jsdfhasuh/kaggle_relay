@@ -748,7 +748,9 @@ def process_job(
                 from app.dataset_recovery import block_recheck, retryable_verification, schedule_recheck
                 from app.dataset_verification_process import verification_error
                 if not integrity_failure and (retryable_verification(exc) or isinstance(exc, DatasetUploadUnknown)):
-                    schedule_recheck(db, job_id, retry_after=verification_error(exc).get("retry_after"))
+                    failure = verification_error(exc)
+                    schedule_recheck(db, job_id, retry_after=failure.get("retry_after"),
+                                     progress=failure["category"] == "progress")
                 else:
                     block_recheck(db, job_id, "failure is not a transient publication or transport error")
                 return

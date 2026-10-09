@@ -1051,6 +1051,8 @@
 
     function cachePill(job) {
       if (job.dataset_cache_hit) return '<span class="pill ok">命中</span>';
+      if (job.dataset_upload_state === "accepted" && job.status === "waiting_dataset") return '<span class="pill warn">已上传·待核验</span>';
+      if (job.relay_input_received) return '<span class="pill neutral">输入已接收</span>';
       if (job.dataset_upload_required === false) return '<span class="pill ok">可跳过</span>';
       return '<span class="pill neutral">需上传</span>';
     }
@@ -1189,13 +1191,21 @@
 
     function datasetRecheckText(job) {
       if (!["waiting_dataset", "queued"].includes(job.status)) return "";
+      const progress = job.dataset_verification || {};
+      const prefix = Number.isInteger(progress.total_files) && progress.total_files > 0
+        ? `原版本 ${progress.version_number} 已核验 ${progress.verified_files}/${progress.total_files} 个文件；` : "";
       if (job.dataset_recheck_state === "scheduled") {
-        return `等待 Kaggle 数据集就绪；下次自动检查：${fmtTimestamp(job.dataset_recheck_at)}`;
+        return `${prefix}等待 Kaggle 数据集就绪；下次自动检查：${fmtTimestamp(job.dataset_recheck_at)}；无需重新上传`;
       }
-      if (job.dataset_recheck_state === "checking") return "正在恢复原数据集版本核验，不重复上传";
+      if (job.dataset_recheck_state === "checking") return `${prefix}正在恢复原数据集版本核验，不重复上传`;
       if (job.dataset_recheck_state === "exhausted") return "数据集自动检查已超过 24 小时，需要人工恢复";
       if (job.dataset_recheck_state === "blocked") return "数据集自动检查已停止，需要人工检查错误原因";
       return "";
+    }
+
+    function canRestartDatasetRecheck(job) {
+      return job.status === "waiting_dataset" && job.dataset_recheck_state === "exhausted"
+        && !job.cancel_requested_at;
     }
 
     function stopDetails(job) {
@@ -1314,6 +1324,7 @@
             <td class="actions-cell">
               <div class="action-row">
                 <button class="light" type="button" data-job-detail="${jobId}">详情</button>
+                ${canRestartDatasetRecheck(job) ? `<button class="light" type="button" data-dataset-recheck="${jobId}">重新开始核验</button>` : ""}
                 ${canCancelJob(job) ? `<button class="light" type="button" data-job-cancel="${jobId}">停止</button>` : ""}
                 ${canDeleteJob(job) ? `<button class="danger" type="button" data-job-delete="${jobId}" ${deletingJobs.has(job.job_id) ? "disabled" : ""}>${deletingJobs.has(job.job_id) ? "删除中..." : "删除"}</button>` : ""}
               </div>
@@ -1804,6 +1815,22 @@
       await loadJobs();
     }
 
+    async function restartDatasetRecheck(jobId, button) {
+      if (!confirm("自动核验窗口已结束。确定重新开始原数据集版本的核验吗？不会重新上传；通过核验后将继续原训练任务。")) return;
+      const previousText = button.textContent;
+      button.disabled = true;
+      button.textContent = "恢复核验中...";
+      try {
+        const data = await api(`/v1/jobs/${encodeURIComponent(jobId)}/complete?restart_recheck=true`, {method: "POST"});
+        renderDetail(data);
+        await loadJobs();
+      } catch (error) {
+        alert(`恢复核验失败：${error.message || String(error)}`);
+        button.disabled = false;
+        button.textContent = previousText;
+      }
+    }
+
     async function cancelJob(jobId, button) {
       const previousText = button.textContent;
       button.disabled = true;
@@ -2130,6 +2157,11 @@
       const cancelButton = event.target.closest("[data-job-cancel]");
       if (cancelButton && !cancelButton.disabled) {
         cancelJob(cancelButton.dataset.jobCancel, cancelButton).catch(console.error);
+        return;
+      }
+      const recheckButton = event.target.closest("[data-dataset-recheck]");
+      if (recheckButton && !recheckButton.disabled) {
+        restartDatasetRecheck(recheckButton.dataset.datasetRecheck, recheckButton).catch(console.error);
         return;
       }
       const deleteButton = event.target.closest("[data-job-delete]");

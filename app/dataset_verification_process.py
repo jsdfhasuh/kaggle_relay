@@ -10,10 +10,12 @@ import threading
 import time
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 import requests
 
 from app.dataset_file_verification import DatasetVersionNotReady
+from app.dataset_verification_state import VerificationDeferred
 from app.security import redact_secrets
 
 
@@ -39,11 +41,17 @@ def retry_after_seconds(value):
 
 
 @contextmanager
-def verification_request_timeouts():
+def verification_request_timeouts(request_gate=None):
     """Bound SDK authentication and downloads inside the dedicated child only."""
     original = requests.Session.send
 
     def send(session, request, **kwargs):
+        host = urlsplit(str(getattr(request, "url", ""))).hostname or ""
+        paced = host == "kaggle.com" or host.endswith(".kaggle.com")
+        if request_gate is not None and paced:
+            request_gate.before_request()
+        elif request_gate is not None:
+            request_gate.check()
         timeout = kwargs.get("timeout")
         if isinstance(timeout, tuple):
             connect, read = timeout
@@ -53,7 +61,11 @@ def verification_request_timeouts():
             connect = read = timeout
         kwargs["timeout"] = (min(15, connect) if connect is not None else 15,
                              min(60, read) if read is not None else 60)
-        return original(session, request, **kwargs)
+        response = original(session, request, **kwargs)
+        if request_gate is not None and paced and response.status_code == 429:
+            request_gate.store.cooldown(request_gate.owner,
+                                        retry_after_seconds(response.headers.get("Retry-After")) or 60)
+        return response
 
     requests.Session.send = send
     try:
@@ -64,7 +76,10 @@ def verification_request_timeouts():
 
 def verification_error(exc):
     retry_after = None
-    if isinstance(exc, DatasetVerificationError):
+    if isinstance(exc, VerificationDeferred):
+        category, status = ("http", 429) if exc.cooldown else ("progress", None)
+        retry_after = exc.retry_after
+    elif isinstance(exc, DatasetVerificationError):
         category, status = exc.category, exc.http_status
         retry_after = exc.retry_after
     elif isinstance(exc, DatasetVersionNotReady):

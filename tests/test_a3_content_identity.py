@@ -493,6 +493,12 @@ def test_real_worker_and_complete_recover_same_candidate_after_response_loss(tmp
         client = TestClient(app)
         response = client.post(f"/v1/jobs/{job_id}/complete", headers=auth_headers(token="test"))
         assert response.status_code == 200
+        assert app.state.db.get_job(job_id)["dataset_recheck_at"] == pending["dataset_recheck_at"]
+        assert app.state.queue.empty()
+        from app.dataset_recovery import schedule_dataset_rechecks
+        app.state.db.update_job(job_id, dataset_recheck_at=1)
+        asyncio.run(schedule_dataset_rechecks(app))
+        assert app.state.queue.get_nowait() == {"action": "recheck_dataset", "job_id": job_id}
     assert app.state.db.get_job(job_id)["status"] == "queued"
     from app.worker import recheck_dataset_job
     recheck_dataset_job(adapter.settings, app.state.db, job_id)

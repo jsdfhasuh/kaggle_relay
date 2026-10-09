@@ -65,7 +65,7 @@ def test_background_check_preserves_retry_after_and_releases_worker(verification
         adapter.wait_dataset("owner/data", upload_receipt=receipt, background=True)
     assert caught.value.http_status == 429 and caught.value.retry_after == 900
     assert clock[0] == 0 and adapter.verify_dataset_content.call_count == 1
-    assert adapter.verify_dataset_content.call_args.kwargs == {"archive_only": True}
+    assert adapter.verify_dataset_content.call_args.kwargs == {"background": True}
 
 
 def test_retry_after_date_and_invalid_values(monkeypatch):

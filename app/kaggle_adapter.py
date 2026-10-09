@@ -30,7 +30,9 @@ from app.security import redact_secrets, register_secret
 from app.stop_reason import classify_stop_reason, provider_state
 from app.payload_contract import verify_upload_archive
 from app.dataset_file_verification import archive_url_missing, verify_version_files
-from app.dataset_verification_process import DatasetVerificationError, run_verification, verification_error
+from app.dataset_verification_process import (DatasetVerificationError, run_verification, verification_error,
+                                              verification_request_timeouts)
+from app.dataset_verification_state import DatasetRequestGate, FILE_BATCH_SECONDS, VerificationDeferred, VerificationStore
 from app.upload_intent import content_digest, intent_path, read_intent, write_intent
 
 
@@ -934,19 +936,30 @@ class KaggleAdapter:
             dataset_dir=str(Path(dataset_dir).absolute()), content_sha256=source_digest,
         )
 
-    def verify_dataset_content(self, dataset_ref, version_number, dataset_dir, content_sha256, archive_only=False):
+    def verify_dataset_content(self, dataset_ref, version_number, dataset_dir, content_sha256,
+                               archive_only=False, background=False):
         if not self._sdk_in_process:
             return self._sdk_call("verify_dataset_content", dataset_ref=dataset_ref, version_number=version_number,
                                   dataset_dir=str(dataset_dir), content_sha256=content_sha256,
-                                  archive_only=archive_only)
+                                  archive_only=archive_only, background=background)
         if type(version_number) is not int or version_number <= 0:
             raise KaggleAdapterError("Dataset exact version must be a positive integer")
         self.verification_phase("content")
         if content_digest(dataset_dir) != content_sha256:
             raise KaggleAdapterError("Dataset frozen content changed")
+        store = VerificationStore(self.settings.storage_dir)
+        scope = None
+        deadline = time.monotonic() + FILE_BATCH_SECONDS if background else None
+        def check():
+            self._check_interrupted()
+            if self.dataset_cancel_check is not None:
+                self.dataset_cancel_check()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise VerificationDeferred("dataset_verification_batch_pending: time budget reached")
+        gate = DatasetRequestGate(store, dataset_ref.split("/")[0], check, deadline)
         self.verification_phase("publication")
         self.log(f"Dataset exact version {version_number}: checking publication and archive availability")
-        with self._temporary_kaggle_env():
+        with self._temporary_kaggle_env(), verification_request_timeouts(gate):
             from kaggle.api.kaggle_api_extended import KaggleApi
             api = KaggleApi()
             api.authenticate()
@@ -974,12 +987,9 @@ class KaggleAdapter:
                             "dataset_archive_not_ready: waiting for the original version archive", "publication") from exc
                     self.log(f"Dataset version {version_number}: archive URL unavailable; "
                              "checking exact-version file contents")
-                    def check():
-                        self._check_interrupted()
-                        if self.dataset_cancel_check is not None:
-                            self.dataset_cancel_check()
-                    verify_version_files(api, dataset_ref, version_number, dataset_dir, check, self.log,
-                                         phase=self.verification_phase)
+                    scope = verify_version_files(api, dataset_ref, version_number, dataset_dir, check, self.log,
+                                                 phase=self.verification_phase, store=store,
+                                                 content_sha256=content_sha256, background=background)
                 else:
                     self.verification_phase("content")
                     paths = list(Path(directory).iterdir())
@@ -992,6 +1002,9 @@ class KaggleAdapter:
                 self.verification_phase("content")
                 if content_digest(dataset_dir) != content_sha256:
                     raise KaggleAdapterError("Dataset frozen content changed during verification")
+                check()
+                if scope is not None:
+                    store.mark_complete(scope)
         return True
 
     def wait_dataset(
@@ -1058,7 +1071,7 @@ class KaggleAdapter:
                 self._verification_content_seconds = 0
                 try:
                     try:
-                        options = {"archive_only": True} if background else {}
+                        options = {"background": True} if background else {}
                         self.verify_dataset_content(dataset_ref, expected_version_number, source_dir, source_digest, **options)
                     finally:
                         publication_start += self._verification_content_seconds

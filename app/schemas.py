@@ -112,10 +112,14 @@ class JobResponse(BaseModel):
     dataset_download_unavailable_code: str = ""
     dataset_cache_hit: bool = False
     dataset_upload_required: bool = True
+    relay_input_received: bool = False
+    dataset_upload_state: str = ""
+    dataset_verification: dict[str, Any] = Field(default_factory=dict)
     dataset_recheck_state: str = ""
     dataset_recheck_at: Optional[float] = None
     dataset_recheck_started_at: Optional[float] = None
     dataset_recheck_count: int = 0
+    dataset_recheck_failures: int = 0
     accepted_chunks: dict[str, list[int]]
     chunk_size: int = 64 * 1024 * 1024
     dataset_size: int = 0
