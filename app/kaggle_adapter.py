@@ -28,6 +28,7 @@ from app.auth_config import KAGGLE_ENV_KEYS, KaggleCredentials
 from app.config import Settings
 from app.security import redact_secrets, register_secret
 from app.stop_reason import classify_stop_reason, provider_state
+from app.startup_progress import parse_startup_progress
 from app.payload_contract import verify_upload_archive
 from app.dataset_file_verification import archive_url_missing, verify_version_files
 from app.dataset_verification_process import (DatasetVerificationError, run_verification, verification_error,
@@ -255,6 +256,11 @@ def parse_training_progress_logs(output: str) -> list[dict]:
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("event_type") == "startup":
+            startup = parse_startup_progress(payload)
+            if startup:
+                events.append(startup)
+            continue
         if payload.get("phase"):
             if (
                 payload.get("backend") != "patchcore"
@@ -301,8 +307,10 @@ def parse_training_progress_logs(output: str) -> list[dict]:
 
 
 def training_progress_key(progress: dict) -> tuple:
+    if progress.get("event_type") == "startup":
+        return ("startup", progress["startup_id"], progress["startup_sequence"])
     if progress.get("phase"):
-        return (
+        key = (
             "patchcore",
             progress.get("phase"),
             progress.get("phase_current"),
@@ -310,6 +318,9 @@ def training_progress_key(progress: dict) -> tuple:
             progress.get("status"),
             progress.get("error_code"),
         )
+        if progress.get("heartbeat") is True:
+            key += (progress.get("reported_at"),)
+        return key
     return ("epoch", progress.get("epoch"), progress.get("epochs"))
 
 

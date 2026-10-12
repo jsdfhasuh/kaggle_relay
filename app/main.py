@@ -935,11 +935,19 @@ def callback_log_message(data: dict) -> str:
 
 
 def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest) -> None:
+    from app.startup_progress import ignore_startup_progress, parse_startup_progress
+
     if job.get("scheduling_mode") == "dynamic" and (
         awaiting_assignment(job) or job["status"] in {"receiving", "assembling", "queued"}
     ):
         raise HTTPException(status_code=409, detail="job has not been submitted to Kaggle")
     data = payload.model_dump()
+    if payload.event_type == "startup":
+        startup = parse_startup_progress(data)
+        if not startup:
+            raise HTTPException(status_code=422, detail="invalid startup progress")
+        data.update(startup, epoch=None, epochs=None, remote_progress=None)
+        payload = JobProgressRequest(**data)
     # Callback authentication may use the original pre-assignment alias. The
     # progress returned to clients must carry the bound provider references.
     for field in ("kernel_ref", "dataset_ref"):
@@ -966,6 +974,8 @@ def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest)
         current = db.get_job(job["job_id"])
         if not current:
             return
+        if ignore_startup_progress(current, data):
+            return
         updates = {
             "kernel_status": json.dumps(data, ensure_ascii=False, sort_keys=True),
             "kaggle_output": clean_message[-4000:],
@@ -980,6 +990,7 @@ def apply_progress_callback(db: RelayDb, job: dict, payload: JobProgressRequest)
         if db.update_job_if_status(
             job["job_id"],
             {current["status"]},
+            expected_kernel_status=current["kernel_status"],
             **updates,
         ):
             return

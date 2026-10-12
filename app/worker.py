@@ -373,6 +373,8 @@ def finish_kernel_job(
     adapter: KaggleAdapter,
     final_status: str | None = None,
 ) -> None:
+    from app.startup_progress import ignore_startup_progress
+
     paths = job_paths(settings, job_id)
     log = job_log(db, job_id)
 
@@ -393,11 +395,15 @@ def finish_kernel_job(
                 if job_cancel_requested(current)
                 else running_status
             )
+            values = values_for_job(current)
+            if "kernel_status" in values and ignore_startup_progress(current, json.loads(values["kernel_status"])):
+                return current
             if db.update_job_if_status(
                 job_id,
                 {current_status},
                 status=status,
-                **values_for_job(current),
+                expected_kernel_status=current["kernel_status"] if "kernel_status" in values else None,
+                **values,
             ):
                 return latest_job()
         raise RuntimeError(

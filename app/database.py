@@ -481,6 +481,7 @@ class RelayDb:
         expected_statuses: set[str] | list[str] | tuple[str, ...],
         *,
         require_not_canceled: bool = False,
+        expected_kernel_status: str | None = None,
         **values: Any,
     ) -> bool:
         ordered_statuses = sorted(set(expected_statuses))
@@ -497,6 +498,7 @@ class RelayDb:
         )
         payload = {
             "job_id": job_id,
+            "expected_kernel_status": expected_kernel_status,
             **values,
             **{
                 f"expected_status_{index}": status
@@ -510,6 +512,7 @@ class RelayDb:
                 SET {assignments}
                 WHERE job_id = :job_id
                   AND status IN ({status_placeholders})
+                  {"AND kernel_status = :expected_kernel_status" if expected_kernel_status is not None else ""}
                   {"AND cancel_requested_at IS NULL" if require_not_canceled else ""}
                 """,
                 payload,
