@@ -483,6 +483,7 @@ class KaggleAdapter:
         }
         result = self._run_command(
             [sys.executable, "-m", "app.kaggle_sdk"],
+            check=False,
             cwd=Path(__file__).resolve().parent.parent,
             timeout=(self.settings.transfer_timeout_seconds if operation in {"p6_download", "upload_dataset", "verify_dataset_content", "probe_username_write_access"}
                      else self.settings.command_timeout_seconds),
@@ -490,6 +491,23 @@ class KaggleAdapter:
             check_space=operation in {"p6_download", "upload_dataset", "verify_dataset_content", "probe_username_write_access"},
             cancel_check=self.dataset_cancel_check if operation == "verify_dataset_content" else None,
         )
+        if result.returncode != 0:
+            # Preserve an ambiguous upload across the SDK process boundary so
+            # the worker checks the retained version instead of blocking recovery.
+            if operation == "upload_dataset":
+                for line in reversed(result.stdout.splitlines()):
+                    if not line.startswith("RELAY_SDK_ERROR="):
+                        continue
+                    try:
+                        error = json.loads(line.removeprefix("RELAY_SDK_ERROR="))
+                    except ValueError:
+                        break
+                    if (isinstance(error, dict) and error.get("type") == "dataset_upload_unknown"
+                            and isinstance(error.get("detail"), str)):
+                        raise DatasetUploadUnknown(redact_secrets(error["detail"]))
+                    break
+            raise KaggleAdapterError(
+                f"Kaggle command failed: {result.returncode}\n{redact_secrets(result.stdout)}")
         for line in reversed(result.stdout.splitlines()):
             if line.startswith("RELAY_SDK_RESULT="):
                 return json.loads(line.removeprefix("RELAY_SDK_RESULT="))

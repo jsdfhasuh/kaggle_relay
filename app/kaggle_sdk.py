@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from app.config import Settings
-from app.kaggle_adapter import KaggleAdapter
+from app.kaggle_adapter import DatasetUploadUnknown, KaggleAdapter
 from app.security import redact_secrets, register_secret
 from app.dataset_verification_process import verification_error
 
@@ -43,6 +43,14 @@ def main() -> int:
         print("RELAY_SDK_RESULT=" + json.dumps(result), flush=True)
         return 0
     except (Exception, SystemExit) as exc:
+        if locals().get("operation") == "upload_dataset" and isinstance(exc, DatasetUploadUnknown):
+            detail = str(exc)
+            if exc.__cause__ is not None:
+                detail += f"; {type(exc.__cause__).__name__}: {exc.__cause__}"
+            print("RELAY_SDK_ERROR=" + json.dumps({
+                "type": "dataset_upload_unknown", "detail": redact_secrets(detail),
+            }), flush=True)
+            return 1
         if locals().get("operation") == "verify_dataset_content":
             print("RELAY_SDK_ERROR=" + json.dumps(verification_error(exc)), flush=True)
             return 1

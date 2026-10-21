@@ -251,7 +251,7 @@ def test_account_cooldown_cannot_extend_exhausted_window(tmp_path, monkeypatch):
     assert app.state.queue.empty()
 
 
-@pytest.mark.parametrize("category", ["transport", "publication"])
+@pytest.mark.parametrize("category", ["transport", "publication", "upload_unknown"])
 def test_background_worker_checks_same_version_and_pushes_only_once(tmp_path, monkeypatch, category):
     api, adapter, _ = fixture_adapter(tmp_path, monkeypatch)
     app = create_app(adapter.settings)
@@ -269,9 +269,12 @@ def test_background_worker_checks_same_version_and_pushes_only_once(tmp_path, mo
     monkeypatch.setattr("app.worker.KaggleAdapter", lambda *a, **kw: adapter)
     monkeypatch.setattr("app.worker.finish_kernel_job", lambda *a, **kw: None)
     wait = adapter.wait_dataset
-    adapter.wait_dataset = Mock(side_effect=DatasetVerificationError(
-        "retry exhausted" if category == "transport" else "payload_publication_timeout: not ready",
-        category, 429 if category == "transport" else None, 900))
+    if category == "upload_unknown":
+        api.lost_response = True
+    else:
+        adapter.wait_dataset = Mock(side_effect=DatasetVerificationError(
+            "retry exhausted" if category == "transport" else "payload_publication_timeout: not ready",
+            category, 429 if category == "transport" else None, 900))
     process_job(adapter.settings, app.state.db, job_id)
     assert api.uploads == 1 and pushes.call_count == 0
     assert app.state.db.get_job(job_id)["dataset_recheck_state"] == "scheduled"
