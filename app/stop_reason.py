@@ -20,6 +20,11 @@ _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CLI_STATUS = re.compile(
     r"[\w.-]+/[\w.-]+\s+has status\s+([\"'])([^\"'\r\n]+)\1\.?", re.ASCII,
 )
+_CLI_UPGRADE_NOTICE = re.compile(
+    r"Warning: Looks like you're using an outdated `kaggle` version "
+    r"\(installed: \d+(?:\.\d+){1,3}\), please consider upgrading to the latest version "
+    r"\(\d+(?:\.\d+){1,3}\)\r?\n", re.ASCII,
+)
 _EARLY_STOP = re.compile(
     r"^EarlyStopping:\s*Training stopped early as no improvement observed in last "
     r"(?P<patience>\d{1,10}) epochs\.\s*Best results observed at epoch (?P<best_epoch>\d{1,10})\b",
@@ -39,6 +44,8 @@ def _status_token(status: str) -> str:
     if not isinstance(status, str):
         return "UNKNOWN"
     text = status.strip()
+    # Kaggle 2.2.x writes this advisory to stdout before the authoritative line.
+    text = _CLI_UPGRADE_NOTICE.sub("", text, count=1) if _CLI_UPGRADE_NOTICE.match(text) else text
     if text.startswith(("{", '[', '"')):
         payload = _decode(text)
         if isinstance(payload, dict):

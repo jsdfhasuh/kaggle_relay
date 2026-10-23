@@ -41,6 +41,16 @@ def test_exact_provider_status(status, expected):
     assert provider_state(status) == canonical[expected]
 
 
+def test_cli_upgrade_notice_does_not_hide_terminal_status():
+    notice = ("Warning: Looks like you're using an outdated `kaggle` version (installed: 2.2.4), "
+              "please consider upgrading to the latest version (2.2.5)\n")
+    line = 'owner/kernel has status "KernelWorkerStatus.COMPLETE"'
+    assert provider_state(notice + line) == "COMPLETE"
+    assert provider_state(notice + line + '\nowner/kernel has status "KernelWorkerStatus.ERROR"') == ""
+    assert provider_state("unrecognized warning\n" + line) == ""
+    assert provider_state(notice + "HTTP 403 forbidden") == ""
+
+
 @pytest.mark.parametrize(("task_id", "epoch", "epochs", "elapsed"), [
     ("28adaefafb164a948f32de1c61799789", 786, 1000, 43212.9),
     ("b760c3494bae40df86a6964ffcef2d77", 486, 500, 43213.7),
