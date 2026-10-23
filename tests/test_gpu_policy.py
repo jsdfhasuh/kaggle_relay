@@ -88,6 +88,33 @@ def test_cpu_and_single_gpu_skip_dataset_preflight(device):
     assert _relay_yolo_train(lambda **kw: kw, data="absent.yaml", device=device)["device"] == device
 
 
+@pytest.mark.parametrize("counts,expected", [({"train": 8, "val": 1}, "0"), ({"train": 8, "val": 4}, "0,1")])
+def test_classification_effective_counts(monkeypatch, counts, expected):
+    datasets = ModuleType("torchvision.datasets")
+    images = ModuleType("PIL.Image")
+    class Folder:
+        class_to_idx = {"a": 0, "b": 1}
+        def __init__(self, root):
+            self.samples = [(str(root / f"{n}.png"), 0) for n in range(counts[root.name])]
+        def __len__(self):
+            return len(self.samples)
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    verified = []
+    images.open = lambda name: nullcontext(SimpleNamespace(verify=lambda: verified.append(name)))
+    datasets.ImageFolder = Folder
+    monkeypatch.setitem(sys.modules, "torchvision.datasets", datasets)
+    pil = ModuleType("PIL")
+    pil.Image = images
+    monkeypatch.setitem(sys.modules, "PIL", pil)
+    class Model:
+        task = "classify"
+        def train(self, **kwargs):
+            return kwargs
+    assert _relay_yolo_train(Model().train, data="dataset", device="0,1")["device"] == expected
+    assert len(verified) == sum(counts.values())
+
+
 def test_invalid_dataset_fails_before_training(monkeypatch):
     fake_datasets(monkeypatch, {"train": 2, "val": 0})
     def train(**kw):

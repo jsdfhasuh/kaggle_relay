@@ -14,7 +14,42 @@ def _relay_yolo_train(train, *args, **kwargs):
     if len(devices) < 2:
         return train(*args, **kwargs)
     task = getattr(getattr(train, "__self__", None), "task", "detect")
-    if task not in {"detect", "segment", "pose", "obb"}:
+    if task not in {"detect", "segment", "pose", "obb", "classify"}:
+        return train(*args, **kwargs)
+
+    if task == "classify":
+        from pathlib import Path
+        from PIL import Image
+        from torchvision.datasets import ImageFolder
+        import importlib
+        import os
+
+        root = Path(kwargs["data"])
+        if root.is_file():
+            root = root.parent
+        counts = {}
+        mapping = None
+        for split in ("train", "val"):
+            dataset = ImageFolder(root / split)
+            if mapping is not None and dataset.class_to_idx != mapping:
+                raise ValueError("Classification train/val class mappings differ")
+            mapping = dataset.class_to_idx
+            for filename, _ in dataset.samples:
+                with Image.open(filename) as image:
+                    image.verify()
+            counts[split] = len(dataset)
+        trainer = kwargs.get("trainer")
+        if trainer is not None:
+            module = importlib.import_module(trainer.__module__)
+            if getattr(module, trainer.__name__, None) is not trainer:
+                raise ValueError("Custom classification trainer must be importable by torchrun")
+            module_file = Path(module.__file__).resolve()
+            import_root = module_file.parents[len(trainer.__module__.split(".")) - 1]
+            os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [str(import_root), os.environ.get("PYTHONPATH", "")]))
+        if min(counts.values()) < len(devices):
+            kwargs["device"] = str(devices[0])
+        print(f"[RELAY GPU POLICY] classification train={counts['train']} val={counts['val']} "
+              f"requested_gpus={len(devices)} selected_device={kwargs['device']}", flush=True)
         return train(*args, **kwargs)
 
     from ultralytics.data.dataset import YOLODataset
