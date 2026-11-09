@@ -295,8 +295,13 @@ def test_timeout_kills_descendants_after_group_leader_exits(tmp_path):
     assert time.monotonic() - start < 9
     assert marker.exists()
     status = Path(f"/proc/{marker.read_text()}/status")
-    if status.exists():
-        assert "State:\tZ" in status.read_text()
+    try:
+        process_status = status.read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        # The kernel may reap the child before or during this read.
+        pass
+    else:
+        assert "State:\tZ" in process_status
 
 
 def test_cleanup_is_idempotent_and_preserves_active_uploads(tmp_path):

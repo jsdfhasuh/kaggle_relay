@@ -3,6 +3,8 @@ uvicorn[standard]
 pydantic
 python-multipart
 kaggle>=2.2.4,<3
+# Kaggle 2.2.5 imports six without declaring it as a dependency.
+six>=1.16,<2
 aiofiles
 pytest
 httpx
